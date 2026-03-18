@@ -4,4 +4,12 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "anndata>=0.12.10",
+    "numba>=0.64.0",
+    "numpy>=2.4.3",
+    "scanpy>=1.11.5",
+    "scipy>=1.17.1",
+    "torch>=2.10.0",
+    "tqdm>=4.67.1",
+]
