@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,6 +23,7 @@ from ._typing import (
 __all__ = [
     "PriorEngine",
     "FitSummary",
+    "PriorFitReport",
     "PriorEngineSetting",
     "PriorEngineTrainingConfig",
 ]
@@ -35,6 +37,25 @@ class FitSummary:
     final_loss: float
     best_loss: float
     n_iter: int
+
+
+@dataclass(frozen=True, slots=True)
+class PriorFitReport:
+    gene_names: list[str]
+    support: np.ndarray
+    grid_min: np.ndarray
+    grid_max: np.ndarray
+    init_q_hat: np.ndarray
+    init_prior_weights: np.ndarray
+    prior_weights: np.ndarray
+    q_hat: np.ndarray
+    final_loss: float
+    best_loss: float
+    loss_history: list[float]
+    nll_history: list[float]
+    align_history: list[float]
+    setting: dict[str, object]
+    training_config: dict[str, object]
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,6 +224,20 @@ class PriorEngine:
         s_hat: float,
         training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
     ) -> FitSummary:
+        report = self.fit_report(batch, s_hat, training_cfg)
+        return FitSummary(
+            gene_names=report.gene_names,
+            final_loss=report.final_loss,
+            best_loss=report.best_loss,
+            n_iter=training_cfg.n_iter,
+        )
+
+    def fit_report(
+        self,
+        batch: GeneBatch,
+        s_hat: float,
+        training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
+    ) -> PriorFitReport:
         if s_hat <= 0:
             raise ValueError(f"s_hat 必须 > 0，收到 {s_hat}")
         batch.check_shape()
@@ -222,10 +257,18 @@ class PriorEngine:
             dtype=self.torch_dtype,
             device=self.device,
         )
-        logits = self._init_logits(
+        logits, init_q_hat, init_prior_weights = self._init_logits(
             indices, counts_t, totals_t, support_ratio, training_cfg
         )
-        best_logits, final_loss, best_loss = self._optimize(
+        (
+            best_logits,
+            final_loss,
+            best_loss,
+            loss_history,
+            nll_history,
+            align_history,
+            q_hat,
+        ) = self._optimize(
             logits,
             counts_t,
             totals_t,
@@ -234,11 +277,22 @@ class PriorEngine:
         )
         self._writeback(indices, best_logits, grid_min, grid_max)
 
-        return FitSummary(
+        return PriorFitReport(
             gene_names=list(batch.gene_names),
+            support=support.detach().cpu().numpy(),
+            grid_min=grid_min.copy(),
+            grid_max=grid_max.copy(),
+            init_q_hat=init_q_hat,
+            init_prior_weights=init_prior_weights,
+            prior_weights=self._smoother(best_logits).detach().cpu().numpy(),
+            q_hat=q_hat,
             final_loss=final_loss,
             best_loss=best_loss,
-            n_iter=training_cfg.n_iter,
+            loss_history=loss_history,
+            nll_history=nll_history,
+            align_history=align_history,
+            setting=asdict(self.setting),
+            training_config=asdict(training_cfg),
         )
 
     def get_priors(self, gene_names: str | list[str]) -> GridDistribution | None:
@@ -355,22 +409,42 @@ class PriorEngine:
         totals_t: TorchTensor,
         support_ratio: TorchTensor,
         cfg: PriorEngineTrainingConfig,
-    ) -> torch.nn.Parameter:
+    ) -> tuple[torch.nn.Parameter, np.ndarray, np.ndarray]:
         init_logits = self._logits[indices].copy()
         cold_mask = ~self._fitted[indices]
+        init_q_hat = np.full(
+            (len(indices), self.setting.grid_size),
+            1.0 / self.setting.grid_size,
+            dtype=DTYPE_NP,
+        )
+        init_prior_weights = init_q_hat.copy()
 
         if np.any(cold_mask):
-            init_logits[cold_mask] = self._initialize_logits_from_posterior(
-                counts_t[cold_mask],
-                totals_t,
-                support_ratio[cold_mask],
-                cfg,
+            cold_logits, cold_q_hat, cold_prior = (
+                self._initialize_logits_from_posterior(
+                    counts_t[cold_mask],
+                    totals_t,
+                    support_ratio[cold_mask],
+                    cfg,
+                )
             )
+            init_logits[cold_mask] = cold_logits
+            init_q_hat[cold_mask] = cold_q_hat
+            init_prior_weights[cold_mask] = cold_prior
+
+        if np.any(~cold_mask):
+            fitted_logits = torch.as_tensor(
+                init_logits[~cold_mask], dtype=self.torch_dtype, device=self.device
+            )
+            with torch.no_grad():
+                fitted_prior = self._smoother(fitted_logits).detach().cpu().numpy()
+            init_q_hat[~cold_mask] = fitted_prior
+            init_prior_weights[~cold_mask] = fitted_prior
 
         logits_t = torch.as_tensor(
             init_logits, dtype=self.torch_dtype, device=self.device
         )
-        return torch.nn.Parameter(logits_t.clone())
+        return torch.nn.Parameter(logits_t.clone()), init_q_hat, init_prior_weights
 
     def _initialize_logits_from_posterior(
         self,
@@ -378,7 +452,7 @@ class PriorEngine:
         totals_t: TorchTensor,
         support_ratio: TorchTensor,
         cfg: PriorEngineTrainingConfig,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """未拟合基因显式初始化：一轮 posterior-generated distribution 反解析为 logits。"""
         with torch.no_grad():
             slices = _iter_cell_slices(totals_t.shape[0], cfg.cell_chunk_size)
@@ -402,7 +476,12 @@ class PriorEngine:
             init_weights = (posterior_sum / totals_t.shape[0]).clamp_min(EPS)
             init_weights = init_weights / init_weights.sum(dim=-1, keepdim=True)
             init_logits = torch.log(init_weights) / max(cfg.init_temperature, EPS)
-            return init_logits.cpu().numpy()
+            init_prior = self._smoother(init_logits)
+            return (
+                init_logits.cpu().numpy(),
+                init_weights.cpu().numpy(),
+                init_prior.cpu().numpy(),
+            )
 
     def _optimize(
         self,
@@ -411,7 +490,15 @@ class PriorEngine:
         totals_t: TorchTensor,
         support_ratio: TorchTensor,
         cfg: PriorEngineTrainingConfig,
-    ) -> tuple[TorchTensor, float, float]:
+    ) -> tuple[
+        TorchTensor,
+        float,
+        float,
+        list[float],
+        list[float],
+        list[float],
+        np.ndarray,
+    ]:
         optimizer = _build_optimizer([logits], cfg)
         scheduler = _build_scheduler(optimizer, cfg)
         cell_slices = _iter_cell_slices(totals_t.shape[0], cfg.cell_chunk_size)
@@ -419,6 +506,10 @@ class PriorEngine:
         best_loss = float("inf")
         best_logits = logits.detach().clone()
         final_loss = float("inf")
+        loss_history: list[float] = []
+        nll_history: list[float] = []
+        align_history: list[float] = []
+        best_q_hat: np.ndarray | None = None
 
         for _ in range(cfg.n_iter):
             optimizer.zero_grad(set_to_none=True)
@@ -465,11 +556,30 @@ class PriorEngine:
             scheduler.step()
 
             final_loss = nll_value + float(align.item())
+            loss_history.append(final_loss)
+            nll_history.append(nll_value)
+            align_history.append(float(align.item()))
             if final_loss < best_loss:
                 best_loss = final_loss
                 best_logits = logits.detach().clone()
+                best_q_hat = q_hat.detach().cpu().numpy()
 
-        return best_logits, final_loss, best_loss
+        if best_q_hat is None:
+            best_q_hat = np.full(
+                (logits.shape[0], logits.shape[1]),
+                1.0 / logits.shape[1],
+                dtype=DTYPE_NP,
+            )
+
+        return (
+            best_logits,
+            final_loss,
+            best_loss,
+            loss_history,
+            nll_history,
+            align_history,
+            best_q_hat,
+        )
 
     def _writeback(
         self,

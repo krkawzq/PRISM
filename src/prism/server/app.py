@@ -19,6 +19,7 @@ class ServerApp:
 
         class RequestHandler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:  # noqa: N802
+                print(f"[prism-server] http GET {self.path}", flush=True)
                 response = app.router.dispatch(Request.from_raw_path("GET", self.path))
                 self._write_response(response)
 

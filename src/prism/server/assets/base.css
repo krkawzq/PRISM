@@ -75,6 +75,10 @@ a:hover {
   gap: 8px;
 }
 
+.fit-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
 .search input,
 .loader input,
 .search button,
@@ -169,6 +173,14 @@ a:hover {
   grid-column: 1 / -1;
 }
 
+.figure img {
+  width: 100%;
+  display: block;
+  border-radius: 16px;
+  border: 1px solid #ddd6c7;
+  background: white;
+}
+
 .plot-svg {
   width: 100%;
   height: auto;
@@ -197,6 +209,30 @@ table {
   border-collapse: collapse;
 }
 
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  border-radius: 16px;
+}
+
+.compact-table {
+  min-width: 1400px;
+  font-size: 13px;
+}
+
+.compact-table th,
+.compact-table td {
+  white-space: nowrap;
+}
+
+.compact-table th:first-child,
+.compact-table td:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--panel);
+}
+
 th,
 td {
   padding: 9px 8px;
@@ -209,6 +245,87 @@ th {
   font-size: 11px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.interactive-3d-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+}
+
+.interactive-3d-card {
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 12px;
+}
+
+.interactive-3d-card:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  padding: 18px;
+  border-radius: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.interactive-3d-card:fullscreen .interactive-3d-plot {
+  flex: 1;
+  height: calc(100vh - 140px);
+}
+
+.interactive-3d-header {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 0 0 10px;
+}
+
+.interactive-3d-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 10px;
+}
+
+.interactive-3d-btn,
+.interactive-3d-select {
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #f8fafc;
+  font: inherit;
+}
+
+.interactive-3d-btn {
+  cursor: pointer;
+}
+
+.interactive-3d-legend {
+  width: 88px;
+  height: 12px;
+  border-radius: 999px;
+  border: 1px solid #cbd5e1;
+  display: inline-block;
+  margin-left: auto;
+}
+
+.interactive-3d-legend.viridis {
+  background: linear-gradient(90deg, #440154, #31688e, #35b779, #fde725);
+}
+
+.interactive-3d-legend.cividis {
+  background: linear-gradient(90deg, #00224e, #575d6d, #a59c74, #fee838);
+}
+
+.interactive-3d-plot {
+  width: 100%;
+  height: 420px;
+  border-radius: 12px;
+  background: white;
+  display: block;
+  overflow: hidden;
 }
 
 @media (max-width: 720px) {

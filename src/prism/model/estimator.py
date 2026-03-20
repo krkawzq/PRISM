@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 
 import numpy as np
@@ -8,7 +9,22 @@ from scipy import special
 
 from ._typing import EPS, DTYPE_NP, PoolEstimate
 
-__all__ = ["fit_pool_scale"]
+__all__ = ["PoolFitReport", "fit_pool_scale", "fit_pool_scale_report"]
+
+
+@dataclass(frozen=True, slots=True)
+class PoolFitReport:
+    mu: float
+    sigma: float
+    point_mu: float
+    point_eta: float
+    loglik: float
+    n_iter: int
+    loglik_history: list[float]
+    eta_posterior_mean: np.ndarray
+    eta_prior_grid: np.ndarray
+    eta_prior_density: np.ndarray
+    used_posterior_softargmax: bool = False
 
 
 @lru_cache(maxsize=16)
@@ -125,6 +141,17 @@ def _posterior_softargmax_mu(
     return float(np.sum(soft_weight * log_eta))
 
 
+def _lognormal_density_grid(
+    mu: float, sigma: float, grid_size: int = 512
+) -> tuple[np.ndarray, np.ndarray]:
+    log_grid = np.linspace(mu - 4.5 * sigma, mu + 4.5 * sigma, grid_size)
+    eta_grid = np.exp(log_grid)
+    density = np.exp(-0.5 * ((log_grid - mu) / sigma) ** 2)
+    density /= eta_grid * sigma * math.sqrt(2.0 * math.pi)
+    density /= max(float(np.trapezoid(density, eta_grid)), EPS)
+    return eta_grid.astype(DTYPE_NP), density.astype(DTYPE_NP)
+
+
 def _em_initialize(unique_n: np.ndarray, freq: np.ndarray) -> tuple[float, float]:
     """用压缩后的 totals 初始化 EM。"""
     log_n = np.log(np.maximum(unique_n, 1.0))
@@ -173,14 +200,54 @@ def fit_pool_scale(
             f"softargmax_temperature 必须 > 0，收到 {softargmax_temperature}"
         )
 
+    report = fit_pool_scale_report(
+        totals,
+        max_iter=max_iter,
+        tol=tol,
+        n_quad=n_quad,
+        use_posterior_mu=use_posterior_mu,
+        softargmax_temperature=softargmax_temperature,
+    )
+    return PoolEstimate(
+        mu=report.mu,
+        sigma=report.sigma,
+        point_mu=report.point_mu,
+        point_eta=report.point_eta,
+        used_posterior_softargmax=report.used_posterior_softargmax,
+    )
+
+
+def fit_pool_scale_report(
+    totals: np.ndarray,
+    *,
+    max_iter: int = 120,
+    tol: float = 1e-6,
+    n_quad: int = 128,
+    use_posterior_mu: bool = False,
+    softargmax_temperature: float = 0.05,
+) -> PoolFitReport:
+    if max_iter < 1:
+        raise ValueError(f"max_iter 必须 >= 1，收到 {max_iter}")
+    if tol <= 0:
+        raise ValueError(f"tol 必须 > 0，收到 {tol}")
+    if use_posterior_mu and softargmax_temperature <= 0:
+        raise ValueError(
+            f"softargmax_temperature 必须 > 0，收到 {softargmax_temperature}"
+        )
+
     totals = _validate_totals(totals)
     unique_n, freq = _compress_totals(totals)
     mu, sigma = _em_initialize(unique_n, freq)
 
     prev_ll = -np.inf
-    for _ in range(max_iter):
+    history: list[float] = []
+    n_iter_done = max_iter
+    for it in range(max_iter):
         mu, sigma, ll = _em_step(unique_n, freq, mu, sigma, n_quad)
+        history.append(ll)
         if abs(ll - prev_ll) / (abs(prev_ll) + 1.0) < tol:
+            n_iter_done = it + 1
+            prev_ll = ll
             break
         prev_ll = ll
 
@@ -195,10 +262,23 @@ def fit_pool_scale(
             softargmax_temperature,
         )
 
-    return PoolEstimate(
+    unique_int = np.rint(totals).astype(np.int64)
+    inverse = np.searchsorted(unique_n.astype(np.int64), unique_int)
+    log_eta, posterior_weight = _posterior_grid_weights(unique_n, mu, sigma, n_quad)
+    eta_grid = np.exp(log_eta)
+    eta_posterior_mean = np.sum(posterior_weight * eta_grid[None, :], axis=1)[inverse]
+    eta_prior_grid, eta_prior_density = _lognormal_density_grid(mu, sigma)
+
+    return PoolFitReport(
         mu=mu,
         sigma=sigma,
         point_mu=point_mu,
         point_eta=float(np.exp(point_mu)),
+        loglik=float(prev_ll),
+        n_iter=n_iter_done,
+        loglik_history=history,
+        eta_posterior_mean=eta_posterior_mean.astype(DTYPE_NP),
+        eta_prior_grid=eta_prior_grid,
+        eta_prior_density=eta_prior_density,
         used_posterior_softargmax=use_posterior_mu,
     )

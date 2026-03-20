@@ -58,6 +58,18 @@ def compute_detected_counts(matrix: Any) -> np.ndarray:
     return np.asarray(counts, dtype=np.int64).reshape(-1)
 
 
+def compute_cell_zero_fraction(matrix: Any) -> np.ndarray:
+    if sparse.issparse(matrix):
+        nonzero = np.asarray(matrix.getnnz(axis=1)).ravel()
+        n_genes = int(matrix.shape[1])
+    else:
+        array = np.asarray(matrix)
+        nonzero = np.count_nonzero(array, axis=1)
+        n_genes = int(array.shape[1])
+    zero_fraction = 1.0 - np.asarray(nonzero, dtype=DTYPE_NP) / max(n_genes, 1)
+    return np.asarray(zero_fraction, dtype=DTYPE_NP).reshape(-1)
+
+
 def build_gene_to_idx(gene_names: np.ndarray) -> dict[str, int]:
     return {str(name): int(idx) for idx, name in enumerate(gene_names.tolist())}
 

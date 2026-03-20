@@ -39,6 +39,7 @@ __all__ = [
     "ALL_CHANNELS",
     "CORE_CHANNELS",
     "Posterior",
+    "PosteriorBatchReport",
     "PosteriorSummary",
     "SignalChannel",
     "SignalExtractor",
@@ -56,6 +57,19 @@ class PosteriorSummary:
     surprisal: np.ndarray  # (B, C)
     surprisal_norm: np.ndarray | None = None
     sharpness: np.ndarray | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PosteriorBatchReport:
+    gene_names: list[str]
+    support: np.ndarray
+    prior_weights: np.ndarray
+    signal: np.ndarray
+    confidence: np.ndarray
+    surprisal: np.ndarray
+    surprisal_norm: np.ndarray | None = None
+    sharpness: np.ndarray | None = None
+    posterior: np.ndarray | None = None
 
 
 def _validate_channels(
@@ -162,6 +176,40 @@ class Posterior:
             sharpness=payload.pop("sharpness"),
         )
 
+    def summarize_batch(
+        self,
+        batch: GeneBatch,
+        s_hat: float | np.ndarray,
+        *,
+        include_posterior: bool = False,
+        include_surprisal_norm: bool = True,
+        include_sharpness: bool = True,
+    ) -> PosteriorBatchReport:
+        channels: set[SignalChannel] = {"signal", "confidence", "surprisal"}
+        if include_surprisal_norm:
+            channels.add("surprisal_norm")
+        if include_sharpness:
+            channels.add("sharpness")
+        if include_posterior:
+            channels.add("posterior")
+
+        payload = self.extract(batch, s_hat, channels=channels)
+        return PosteriorBatchReport(
+            gene_names=list(batch.gene_names),
+            support=payload.pop("support")
+            if include_posterior
+            else self._support_for(batch),
+            prior_weights=payload.pop("prior_weights")
+            if include_posterior
+            else self._prior_weights_for(batch),
+            signal=payload.pop("signal"),
+            confidence=payload.pop("confidence"),
+            surprisal=payload.pop("surprisal"),
+            surprisal_norm=payload.pop("surprisal_norm", None),
+            sharpness=payload.pop("sharpness", None),
+            posterior=payload.pop("posterior", None),
+        )
+
     def extract(
         self,
         batch: GeneBatch,
@@ -218,6 +266,26 @@ class Posterior:
                 raise KeyError(f"基因 {name!r} 不在 extractor 中")
             indices.append(self._gene_to_idx[name])
         return np.asarray(indices, dtype=np.int64)
+
+    def _support_for(self, batch: GeneBatch) -> np.ndarray:
+        indices = self._resolve_genes(batch.gene_names)
+        grid_min_np = np.asarray(self._priors.grid_min)[indices].astype(
+            DTYPE_NP, copy=False
+        )
+        grid_max_np = np.asarray(self._priors.grid_max)[indices].astype(
+            DTYPE_NP, copy=False
+        )
+        grid_min_t = torch.as_tensor(grid_min_np, dtype=DTYPE_TORCH)
+        grid_max_t = torch.as_tensor(grid_max_np, dtype=DTYPE_TORCH)
+        support_t = (
+            grid_min_t[:, None]
+            + (grid_max_t - grid_min_t)[:, None] * self._base_grid_t[None, :]
+        )
+        return support_t.cpu().numpy()
+
+    def _prior_weights_for(self, batch: GeneBatch) -> np.ndarray:
+        indices = self._resolve_genes(batch.gene_names)
+        return np.asarray(self._priors.weights[indices], dtype=DTYPE_NP)
 
     def _validate_batch(self, batch: GeneBatch) -> None:
         if batch.counts.ndim != 2:
