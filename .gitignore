@@ -13,3 +13,5 @@ uv.lock
 # Generated dataset artifacts
 data/raw/
 data/*.h5ad
+
+output/
