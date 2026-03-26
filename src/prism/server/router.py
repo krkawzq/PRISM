@@ -59,7 +59,11 @@ class Response:
         return cls(
             status=status,
             content_type="application/json; charset=utf-8",
-            body=json.dumps(payload, ensure_ascii=True, indent=2).encode("utf-8"),
+            body=json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
         )
 
     @classmethod

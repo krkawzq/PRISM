@@ -21,18 +21,23 @@ from ._typing import (
 
 SignalChannel = Literal[
     "signal",
-    "confidence",
-    "surprisal",
-    "surprisal_norm",
-    "sharpness",
+    "posterior_entropy",
+    "prior_entropy",
+    "mutual_information",
     "posterior",
 ]
 
 ALL_CHANNELS: frozenset[SignalChannel] = frozenset(
-    {"signal", "confidence", "surprisal", "surprisal_norm", "sharpness", "posterior"}
+    {
+        "signal",
+        "posterior_entropy",
+        "prior_entropy",
+        "mutual_information",
+        "posterior",
+    }
 )
 CORE_CHANNELS: frozenset[SignalChannel] = frozenset(
-    {"signal", "confidence", "surprisal"}
+    {"signal", "posterior_entropy", "prior_entropy", "mutual_information"}
 )
 
 __all__ = [
@@ -53,10 +58,9 @@ class PosteriorSummary:
     prior_weights: np.ndarray  # (B, M)
     posterior: np.ndarray  # (B, C, M)
     signal: np.ndarray  # (B, C)
-    confidence: np.ndarray  # (B, C)
-    surprisal: np.ndarray  # (B, C)
-    surprisal_norm: np.ndarray | None = None
-    sharpness: np.ndarray | None = None
+    posterior_entropy: np.ndarray  # (B, C)
+    prior_entropy: np.ndarray  # (B, C)
+    mutual_information: np.ndarray  # (B, C)
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,10 +69,9 @@ class PosteriorBatchReport:
     support: np.ndarray
     prior_weights: np.ndarray
     signal: np.ndarray
-    confidence: np.ndarray
-    surprisal: np.ndarray
-    surprisal_norm: np.ndarray | None = None
-    sharpness: np.ndarray | None = None
+    posterior_entropy: np.ndarray
+    prior_entropy: np.ndarray
+    mutual_information: np.ndarray
     posterior: np.ndarray | None = None
 
 
@@ -103,28 +106,38 @@ def _normalize_s_hat(s_hat: float | np.ndarray, n_cells: int) -> np.ndarray:
     return s_hat_np
 
 
-def _extract_confidence(post: np.ndarray) -> np.ndarray:
-    grid_size = post.shape[-1]
+def _extract_entropy(post: np.ndarray) -> np.ndarray:
     entropy = -(post * np.log(np.clip(post, EPS, None))).sum(axis=-1)
-    return np.clip(1.0 - entropy / math.log(grid_size), 0.0, 1.0)
+    return np.clip(np.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
 
 
-def _extract_sharpness_curve(weights: np.ndarray) -> np.ndarray:
-    log_weights = np.log(np.clip(weights, EPS, None))
-    sharpness_curve = np.zeros_like(log_weights)
-    if weights.shape[-1] >= 3:
-        sharpness_curve[:, 1:-1] = -(
-            log_weights[:, :-2] - 2.0 * log_weights[:, 1:-1] + log_weights[:, 2:]
-        )
-        sharpness_curve[:, 0] = sharpness_curve[:, 1]
-        sharpness_curve[:, -1] = sharpness_curve[:, -2]
-    return np.clip(sharpness_curve, 0.0, None)
+def _extract_entropy_t(post: TorchTensor) -> TorchTensor:
+    entropy = -(post * torch.log(torch.clamp(post, min=EPS))).sum(dim=-1)
+    entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.clamp(entropy, min=0.0)
+
+
+def _extract_prior_entropy(weights: np.ndarray) -> np.ndarray:
+    entropy = -(weights * np.log(np.clip(weights, EPS, None))).sum(axis=-1)
+    return np.clip(np.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+
+
+def _extract_prior_entropy_t(weights: TorchTensor) -> TorchTensor:
+    entropy = -(weights * torch.log(torch.clamp(weights, min=EPS))).sum(dim=-1)
+    entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.clamp(entropy, min=0.0)
 
 
 class Posterior:
     """从已拟合先验中提取 MAP 信号与后验指标。"""
 
-    def __init__(self, gene_names: list[str], priors: GridDistribution) -> None:
+    def __init__(
+        self,
+        gene_names: list[str],
+        priors: GridDistribution,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> None:
         if not gene_names:
             raise ValueError("gene_names 不能为空")
         if len(gene_names) != len(set(gene_names)):
@@ -140,7 +153,31 @@ class Posterior:
         self.gene_names = list(gene_names)
         self._gene_to_idx = {name: idx for idx, name in enumerate(self.gene_names)}
         self._priors = priors
-        self._base_grid_t = torch.linspace(0.0, 1.0, self._priors.M, dtype=DTYPE_TORCH)
+        self.device = torch.device(device)
+        self._weights_t = torch.as_tensor(
+            np.asarray(self._priors.weights, dtype=DTYPE_NP),
+            dtype=DTYPE_TORCH,
+            device=self.device,
+        )
+        self._grid_min_t_all = torch.as_tensor(
+            np.asarray(self._priors.grid_min, dtype=DTYPE_NP),
+            dtype=DTYPE_TORCH,
+            device=self.device,
+        )
+        self._grid_max_t_all = torch.as_tensor(
+            np.asarray(self._priors.grid_max, dtype=DTYPE_NP),
+            dtype=DTYPE_TORCH,
+            device=self.device,
+        )
+        self._totals_cache: dict[tuple[int, int], TorchTensor] = {}
+        self._s_hat_scalar_cache: dict[int, TorchTensor] = {}
+        self._base_grid_t = torch.linspace(
+            0.0,
+            1.0,
+            self._priors.M,
+            dtype=DTYPE_TORCH,
+            device=self.device,
+        )
 
     def query(
         self,
@@ -170,10 +207,9 @@ class Posterior:
             prior_weights=payload.pop("prior_weights"),
             posterior=payload.pop("posterior"),
             signal=payload.pop("signal"),
-            confidence=payload.pop("confidence"),
-            surprisal=payload.pop("surprisal"),
-            surprisal_norm=payload.pop("surprisal_norm"),
-            sharpness=payload.pop("sharpness"),
+            posterior_entropy=payload.pop("posterior_entropy"),
+            prior_entropy=payload.pop("prior_entropy"),
+            mutual_information=payload.pop("mutual_information"),
         )
 
     def summarize_batch(
@@ -182,14 +218,13 @@ class Posterior:
         s_hat: float | np.ndarray,
         *,
         include_posterior: bool = False,
-        include_surprisal_norm: bool = True,
-        include_sharpness: bool = True,
     ) -> PosteriorBatchReport:
-        channels: set[SignalChannel] = {"signal", "confidence", "surprisal"}
-        if include_surprisal_norm:
-            channels.add("surprisal_norm")
-        if include_sharpness:
-            channels.add("sharpness")
+        channels: set[SignalChannel] = {
+            "signal",
+            "posterior_entropy",
+            "prior_entropy",
+            "mutual_information",
+        }
         if include_posterior:
             channels.add("posterior")
 
@@ -203,10 +238,9 @@ class Posterior:
             if include_posterior
             else self._prior_weights_for(batch),
             signal=payload.pop("signal"),
-            confidence=payload.pop("confidence"),
-            surprisal=payload.pop("surprisal"),
-            surprisal_norm=payload.pop("surprisal_norm", None),
-            sharpness=payload.pop("sharpness", None),
+            posterior_entropy=payload.pop("posterior_entropy"),
+            prior_entropy=payload.pop("prior_entropy"),
+            mutual_information=payload.pop("mutual_information"),
             posterior=payload.pop("posterior", None),
         )
 
@@ -223,39 +257,52 @@ class Posterior:
         s_hat_np = _normalize_s_hat(s_hat, batch.C)
 
         indices = self._resolve_genes(batch.gene_names)
-        posterior_np, support_np, weights_np = self._compute_posterior(
+        posterior_t, support_t, weights_t = self._compute_posterior(
             batch, indices, s_hat_np
         )
-        map_idx = np.argmax(posterior_np, axis=-1)
+        map_idx_t = torch.argmax(posterior_t, dim=-1)
+        support_expanded = support_t[:, None, :].expand(-1, batch.C, -1)
 
         result: dict[str, np.ndarray] = {}
         if "signal" in requested:
-            result["signal"] = _gather_at_index(support_np, map_idx)
-        if "confidence" in requested:
-            result["confidence"] = _extract_confidence(posterior_np)
-        if "surprisal" in requested:
-            result["surprisal"] = -np.log(
-                np.clip(_gather_at_index(weights_np, map_idx), EPS, None)
+            signal_t = torch.gather(
+                support_expanded, 2, map_idx_t.unsqueeze(-1)
+            ).squeeze(-1)
+            result["signal"] = signal_t.cpu().numpy()
+        posterior_entropy_t: TorchTensor | None = None
+        prior_entropy_t: TorchTensor | None = None
+        if "posterior_entropy" in requested or "mutual_information" in requested:
+            posterior_entropy_t = _extract_entropy_t(posterior_t)
+        if "posterior_entropy" in requested:
+            if posterior_entropy_t is None:
+                raise RuntimeError("posterior entropy 提取失败")
+            posterior_entropy = posterior_entropy_t
+            result["posterior_entropy"] = posterior_entropy.cpu().numpy()
+        if "prior_entropy" in requested or "mutual_information" in requested:
+            prior_entropy_t = _extract_prior_entropy_t(weights_t)
+        if "prior_entropy" in requested:
+            if prior_entropy_t is None:
+                raise RuntimeError("prior entropy 提取失败")
+            prior_entropy = prior_entropy_t
+            result["prior_entropy"] = (
+                prior_entropy[:, None].expand(-1, batch.C).cpu().numpy()
             )
-        if "surprisal_norm" in requested:
-            surprisal = result.get("surprisal")
-            if surprisal is None:
-                surprisal = -np.log(
-                    np.clip(_gather_at_index(weights_np, map_idx), EPS, None)
-                )
-            max_surprisal = -np.log(np.clip(weights_np, EPS, None)).max(axis=-1)
-            result["surprisal_norm"] = surprisal / np.maximum(
-                max_surprisal[:, None], EPS
+        if "mutual_information" in requested:
+            if prior_entropy_t is None or posterior_entropy_t is None:
+                raise RuntimeError("mutual information 提取失败")
+            prior_entropy = prior_entropy_t
+            posterior_entropy = posterior_entropy_t
+            result["mutual_information"] = (
+                torch.clamp(prior_entropy[:, None] - posterior_entropy, min=0.0)
+                .cpu()
+                .numpy()
             )
-        if "sharpness" in requested:
-            sharpness_curve = _extract_sharpness_curve(weights_np)
-            result["sharpness"] = _gather_at_index(sharpness_curve, map_idx)
         if "posterior" in requested:
-            result["posterior"] = posterior_np
+            result["posterior"] = posterior_t.cpu().numpy()
 
         if channels is not None and "posterior" in channels:
-            result["support"] = support_np
-            result["prior_weights"] = weights_np
+            result["support"] = support_t.cpu().numpy()
+            result["prior_weights"] = weights_t.cpu().numpy()
 
         return result
 
@@ -269,14 +316,9 @@ class Posterior:
 
     def _support_for(self, batch: GeneBatch) -> np.ndarray:
         indices = self._resolve_genes(batch.gene_names)
-        grid_min_np = np.asarray(self._priors.grid_min)[indices].astype(
-            DTYPE_NP, copy=False
-        )
-        grid_max_np = np.asarray(self._priors.grid_max)[indices].astype(
-            DTYPE_NP, copy=False
-        )
-        grid_min_t = torch.as_tensor(grid_min_np, dtype=DTYPE_TORCH)
-        grid_max_t = torch.as_tensor(grid_max_np, dtype=DTYPE_TORCH)
+        indices_t = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        grid_min_t = self._grid_min_t_all.index_select(0, indices_t)
+        grid_max_t = self._grid_max_t_all.index_select(0, indices_t)
         support_t = (
             grid_min_t[:, None]
             + (grid_max_t - grid_min_t)[:, None] * self._base_grid_t[None, :]
@@ -285,7 +327,8 @@ class Posterior:
 
     def _prior_weights_for(self, batch: GeneBatch) -> np.ndarray:
         indices = self._resolve_genes(batch.gene_names)
-        return np.asarray(self._priors.weights[indices], dtype=DTYPE_NP)
+        indices_t = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        return self._weights_t.index_select(0, indices_t).cpu().numpy()
 
     def _validate_batch(self, batch: GeneBatch) -> None:
         if batch.counts.ndim != 2:
@@ -302,40 +345,72 @@ class Posterior:
         batch: GeneBatch,
         indices: np.ndarray,
         s_hat: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        weights_np = np.asarray(self._priors.weights[indices], dtype=DTYPE_NP)
-        grid_min_np = np.asarray(self._priors.grid_min)[indices].astype(
-            DTYPE_NP, copy=False
-        )
-        grid_max_np = np.asarray(self._priors.grid_max)[indices].astype(
-            DTYPE_NP, copy=False
-        )
-
-        grid_min_t = torch.as_tensor(grid_min_np, dtype=DTYPE_TORCH)
-        grid_max_t = torch.as_tensor(grid_max_np, dtype=DTYPE_TORCH)
+    ) -> tuple[TorchTensor, TorchTensor, TorchTensor]:
+        indices_t = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        weights_t = self._weights_t.index_select(0, indices_t)
+        grid_min_t = self._grid_min_t_all.index_select(0, indices_t)
+        grid_max_t = self._grid_max_t_all.index_select(0, indices_t)
         support_t = (
             grid_min_t[:, None]
             + (grid_max_t - grid_min_t)[:, None] * self._base_grid_t[None, :]
         )
 
-        counts_t = torch.as_tensor(batch.counts.T, dtype=DTYPE_TORCH)
-        totals_t = torch.as_tensor(batch.totals, dtype=DTYPE_TORCH).unsqueeze(0)
-        s_hat_t = torch.as_tensor(s_hat, dtype=DTYPE_TORCH).unsqueeze(0).unsqueeze(-1)
-        weights_t = torch.as_tensor(weights_np, dtype=DTYPE_TORCH)
+        with torch.inference_mode():
+            counts_t = torch.as_tensor(
+                batch.counts.T,
+                dtype=DTYPE_TORCH,
+                device=self.device,
+            )
+            totals_t = self._totals_tensor(batch.totals)
+            s_hat_t = self._s_hat_tensor(s_hat, batch.C)
+            x = counts_t.unsqueeze(-1)
+            n = totals_t.unsqueeze(-1)
+            p = (support_t[:, None, :] / s_hat_t).clamp(EPS, 1.0 - EPS)
+            log_coeff = (
+                torch.lgamma(n + 1.0)
+                - torch.lgamma(x + 1.0)
+                - torch.lgamma(n - x + 1.0)
+            )
+            log_lik = log_coeff + x * torch.log(p) + (n - x) * torch.log1p(-p)
+            posterior_t = compute_posterior(log_lik, weights_t)
 
-        x = counts_t.unsqueeze(-1)
-        n = totals_t.unsqueeze(-1)
-        p = (support_t[:, None, :] / s_hat_t).clamp(EPS, 1.0 - EPS)
-        log_coeff = (
-            torch.lgamma(n + 1.0) - torch.lgamma(x + 1.0) - torch.lgamma(n - x + 1.0)
-        )
-        log_lik = log_coeff + x * torch.log(p) + (n - x) * torch.log1p(-p)
-        posterior_t = compute_posterior(log_lik, weights_t)
+        return posterior_t, support_t, weights_t
 
+    def _totals_tensor(self, totals: np.ndarray) -> TorchTensor:
+        key = (int(totals.shape[0]), int(totals.__array_interface__["data"][0]))
+        cached = self._totals_cache.get(key)
+        if cached is not None:
+            return cached
+        tensor = torch.as_tensor(
+            totals,
+            dtype=DTYPE_TORCH,
+            device=self.device,
+        ).unsqueeze(0)
+        self._totals_cache[key] = tensor
+        return tensor
+
+    def _s_hat_tensor(self, s_hat: np.ndarray, n_cells: int) -> TorchTensor:
+        if s_hat.ndim == 1 and np.all(s_hat == s_hat[0]):
+            key = n_cells
+            cached = self._s_hat_scalar_cache.get(key)
+            if cached is not None:
+                return cached
+            tensor = torch.full(
+                (1, n_cells, 1),
+                float(s_hat[0]),
+                dtype=DTYPE_TORCH,
+                device=self.device,
+            )
+            self._s_hat_scalar_cache[key] = tensor
+            return tensor
         return (
-            posterior_t.cpu().numpy(),
-            support_t.cpu().numpy(),
-            weights_np,
+            torch.as_tensor(
+                s_hat,
+                dtype=DTYPE_TORCH,
+                device=self.device,
+            )
+            .unsqueeze(0)
+            .unsqueeze(-1)
         )
 
 

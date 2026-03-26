@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -10,6 +11,8 @@ from scipy import special
 from ._typing import EPS, DTYPE_NP, PoolEstimate
 
 __all__ = ["PoolFitReport", "fit_pool_scale", "fit_pool_scale_report"]
+
+PoolFitProgressCallback = Callable[[int, int, float, float, float, bool], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +192,7 @@ def fit_pool_scale(
     n_quad: int = 128,
     use_posterior_mu: bool = False,
     softargmax_temperature: float = 0.05,
+    progress_callback: PoolFitProgressCallback | None = None,
 ) -> PoolEstimate:
     """用 Poisson-LogNormal EM 拟合采样池标尺参数。"""
     if max_iter < 1:
@@ -207,6 +211,7 @@ def fit_pool_scale(
         n_quad=n_quad,
         use_posterior_mu=use_posterior_mu,
         softargmax_temperature=softargmax_temperature,
+        progress_callback=progress_callback,
     )
     return PoolEstimate(
         mu=report.mu,
@@ -225,6 +230,7 @@ def fit_pool_scale_report(
     n_quad: int = 128,
     use_posterior_mu: bool = False,
     softargmax_temperature: float = 0.05,
+    progress_callback: PoolFitProgressCallback | None = None,
 ) -> PoolFitReport:
     if max_iter < 1:
         raise ValueError(f"max_iter 必须 >= 1，收到 {max_iter}")
@@ -245,7 +251,10 @@ def fit_pool_scale_report(
     for it in range(max_iter):
         mu, sigma, ll = _em_step(unique_n, freq, mu, sigma, n_quad)
         history.append(ll)
-        if abs(ll - prev_ll) / (abs(prev_ll) + 1.0) < tol:
+        converged = abs(ll - prev_ll) / (abs(prev_ll) + 1.0) < tol
+        if progress_callback is not None:
+            progress_callback(it + 1, max_iter, ll, mu, sigma, converged)
+        if converged:
             n_iter_done = it + 1
             prev_ll = ll
             break

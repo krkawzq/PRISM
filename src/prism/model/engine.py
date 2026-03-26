@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Literal
 
 import numpy as np
@@ -29,6 +30,7 @@ __all__ = [
 ]
 
 TorchDTypeName = Literal["float64", "float32"]
+FitProgressCallback = Callable[[int, int, float, float, float, bool], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,8 +225,16 @@ class PriorEngine:
         batch: GeneBatch,
         s_hat: float,
         training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
+        progress_callback: FitProgressCallback | None = None,
+        grid_max_override: np.ndarray | None = None,
     ) -> FitSummary:
-        report = self.fit_report(batch, s_hat, training_cfg)
+        report = self.fit_report(
+            batch,
+            s_hat,
+            training_cfg,
+            progress_callback=progress_callback,
+            grid_max_override=grid_max_override,
+        )
         return FitSummary(
             gene_names=report.gene_names,
             final_loss=report.final_loss,
@@ -237,6 +247,8 @@ class PriorEngine:
         batch: GeneBatch,
         s_hat: float,
         training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
+        progress_callback: FitProgressCallback | None = None,
+        grid_max_override: np.ndarray | None = None,
     ) -> PriorFitReport:
         if s_hat <= 0:
             raise ValueError(f"s_hat 必须 > 0，收到 {s_hat}")
@@ -244,7 +256,19 @@ class PriorEngine:
         self._validate_batch(batch, s_hat)
 
         indices = self._resolve_indices(batch.gene_names)
-        grid_min, grid_max = self._compute_grid_bounds(batch, s_hat)
+        if grid_max_override is None:
+            grid_min, grid_max = self._compute_grid_bounds(batch, s_hat)
+        else:
+            grid_min = np.zeros(batch.B, dtype=DTYPE_NP)
+            grid_max = np.asarray(grid_max_override, dtype=DTYPE_NP).reshape(-1)
+            if grid_max.shape != (batch.B,):
+                raise ValueError(
+                    f"grid_max_override shape mismatch: expected {(batch.B,)}, got {grid_max.shape}"
+                )
+            if np.any(~np.isfinite(grid_max)) or np.any(grid_max <= 0):
+                raise ValueError("grid_max_override must be finite and > 0")
+            if np.any(grid_max > s_hat):
+                raise ValueError("grid_max_override must satisfy grid_max <= s_hat")
         support = self._build_support_tensor(grid_min, grid_max)
         support_ratio = (support / s_hat).clamp(EPS, 1.0 - EPS)
         counts_t = torch.as_tensor(
@@ -274,6 +298,7 @@ class PriorEngine:
             totals_t,
             support_ratio,
             training_cfg,
+            progress_callback=progress_callback,
         )
         self._writeback(indices, best_logits, grid_min, grid_max)
 
@@ -490,6 +515,7 @@ class PriorEngine:
         totals_t: TorchTensor,
         support_ratio: TorchTensor,
         cfg: PriorEngineTrainingConfig,
+        progress_callback: FitProgressCallback | None = None,
     ) -> tuple[
         TorchTensor,
         float,
@@ -563,6 +589,16 @@ class PriorEngine:
                 best_loss = final_loss
                 best_logits = logits.detach().clone()
                 best_q_hat = q_hat.detach().cpu().numpy()
+
+            if progress_callback is not None:
+                progress_callback(
+                    len(loss_history),
+                    cfg.n_iter,
+                    final_loss,
+                    nll_value,
+                    float(align.item()),
+                    final_loss <= best_loss,
+                )
 
         if best_q_hat is None:
             best_q_hat = np.full(

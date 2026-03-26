@@ -10,8 +10,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.ndimage import gaussian_filter
 
 from .analysis import GeneAnalysis, GeneSummary
+from .global_eval import GlobalEvaluationResult
 
 plt.rcParams["font.sans-serif"] = [
     "Noto Sans CJK SC",
@@ -251,7 +253,7 @@ def plot_signal_interface(analysis: GeneAnalysis):
     axes[0, 0].set_title("Signal vs X_eff")
     axes[0, 0].set_xlabel("X_eff = X_gc / N_c * S_hat")
     axes[0, 0].set_ylabel("Signal")
-    fig.colorbar(sc0, ax=axes[0, 0], shrink=0.88).set_label("Confidence")
+    fig.colorbar(sc0, ax=axes[0, 0], shrink=0.88).set_label("Posterior entropy")
     sc1 = axes[0, 1].scatter(
         x_eff,
         analysis.confidence,
@@ -261,36 +263,36 @@ def plot_signal_interface(analysis: GeneAnalysis):
         alpha=0.72,
         edgecolor="none",
     )
-    axes[0, 1].set_title("Confidence vs X_eff")
+    axes[0, 1].set_title("Posterior entropy vs X_eff")
     axes[0, 1].set_xlabel("X_eff = X_gc / N_c * S_hat")
-    axes[0, 1].set_ylabel("Confidence")
+    axes[0, 1].set_ylabel("Posterior entropy")
     fig.colorbar(sc1, ax=axes[0, 1], shrink=0.88).set_label("Signal")
     sc2 = axes[1, 0].scatter(
         analysis.signal,
-        analysis.surprisal,
-        c=analysis.confidence,
+        analysis.prior_entropy,
+        c=analysis.mutual_information,
         cmap="magma",
         s=14,
         alpha=0.72,
         edgecolor="none",
     )
-    axes[1, 0].set_title("Surprisal vs signal")
+    axes[1, 0].set_title("Prior entropy vs signal")
     axes[1, 0].set_xlabel("Signal")
-    axes[1, 0].set_ylabel("Surprisal")
-    fig.colorbar(sc2, ax=axes[1, 0], shrink=0.88).set_label("Confidence")
+    axes[1, 0].set_ylabel("Prior entropy")
+    fig.colorbar(sc2, ax=axes[1, 0], shrink=0.88).set_label("Mutual information")
     sc3 = axes[1, 1].scatter(
-        analysis.signal,
-        analysis.sharpness,
-        c=analysis.surprisal,
+        x_eff,
+        analysis.mutual_information,
+        c=analysis.confidence,
         cmap="plasma",
         s=14,
         alpha=0.72,
         edgecolor="none",
     )
-    axes[1, 1].set_title("Sharpness vs signal")
-    axes[1, 1].set_xlabel("Signal")
-    axes[1, 1].set_ylabel("Sharpness")
-    fig.colorbar(sc3, ax=axes[1, 1], shrink=0.88).set_label("Surprisal")
+    axes[1, 1].set_title("Mutual information vs X_eff")
+    axes[1, 1].set_xlabel("X_eff = X_gc / N_c * S_hat")
+    axes[1, 1].set_ylabel("Mutual information")
+    fig.colorbar(sc3, ax=axes[1, 1], shrink=0.88).set_label("Posterior entropy")
     fig.tight_layout()
     return fig_to_uri(fig)
 
@@ -308,17 +310,22 @@ def _binned_surface(x, y, z, *, bins=128):
     value_grid = np.zeros((bins, bins), dtype=float)
     np.add.at(count_grid, (x_idx, y_idx), 1.0)
     np.add.at(value_grid, (x_idx, y_idx), z)
+    smooth_count = gaussian_filter(count_grid, sigma=1.15, mode="nearest")
+    smooth_value = gaussian_filter(value_grid, sigma=1.15, mode="nearest")
     surface = np.divide(
-        value_grid,
-        np.maximum(count_grid, 1e-12),
-        out=np.full_like(value_grid, np.nan),
-        where=count_grid > 0,
+        smooth_value,
+        np.maximum(smooth_count, 1e-12),
+        out=np.full_like(smooth_value, np.nan),
+        where=smooth_count > 0,
     )
-    density = np.log1p(count_grid)
+    density = np.log1p(smooth_count)
     if np.max(density) > 0:
         density = density / np.max(density)
     else:
         density.fill(0.0)
+    occupancy = smooth_count / max(float(np.max(smooth_count)), 1e-12)
+    surface[occupancy < 0.035] = np.nan
+    density[occupancy < 0.035] = np.nan
     x_centers = grid_axis
     y_centers = grid_axis
     xx, yy = np.meshgrid(x_centers, y_centers, indexing="xy")
@@ -352,8 +359,8 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
     x_eff = np.asarray(analysis.x_eff, dtype=float)
     signal = np.asarray(analysis.signal, dtype=float)
     confidence = np.asarray(analysis.confidence, dtype=float)
-    surprisal = np.asarray(analysis.surprisal, dtype=float)
-    sharpness = np.asarray(analysis.sharpness, dtype=float)
+    prior_entropy = np.asarray(analysis.prior_entropy, dtype=float)
+    mutual_information = np.asarray(analysis.mutual_information, dtype=float)
     idx = _scatter_sample_idx(len(totals), max_points=4500, seed=7)
     xy_modes = {
         "x_nc": {
@@ -395,12 +402,20 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
     color_metrics = {
         "signal": {"label": "Signal", "values": signal, "palette": "Viridis"},
         "confidence": {
-            "label": "Confidence",
+            "label": "Posterior entropy",
             "values": confidence,
             "palette": "Cividis",
         },
-        "surprisal": {"label": "Surprisal", "values": surprisal, "palette": "Magma"},
-        "sharpness": {"label": "Sharpness", "values": sharpness, "palette": "Plasma"},
+        "prior_entropy": {
+            "label": "Prior entropy",
+            "values": prior_entropy,
+            "palette": "Magma",
+        },
+        "mutual_information": {
+            "label": "Mutual information",
+            "values": mutual_information,
+            "palette": "Plasma",
+        },
         "xeff": {"label": "X_eff", "values": x_eff, "palette": "Turbo"},
     }
 
@@ -410,7 +425,7 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
         for key, mode in xy_modes.items():
             x_norm, x_lo, x_hi = _clip_and_normalize(mode["x"])
             y_norm, y_lo, y_hi = _clip_and_normalize(mode["y"])
-            xx, yy, zz, density = _binned_surface(x_norm, y_norm, z_norm, bins=128)
+            xx, yy, zz, density = _binned_surface(x_norm, y_norm, z_norm, bins=96)
             colors_payload = {}
             for metric_key, metric in color_metrics.items():
                 c_norm, c_lo, c_hi = _clip_and_normalize(metric["values"])
@@ -449,7 +464,12 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
         }
 
     payload_signal = build_payload(signal, "Signal", "Signal", "viridis")
-    payload_conf = build_payload(confidence, "Confidence", "Confidence", "cividis")
+    payload_conf = build_payload(
+        confidence,
+        "Posterior entropy",
+        "Posterior entropy",
+        "cividis",
+    )
     block_id = f"signal3d-{uuid.uuid4().hex[:8]}"
     return f"""
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
@@ -465,10 +485,10 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
             <option value="neff_over_n">X_eff vs N_c</option>
           </select>
           <select id="{block_id}-signal-color" class="interactive-3d-select">
-            <option value="confidence">Color: Confidence</option>
+            <option value="confidence">Color: Posterior entropy</option>
             <option value="signal">Color: Signal</option>
-            <option value="surprisal">Color: Surprisal</option>
-            <option value="sharpness">Color: Sharpness</option>
+            <option value="prior_entropy">Color: Prior entropy</option>
+            <option value="mutual_information">Color: Mutual information</option>
             <option value="xeff">Color: X_eff</option>
           </select>
           <span class="muted">surface color = density</span>
@@ -482,7 +502,7 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
         <div id="{block_id}-signal" class="interactive-3d-plot"></div>
       </div>
       <div class="interactive-3d-card">
-        <div class="interactive-3d-header">Confidence in observation space</div>
+        <div class="interactive-3d-header">Posterior entropy in observation space</div>
         <div class="interactive-3d-toolbar">
           <select id="{block_id}-confidence-mode" class="interactive-3d-select">
             <option value="x_nc">X_gc vs N_c</option>
@@ -493,9 +513,9 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
           </select>
           <select id="{block_id}-confidence-color" class="interactive-3d-select">
             <option value="signal">Color: Signal</option>
-            <option value="confidence">Color: Confidence</option>
-            <option value="surprisal">Color: Surprisal</option>
-            <option value="sharpness">Color: Sharpness</option>
+            <option value="confidence">Color: Posterior entropy</option>
+            <option value="prior_entropy">Color: Prior entropy</option>
+            <option value="mutual_information">Color: Mutual information</option>
             <option value="xeff">Color: X_eff</option>
           </select>
           <span class="muted">surface color = density</span>
@@ -547,8 +567,9 @@ def plot_signal_interface_3d_html(analysis: GeneAnalysis):
               z: mode.surface.z,
               surfacecolor: mode.surface.density,
               colorscale: 'Viridis',
-              opacity: 0.84,
+              opacity: 0.9,
               showscale: true,
+              connectgaps: false,
               visible: document.getElementById(prefix + '-surface').dataset.state !== 'off',
               colorbar: {{ title: 'Density', len: 0.78, x: 1.02 }},
               hovertemplate: mode.x_label + ': %{{x:.3f}}<br>' + mode.y_label + ': %{{y:.3f}}<br>' + payload.z_label + ': %{{z:.3f}}<extra></extra>',
@@ -648,13 +669,78 @@ def plot_posterior_gallery(analysis: GeneAnalysis):
         ax.axvline(analysis.signal[cell_idx], color="#c2410c", ls="--", lw=1.4)
         ax.set_title(
             f"x={fmt_int(analysis.counts[cell_idx])}, N={fmt_int(analysis.totals[cell_idx])}\n"
-            f"s={fmt_f(analysis.signal[cell_idx], 2)}, conf={fmt_f(analysis.confidence[cell_idx], 2)}",
+            f"s={fmt_f(analysis.signal[cell_idx], 2)}, H_post={fmt_f(analysis.confidence[cell_idx], 2)}",
             fontsize=10,
         )
         ax.set_xlabel("mu")
         ax.set_ylabel("Posterior")
     for ax in axes.flat[len(idx) :]:
         ax.set_axis_off()
+    fig.tight_layout()
+    return fig_to_uri(fig)
+
+
+def plot_hvg_overlap(result: GlobalEvaluationResult):
+    ks = np.asarray(sorted(result.hvg_overlap), dtype=int)
+    trad_entropy = np.asarray(
+        [result.hvg_overlap[int(k)]["trad_entropy"] for k in ks], dtype=float
+    )
+    trad_structure = np.asarray(
+        [result.hvg_overlap[int(k)]["trad_structure"] for k in ks], dtype=float
+    )
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.plot(
+        ks, trad_entropy, color="#0f766e", lw=2.5, marker="o", label="Trad vs Entropy"
+    )
+    ax.plot(
+        ks,
+        trad_structure,
+        color="#1d4ed8",
+        lw=2.5,
+        marker="s",
+        label="Trad vs Structure",
+    )
+    ax.set_title("HVG overlap@k")
+    ax.set_xlabel("Top-k")
+    ax.set_ylabel("Overlap")
+    ax.set_ylim(0.0, 1.0)
+    ax.legend(frameon=False)
+    ax.grid(alpha=0.2)
+    fig.tight_layout()
+    return fig_to_uri(fig)
+
+
+def plot_hvg_score_scatter(result: GlobalEvaluationResult):
+    rows = result.fg_gene_rows
+    x = np.asarray([float(row["trad_score"]) for row in rows], dtype=float)
+    y = np.asarray([float(row["entropy"]) for row in rows], dtype=float)
+    c = np.asarray([float(row["structure_score"]) for row in rows], dtype=float)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+    sc = ax.scatter(x, y, c=c, cmap="viridis", s=26, alpha=0.78, edgecolor="none")
+    ax.set_title("Traditional HVG score vs F_g entropy")
+    ax.set_xlabel("Traditional HVG score")
+    ax.set_ylabel("F_g entropy")
+    fig.colorbar(sc, ax=ax, shrink=0.86, label="Structure score")
+    fig.tight_layout()
+    return fig_to_uri(fig)
+
+
+def plot_hvg_top_gene_panels(result: GlobalEvaluationResult):
+    fig, axes = plt.subplots(1, 3, figsize=(18, 7))
+    panels = [
+        ("Traditional HVG", result.top_traditional_genes, "#155e75"),
+        ("F_g entropy", result.top_entropy_genes, "#0f766e"),
+        ("F_g structure", result.top_structure_genes, "#1d4ed8"),
+    ]
+    for ax, (title, rows, color) in zip(axes, panels, strict=False):
+        names = [name for name, _ in rows][:12][::-1]
+        values = [score for _, score in rows][:12][::-1]
+        ypos = np.arange(len(names))
+        ax.barh(ypos, values, color=color, alpha=0.88)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_title(title)
+        ax.grid(axis="x", alpha=0.2)
     fig.tight_layout()
     return fig_to_uri(fig)
 

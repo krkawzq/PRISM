@@ -85,6 +85,18 @@ def _coerce_pool_report(value: Any) -> PoolFitReport | None:
 def _infer_r_hint(checkpoint: dict[str, Any], s_hat: float) -> float | None:
     if s_hat <= 0:
         return None
+
+    pool_report = checkpoint.get("pool_report")
+    if isinstance(pool_report, dict):
+        try:
+            pool_report = PoolFitReport(**pool_report)
+        except TypeError:
+            pool_report = None
+    if isinstance(pool_report, PoolFitReport):
+        r_hint = float(pool_report.point_eta) / s_hat
+        if r_hint > 0:
+            return r_hint
+
     pool_estimate = checkpoint.get("pool_estimate")
     if isinstance(pool_estimate, dict):
         try:

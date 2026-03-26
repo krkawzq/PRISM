@@ -17,6 +17,7 @@ from sklearn.neighbors import NearestNeighbors
 from prism.baseline.fg_analysis import (
     FgAnalysisSummary,
     fg_entropy,
+    hvg_consistency_analysis,
     summarize_fg_analysis,
 )
 from prism.baseline.metrics import treatment_conditional_cv
@@ -45,46 +46,87 @@ class GlobalEvaluationResult:
     representation_metrics: dict[str, GlobalRepresentationMetric]
     fg_summary: FgAnalysisSummary
     top_entropy_genes: list[tuple[str, float]]
+    top_traditional_genes: list[tuple[str, float]]
+    hvg_overlap: dict[int, dict[str, float]]
+    hvg_divergent_genes: dict[str, list[str]]
+    top_structure_genes: list[tuple[str, float]]
+    fg_gene_rows: list[dict[str, float | str]]
+    hvg_spearman: dict[str, float]
+
+
+@dataclass(frozen=True, slots=True)
+class GlobalEvalParams:
+    max_cells: int = 2000
+    max_genes: int = 256
+    gene_batch_size: int = 64
+    random_seed: int = 0
 
 
 def compute_global_evaluation(
     state: AppState,
     *,
-    max_genes: int = 256,
-    gene_batch_size: int = 64,
+    params: GlobalEvalParams | None = None,
 ) -> GlobalEvaluationResult:
+    if params is None:
+        params = GlobalEvalParams()
+
     loaded = state.require_loaded()
     if loaded.model.engine is None or loaded.model.s_hat is None:
         raise ValueError("global evaluation requires a loaded checkpoint")
 
-    cache_key = _cache_key(loaded, max_genes)
+    cache_key = _cache_key(loaded, params)
     cached = state.get_cached_global_eval(cache_key)
     if cached is not None:
         print(f"[prism-server] global eval cache hit key={cache_key[:8]}", flush=True)
         return cached
 
+    return state.get_or_create_cache(
+        "global_eval",
+        cache_key,
+        lambda: _compute_global_evaluation_uncached(state, loaded, params),
+    )
+
+
+def _compute_global_evaluation_uncached(
+    state: AppState,
+    loaded: LoadedState,
+    params: GlobalEvalParams,
+) -> GlobalEvaluationResult:
+
     label_key, labels = _resolve_labels(loaded)
     print(
-        f"[prism-server] global eval start label_key={label_key} max_genes={max_genes}",
+        f"[prism-server] global eval start label_key={label_key} max_cells={params.max_cells} max_genes={params.max_genes} batch={params.gene_batch_size} seed={params.random_seed}",
         flush=True,
     )
-    gene_names, gene_positions = _select_gene_subset(loaded, max_genes)
+
+    cell_indices = _select_cell_subset(loaded, labels, params)
+    sampled_labels = labels[cell_indices]
+    sampled_totals = loaded.dataset.totals[cell_indices]
+    print(
+        f"[prism-server] global eval selected cells count={len(cell_indices)} of total={loaded.n_cells}",
+        flush=True,
+    )
+
+    gene_names, gene_positions = _select_gene_subset(loaded, params.max_genes)
     print(
         f"[prism-server] global eval selected genes count={len(gene_names)} top_gene={gene_names[0] if gene_names else '-'}",
         flush=True,
     )
-    raw = _slice_gene_matrix(loaded.dataset.matrix, gene_positions)
+
+    raw = _slice_gene_matrix(
+        loaded.dataset.matrix, gene_positions, cell_indices=cell_indices
+    )
     print(f"[prism-server] global eval raw matrix shape={raw.shape}", flush=True)
-    totals = loaded.dataset.totals
-    normalized = _normalize_total_matrix(raw, totals)
+    normalized = _normalize_total_matrix(raw, sampled_totals)
     print("[prism-server] global eval built NormalizeTotalX", flush=True)
     log1p_normalized = np.log1p(normalized)
     print("[prism-server] global eval built Log1pNormalizeTotalX", flush=True)
     signal = _extract_signal_matrix(
         loaded,
         gene_names=gene_names,
-        gene_positions=gene_positions,
-        batch_size=gene_batch_size,
+        counts=raw,
+        batch_size=params.gene_batch_size,
+        sampled_totals=sampled_totals,
     )
     print(
         f"[prism-server] global eval built signal matrix shape={signal.shape}",
@@ -92,25 +134,47 @@ def compute_global_evaluation(
     )
 
     representation_metrics = {
-        "X": _evaluate_matrix(raw, labels, name="X"),
-        "NormalizeTotalX": _evaluate_matrix(normalized, labels, name="NormalizeTotalX"),
-        "Log1pNormalizeTotalX": _evaluate_matrix(
-            log1p_normalized, labels, name="Log1pNormalizeTotalX"
+        "X": _evaluate_matrix(raw, sampled_labels, name="X"),
+        "NormalizeTotalX": _evaluate_matrix(
+            normalized, sampled_labels, name="NormalizeTotalX"
         ),
-        "signal": _evaluate_matrix(signal, labels, name="signal"),
+        "Log1pNormalizeTotalX": _evaluate_matrix(
+            log1p_normalized, sampled_labels, name="Log1pNormalizeTotalX"
+        ),
+        "signal": _evaluate_matrix(signal, sampled_labels, name="signal"),
     }
+
     print("[prism-server] global eval starting F_g analysis", flush=True)
-    fg_summary, top_entropy_genes = _analyze_fg(loaded)
+    fg_cache_key = _fg_cache_key(loaded)
+    (
+        fg_summary,
+        top_entropy_genes,
+        hvg_overlap,
+        hvg_divergent_genes,
+        top_structure_genes,
+        fg_gene_rows,
+        hvg_spearman,
+        top_traditional_genes,
+    ) = state.get_or_create_cache(
+        "fg_analysis",
+        fg_cache_key,
+        lambda: _analyze_fg(loaded),
+    )
     result = GlobalEvaluationResult(
         label_key=label_key,
-        n_labels=int(np.unique(labels).size),
+        n_labels=int(np.unique(sampled_labels).size),
         n_cells=int(raw.shape[0]),
         n_genes=int(raw.shape[1]),
         representation_metrics=representation_metrics,
         fg_summary=fg_summary,
         top_entropy_genes=top_entropy_genes,
+        top_traditional_genes=top_traditional_genes,
+        hvg_overlap=hvg_overlap,
+        hvg_divergent_genes=hvg_divergent_genes,
+        top_structure_genes=top_structure_genes,
+        fg_gene_rows=fg_gene_rows,
+        hvg_spearman=hvg_spearman,
     )
-    state.set_cached_global_eval(cache_key, result)
     print(
         f"[prism-server] global eval done cells={result.n_cells} genes={result.n_genes}",
         flush=True,
@@ -144,8 +208,15 @@ def _select_gene_subset(
     return gene_names, keep
 
 
-def _slice_gene_matrix(matrix, gene_positions: np.ndarray) -> np.ndarray:
+def _slice_gene_matrix(
+    matrix,
+    gene_positions: np.ndarray,
+    *,
+    cell_indices: np.ndarray | None = None,
+) -> np.ndarray:
     subset = matrix[:, gene_positions]
+    if cell_indices is not None:
+        subset = subset[cell_indices, :]
     if sparse.issparse(subset):
         return np.asarray(subset.toarray(), dtype=DTYPE_NP)
     return np.asarray(subset, dtype=DTYPE_NP)
@@ -161,8 +232,9 @@ def _extract_signal_matrix(
     loaded: LoadedState,
     *,
     gene_names: list[str],
-    gene_positions: np.ndarray,
+    counts: np.ndarray,
     batch_size: int,
+    sampled_totals: np.ndarray,
 ) -> np.ndarray:
     if loaded.model.engine is None or loaded.model.s_hat is None:
         raise ValueError("global evaluation requires checkpoint engine and s_hat")
@@ -170,7 +242,6 @@ def _extract_signal_matrix(
     if priors is None:
         raise ValueError("failed to read checkpoint priors for global evaluation")
     posterior = Posterior(gene_names, priors)
-    counts = _slice_gene_matrix(loaded.dataset.matrix, gene_positions)
     signal = np.zeros_like(counts, dtype=np.float32)
     offsets = range(0, len(gene_names), batch_size)
     total_batches = max((len(gene_names) + batch_size - 1) // batch_size, 1)
@@ -184,7 +255,7 @@ def _extract_signal_matrix(
         batch = GeneBatch(
             gene_names=batch_gene_names,
             counts=batch_counts,
-            totals=loaded.dataset.totals,
+            totals=sampled_totals,
         )
         extracted = posterior.extract(
             batch, s_hat=float(loaded.model.s_hat), channels={"signal"}
@@ -277,20 +348,64 @@ def _mean_treatment_cv(matrix: np.ndarray, labels: np.ndarray) -> float | None:
     return float(np.mean(cvs))
 
 
-def _cache_key(loaded: LoadedState, max_genes: int) -> str:
+def _cache_key(loaded: LoadedState, params: GlobalEvalParams) -> str:
     payload = (
-        str(loaded.dataset.h5ad_path),
-        loaded.dataset.layer,
-        str(loaded.model.ckpt_path),
-        int(max_genes),
-        tuple(loaded.fitted_gene_names[:max_genes]),
+        loaded.context_key,
+        params.max_cells,
+        params.max_genes,
+        params.gene_batch_size,
+        params.random_seed,
+        tuple(loaded.fitted_gene_names[: params.max_genes]),
     )
     return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
 
 
+def _select_cell_subset(
+    loaded: LoadedState,
+    labels: np.ndarray,
+    params: GlobalEvalParams,
+) -> np.ndarray:
+    max_cells = int(params.max_cells)
+    if max_cells <= 0 or max_cells >= loaded.n_cells:
+        return np.arange(loaded.n_cells, dtype=np.int64)
+    rng = np.random.default_rng(params.random_seed)
+    labels = np.asarray(labels)
+    chosen: list[np.ndarray] = []
+    unique_labels = np.unique(labels)
+    per_group = max(1, max_cells // max(len(unique_labels), 1))
+    for label in unique_labels:
+        indices = np.flatnonzero(labels == label)
+        take = min(indices.size, per_group)
+        if take > 0:
+            chosen.append(np.sort(rng.choice(indices, size=take, replace=False)))
+    sampled = np.concatenate(chosen) if chosen else np.asarray([], dtype=np.int64)
+    if sampled.size < max_cells:
+        remaining = np.setdiff1d(
+            np.arange(loaded.n_cells, dtype=np.int64), sampled, assume_unique=False
+        )
+        extra = min(max_cells - sampled.size, remaining.size)
+        if extra > 0:
+            sampled = np.concatenate(
+                [sampled, np.sort(rng.choice(remaining, size=extra, replace=False))]
+            )
+    sampled = np.unique(sampled)
+    if sampled.size > max_cells:
+        sampled = np.sort(rng.choice(sampled, size=max_cells, replace=False))
+    return np.asarray(sampled, dtype=np.int64)
+
+
 def _analyze_fg(
     loaded: LoadedState,
-) -> tuple[FgAnalysisSummary, list[tuple[str, float]]]:
+) -> tuple[
+    FgAnalysisSummary,
+    list[tuple[str, float]],
+    dict[int, dict[str, float]],
+    dict[str, list[str]],
+    list[tuple[str, float]],
+    list[dict[str, float | str]],
+    dict[str, float],
+    list[tuple[str, float]],
+]:
     if loaded.model.engine is None:
         raise ValueError("F_g analysis requires checkpoint engine")
     gene_names = list(loaded.fitted_gene_names)
@@ -305,19 +420,71 @@ def _analyze_fg(
     ) / max(loaded.n_cells, 1)
     subset = _slice_gene_matrix(loaded.dataset.matrix, gene_idx)
     normalized = _normalize_total_matrix(subset, loaded.dataset.totals)
-    hvg_scores = np.var(normalized, axis=0) / np.maximum(
-        np.mean(normalized, axis=0), 1e-12
+    consistency = hvg_consistency_analysis(
+        counts=subset,
+        totals=loaded.dataset.totals,
+        prior=priors,
+        gene_names=gene_names,
     )
     summary = summarize_fg_analysis(
-        priors, mean_expression=mean_expression, hvg_scores=hvg_scores
+        priors,
+        mean_expression=mean_expression,
+        hvg_scores=consistency.traditional_scores,
+        structure_scores=consistency.structure_scores,
     )
     entropy = fg_entropy(priors)
     order = np.argsort(entropy)[::-1][:20]
     top_entropy_genes = [
         (gene_names[int(idx)], float(entropy[int(idx)])) for idx in order
     ]
+    structure_order = np.argsort(consistency.structure_scores)[::-1][:20]
+    top_structure_genes = [
+        (gene_names[int(idx)], float(consistency.structure_scores[int(idx)]))
+        for idx in structure_order
+    ]
+    traditional_order = np.argsort(consistency.traditional_scores)[::-1][:20]
+    top_traditional_genes = [
+        (gene_names[int(idx)], float(consistency.traditional_scores[int(idx)]))
+        for idx in traditional_order
+    ]
+    row_order = np.argsort(
+        consistency.structure_scores - consistency.traditional_scores
+    )[::-1]
+    fg_gene_rows = [
+        {
+            "gene_name": gene_names[int(idx)],
+            "mean_expr": float(mean_expression[int(idx)]),
+            "trad_score": float(consistency.traditional_scores[int(idx)]),
+            "entropy": float(entropy[int(idx)]),
+            "peak_count": float(consistency.peak_counts[int(idx)]),
+            "inflection_count": float(consistency.inflection_counts[int(idx)]),
+            "structure_score": float(consistency.structure_scores[int(idx)]),
+        }
+        for idx in row_order[:200]
+    ]
     print(
         f"[prism-server] F_g analysis done genes={len(gene_names)} entropy_mean={summary.entropy_mean:.4f} hvg_rho={summary.hvg_spearman:.4f}",
         flush=True,
     )
-    return summary, top_entropy_genes
+    return (
+        summary,
+        top_entropy_genes,
+        consistency.overlap,
+        {
+            "traditional_only": consistency.traditional_only,
+            "entropy_only": consistency.entropy_only,
+            "structure_only": consistency.structure_only,
+        },
+        top_structure_genes,
+        fg_gene_rows,
+        {
+            "trad_vs_entropy": float(consistency.spearman_trad_vs_entropy),
+            "trad_vs_structure": float(consistency.spearman_trad_vs_structure),
+        },
+        top_traditional_genes,
+    )
+
+
+def _fg_cache_key(loaded: LoadedState) -> str:
+    payload = (loaded.context_key, "fg_analysis", tuple(loaded.fitted_gene_names))
+    return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()

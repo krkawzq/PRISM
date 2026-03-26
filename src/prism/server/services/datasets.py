@@ -77,7 +77,9 @@ def build_gene_to_idx(gene_names: np.ndarray) -> dict[str, int]:
 def resolve_gene_query(
     query: str,
     gene_names: np.ndarray,
+    gene_names_lower: tuple[str, ...],
     gene_to_idx: dict[str, int],
+    gene_lower_to_idx: dict[str, int],
 ) -> int:
     token = query.strip()
     if not token:
@@ -92,13 +94,9 @@ def resolve_gene_query(
             return idx
 
     lowered = token.lower()
-    exact = [
-        idx
-        for idx, name in enumerate(gene_names.tolist())
-        if str(name).lower() == lowered
-    ]
-    if exact:
-        return int(exact[0])
+    exact = gene_lower_to_idx.get(lowered)
+    if exact is not None:
+        return int(exact)
 
     raise GeneNotFoundError(f"gene query {query!r} not found")
 
@@ -106,20 +104,20 @@ def resolve_gene_query(
 def search_gene_candidates(
     query: str,
     gene_names: np.ndarray,
+    gene_names_lower: tuple[str, ...],
     gene_total_counts: np.ndarray,
     gene_detected_counts: np.ndarray,
+    ranked_indices: np.ndarray,
     n_cells: int,
     limit: int,
 ) -> list[GeneCandidate]:
     token = query.strip().lower()
     indices: list[int] = []
-    for idx, name in enumerate(gene_names.tolist()):
-        if not token or token in str(name).lower():
-            indices.append(idx)
-
-    indices = sorted(
-        indices, key=lambda idx: float(gene_total_counts[idx]), reverse=True
-    )[:limit]
+    for idx in ranked_indices.tolist():
+        if not token or token in gene_names_lower[int(idx)]:
+            indices.append(int(idx))
+            if len(indices) >= limit:
+                break
     return [
         GeneCandidate(
             gene_name=str(gene_names[idx]),

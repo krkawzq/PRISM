@@ -10,7 +10,7 @@ def render_page(*, title: str, body: str) -> str:
     <meta charset=\"utf-8\">
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
     <title>{escape(title)}</title>
-    <link rel=\"stylesheet\" href=\"/assets/base.css\">
+    <link rel=\"stylesheet\" href=\"/assets/base.css?v=20260321b\">
   </head>
   <body>
     <main class=\"page\">{body}</main>
