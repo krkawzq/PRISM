@@ -84,20 +84,16 @@ def resolve_gene_query(
     token = query.strip()
     if not token:
         raise GeneNotFoundError("empty gene query")
-
     if token in gene_to_idx:
         return gene_to_idx[token]
-
     if token.isdigit():
         idx = int(token)
         if 0 <= idx < len(gene_names):
             return idx
-
     lowered = token.lower()
     exact = gene_lower_to_idx.get(lowered)
     if exact is not None:
         return int(exact)
-
     raise GeneNotFoundError(f"gene query {query!r} not found")
 
 
@@ -137,3 +133,33 @@ def slice_gene_counts(matrix: Any, gene_index: int) -> np.ndarray:
     else:
         values = np.asarray(subset).reshape(-1)
     return np.asarray(values, dtype=DTYPE_NP)
+
+
+def slice_gene_matrix(
+    matrix: Any, gene_positions: list[int], *, cell_indices: np.ndarray | None = None
+) -> np.ndarray:
+    subset = matrix[:, gene_positions]
+    if cell_indices is not None:
+        subset = subset[cell_indices, :]
+    if sparse.issparse(subset):
+        return np.asarray(subset.toarray(), dtype=DTYPE_NP)
+    return np.asarray(subset, dtype=DTYPE_NP)
+
+
+def compute_reference_counts(
+    matrix: Any, gene_positions: list[int], *, cell_indices: np.ndarray | None = None
+) -> np.ndarray:
+    subset = matrix[:, gene_positions]
+    if cell_indices is not None:
+        subset = subset[cell_indices, :]
+    if sparse.issparse(subset):
+        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
+    else:
+        totals = np.asarray(subset, dtype=DTYPE_NP).sum(axis=1)
+    return np.asarray(totals, dtype=DTYPE_NP).reshape(-1)
+
+
+def resolve_gene_positions(
+    gene_names: list[str] | tuple[str, ...], gene_to_idx: dict[str, int]
+) -> list[int]:
+    return [gene_to_idx[name] for name in gene_names if name in gene_to_idx]

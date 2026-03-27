@@ -10,6 +10,7 @@ from prism.model import OptimizerName, SchedulerName
 
 from .router import Request, Response, Router
 from .services.analysis import (
+    KBulkParams,
     GeneBrowsePage,
     GeneFitParams,
     analyze_gene,
@@ -17,20 +18,16 @@ from .services.analysis import (
     build_dataset_summary,
     search_gene_candidates,
     summarize_gene_expression,
-    top_fitted_genes,
 )
 from .services.datasets import GeneNotFoundError, resolve_gene_query, slice_gene_counts
 from .services.figures import (
-    plot_hvg_overlap,
     plot_gene_overview,
-    plot_init_comparison,
+    plot_global_overview,
+    plot_kbulk_comparison,
     plot_loss_trace,
     plot_posterior_gallery,
     plot_prior_fit,
     plot_signal_interface,
-    plot_signal_interface_3d_html,
-    plot_stage0,
-    treatment_block,
 )
 from .services.global_eval import GlobalEvalParams, compute_global_evaluation
 from .state import AppState
@@ -51,7 +48,6 @@ def build_router(state: AppState) -> Router:
 
 
 def handle_home(request: Request, state: AppState) -> Response:
-    print(f"[prism-server] route / query={request.query}", flush=True)
     loaded = state.loaded
     query = (request.first("q") or "").strip()
     browse_query = (request.first("browse_q") or query).strip()
@@ -59,21 +55,20 @@ def handle_home(request: Request, state: AppState) -> Response:
     browse_dir = (request.first("browse_dir") or "desc").strip().lower()
     browse_scope = (request.first("browse_scope") or "auto").strip().lower()
     browse_page = max(1, int((request.first("browse_page") or "1").strip() or "1"))
+    params = _parse_global_eval_params(request)
     if loaded is None:
-        html = render_home_page(
-            dataset_summary=None,
-            gene_browser=None,
-            search_query=query,
-            h5ad_path="",
-            ckpt_path="",
-            layer="",
-            global_eval_params=_parse_global_eval_params(request),
+        return Response.html(
+            render_home_page(
+                dataset_summary=None,
+                gene_browser=None,
+                search_query=query,
+                h5ad_path="",
+                ckpt_path="",
+                layer="",
+                global_eval_params=params,
+            )
         )
-        return Response.html(html)
 
-    gene_browser: GeneBrowsePage | None = None
-    global_eval = None
-    global_eval_figures = None
     gene_browser = browse_gene_candidates(
         state,
         query=browse_query,
@@ -82,120 +77,90 @@ def handle_home(request: Request, state: AppState) -> Response:
         page=browse_page,
         scope=browse_scope,
     )
-    global_eval_params = _parse_global_eval_params(request)
-    if request.first("global_eval") == "1" and loaded.model.ckpt_path is not None:
-        print("[prism-server] requested global evaluation from home page", flush=True)
-        try:
-            print(
-                f"[prism-server] global eval params={global_eval_params}",
-                flush=True,
+    global_eval = None
+    global_figures = None
+    if request.first("global_eval") == "1" and loaded.checkpoint is not None:
+        global_eval = compute_global_evaluation(state, params=params)
+        global_figures = {
+            "global_overview": _cached_figure(
+                state,
+                "home",
+                "global_overview",
+                lambda: plot_global_overview(global_eval),
             )
-            global_eval = compute_global_evaluation(state, params=global_eval_params)
-            global_key = f"global-{global_eval_params.max_cells}-{global_eval_params.max_genes}-{global_eval_params.gene_batch_size}-{global_eval_params.random_seed}"
-            global_eval_figures = {
-                "overlap": _cached_figure(
-                    state,
-                    global_key,
-                    "hvg_overlap",
-                    lambda: plot_hvg_overlap(global_eval),
-                ),
-            }
-        except Exception as exc:
-            print(f"[prism-server] global evaluation failed: {exc}", flush=True)
-
-    html = _cached_html(
-        state,
-        "home",
-        (
-            f"query={query}|browse_q={browse_query}|sort={browse_sort}|dir={browse_dir}|"
-            f"scope={browse_scope}|page={browse_page}|global_eval={'1' if global_eval is not None else '0'}|"
-            f"ge={global_eval_params.max_cells}-{global_eval_params.max_genes}-{global_eval_params.gene_batch_size}-{global_eval_params.random_seed}"
-        ),
-        lambda: render_home_page(
-            dataset_summary=build_dataset_summary(state),
-            gene_browser=gene_browser,
-            search_query=query,
-            h5ad_path=str(loaded.dataset.h5ad_path),
-            ckpt_path=""
-            if loaded.model.ckpt_path is None
-            else str(loaded.model.ckpt_path),
-            layer=loaded.dataset.layer or "",
-            global_eval=global_eval,
-            global_eval_params=global_eval_params,
-            global_eval_figures=global_eval_figures,
-        ),
+        }
+    html = render_home_page(
+        dataset_summary=build_dataset_summary(state),
+        gene_browser=gene_browser,
+        search_query=query,
+        h5ad_path=str(loaded.dataset.h5ad_path),
+        ckpt_path="" if loaded.checkpoint is None else str(loaded.checkpoint.ckpt_path),
+        layer=loaded.dataset.layer or "",
+        global_eval=global_eval,
+        global_eval_params=params,
+        global_eval_figures=global_figures,
     )
     return Response.html(html)
 
 
 def handle_load(request: Request, state: AppState) -> Response:
-    print(f"[prism-server] route /load query={request.query}", flush=True)
-    global_eval_params = _parse_global_eval_params(request)
     h5ad_path = (request.first("h5ad") or "").strip()
     ckpt_path = (request.first("ckpt") or "").strip()
     layer = (request.first("layer") or "").strip() or None
+    params = _parse_global_eval_params(request)
     if not h5ad_path:
-        html = render_home_page(
-            dataset_summary=None,
-            gene_browser=None,
-            h5ad_path=h5ad_path,
-            ckpt_path=ckpt_path,
-            layer=layer or "",
-            error_message="h5ad path is required.",
-            global_eval_params=global_eval_params,
+        return Response.html(
+            render_home_page(
+                dataset_summary=None,
+                gene_browser=None,
+                h5ad_path=h5ad_path,
+                ckpt_path=ckpt_path,
+                layer=layer or "",
+                error_message="h5ad path is required.",
+                global_eval_params=params,
+            ),
+            status=HTTPStatus.BAD_REQUEST,
         )
-        return Response.html(html, status=HTTPStatus.BAD_REQUEST)
-
     try:
         loaded = state.load(
             h5ad_path=h5ad_path, ckpt_path=ckpt_path or None, layer=layer
         )
     except Exception as exc:
-        html = render_home_page(
-            dataset_summary=None,
-            gene_browser=None,
-            h5ad_path=h5ad_path,
-            ckpt_path=ckpt_path,
-            layer=layer or "",
-            error_message=str(exc),
-            global_eval_params=global_eval_params,
+        return Response.html(
+            render_home_page(
+                dataset_summary=None,
+                gene_browser=None,
+                h5ad_path=h5ad_path,
+                ckpt_path=ckpt_path,
+                layer=layer or "",
+                error_message=str(exc),
+                global_eval_params=params,
+            ),
+            status=HTTPStatus.BAD_REQUEST,
         )
-        return Response.html(html, status=HTTPStatus.BAD_REQUEST)
-
-    html = _cached_html(
-        state,
-        "home",
-        "default",
-        lambda: render_home_page(
-            dataset_summary=build_dataset_summary(state),
-            gene_browser=browse_gene_candidates(state),
-            h5ad_path=str(loaded.dataset.h5ad_path),
-            ckpt_path=""
-            if loaded.model.ckpt_path is None
-            else str(loaded.model.ckpt_path),
-            layer=loaded.dataset.layer or "",
-            global_eval=None,
-            global_eval_params=global_eval_params,
-        ),
+    html = render_home_page(
+        dataset_summary=build_dataset_summary(state),
+        gene_browser=browse_gene_candidates(state),
+        h5ad_path=str(loaded.dataset.h5ad_path),
+        ckpt_path="" if loaded.checkpoint is None else str(loaded.checkpoint.ckpt_path),
+        layer=loaded.dataset.layer or "",
+        global_eval=None,
+        global_eval_params=params,
     )
     return Response.html(html)
 
 
 def handle_gene(request: Request, state: AppState) -> Response:
-    print(f"[prism-server] route /gene query={request.query}", flush=True)
     loaded = state.loaded
     if loaded is None:
         return Response.redirect("/")
     query = (request.first("q") or "").strip()
     if not query:
         return Response.redirect("/")
-
-    fit_params = None
-    if request.first("fit") == "1":
-        fit_params = _parse_fit_params(request)
-        print(f"[prism-server] parsed fit params={fit_params}", flush=True)
-    include_3d = request.first("view3d") != "0"
-
+    fit_params = _parse_fit_params(request) if request.first("fit") == "1" else None
+    kbulk_params = (
+        _parse_kbulk_params(request) if request.first("kbulk") == "1" else None
+    )
     try:
         gene_index = resolve_gene_query(
             query,
@@ -205,29 +170,30 @@ def handle_gene(request: Request, state: AppState) -> Response:
             loaded.dataset.gene_lower_to_idx,
         )
     except GeneNotFoundError:
-        html = render_home_page(
-            dataset_summary=build_dataset_summary(state),
-            gene_browser=browse_gene_candidates(state, query=query),
-            search_query=query,
-            h5ad_path=str(loaded.dataset.h5ad_path),
-            ckpt_path=""
-            if loaded.model.ckpt_path is None
-            else str(loaded.model.ckpt_path),
-            layer=loaded.dataset.layer or "",
-            error_message=f"Gene {query!r} not found.",
+        return Response.html(
+            render_home_page(
+                dataset_summary=build_dataset_summary(state),
+                gene_browser=browse_gene_candidates(state, query=query),
+                search_query=query,
+                h5ad_path=str(loaded.dataset.h5ad_path),
+                ckpt_path=""
+                if loaded.checkpoint is None
+                else str(loaded.checkpoint.ckpt_path),
+                layer=loaded.dataset.layer or "",
+                error_message=f"Gene {query!r} not found.",
+            ),
+            status=HTTPStatus.NOT_FOUND,
         )
-        return Response.html(html, status=HTTPStatus.NOT_FOUND)
-
     gene_name = str(loaded.dataset.gene_names[gene_index])
-    has_checkpoint_prior = (
-        loaded.model.engine is not None and loaded.model.engine.is_fitted(gene_name)
+    has_checkpoint_prior = loaded.checkpoint is not None and gene_name in set(
+        loaded.fitted_gene_names
     )
-    if not has_checkpoint_prior and fit_params is None:
+    if not has_checkpoint_prior and fit_params is None and kbulk_params is None:
         summary = summarize_gene_expression(loaded, gene_index)
         figures = {
             "gene_overview": _cached_figure(
                 state,
-                state.make_cache_key("pending_gene", gene_name),
+                f"pending-{gene_name}",
                 "gene_overview",
                 lambda: plot_gene_overview(
                     summary,
@@ -236,45 +202,29 @@ def handle_gene(request: Request, state: AppState) -> Response:
                 ),
             )
         }
-        html = _cached_html(
-            state,
-            state.make_cache_key("pending_gene", gene_name),
-            "gene_pending_page",
-            lambda: render_gene_pending_page(
+        return Response.html(
+            render_gene_pending_page(
                 gene_name=gene_name,
                 gene_index=gene_index,
                 summary=summary,
                 search_query=query,
-                candidates=search_gene_candidates(state, query, limit=8),
                 fit_params=None,
+                kbulk_params=None if kbulk_params is None else asdict(kbulk_params),
+                candidates=search_gene_candidates(state, query, limit=8),
                 figures=figures,
-            ),
+                has_checkpoint=loaded.checkpoint is not None,
+            )
         )
-        return Response.html(html)
-
-    try:
-        analysis = analyze_gene(state, query, fit_params=fit_params)
-    except GeneNotFoundError:
-        html = render_home_page(
-            dataset_summary=build_dataset_summary(state),
-            gene_browser=browse_gene_candidates(state, query=query),
-            search_query=query,
-            h5ad_path=str(loaded.dataset.h5ad_path),
-            ckpt_path=""
-            if loaded.model.ckpt_path is None
-            else str(loaded.model.ckpt_path),
-            layer=loaded.dataset.layer or "",
-            error_message=f"Gene {query!r} not found.",
-        )
-        return Response.html(html, status=HTTPStatus.NOT_FOUND)
-
+    analysis = analyze_gene(
+        state, query, fit_params=fit_params, kbulk_params=kbulk_params
+    )
     figures = {
         "gene_overview": _cached_figure(
             state,
             analysis.cache_key,
             "gene_overview",
             lambda: plot_gene_overview(
-                analysis.summary, analysis.counts, analysis.totals
+                analysis.summary, analysis.counts, analysis.reference_counts
             ),
         ),
         "prior_fit": _cached_figure(
@@ -293,60 +243,31 @@ def handle_gene(request: Request, state: AppState) -> Response:
             lambda: plot_posterior_gallery(analysis),
         ),
     }
-    if analysis.pool_report is not None:
-        figures["stage0"] = _cached_figure(
-            state,
-            analysis.cache_key,
-            "stage0",
-            lambda: plot_stage0(analysis.pool_report, analysis.totals),
-        )
-    if analysis.prior_report is not None:
+    if analysis.fit_result is not None:
         figures["loss_trace"] = _cached_figure(
+            state, analysis.cache_key, "loss_trace", lambda: plot_loss_trace(analysis)
+        )
+    if analysis.kbulk is not None:
+        comparison = analysis.kbulk
+        figures["kbulk"] = _cached_figure(
             state,
             analysis.cache_key,
-            "loss_trace",
-            lambda: plot_loss_trace(analysis.prior_report),
+            "kbulk",
+            lambda: plot_kbulk_comparison(comparison),
         )
-        figures["init_comparison"] = _cached_figure(
-            state,
-            analysis.cache_key,
-            "init_comparison",
-            lambda: plot_init_comparison(analysis.prior_report),
-        )
-    if include_3d:
-        figures["signal_3d"] = _cached_figure(
-            state,
-            analysis.cache_key,
-            "signal_3d",
-            lambda: plot_signal_interface_3d_html(analysis),
-        )
-
-    treatment_html = _cached_html(
-        state,
-        analysis.cache_key,
-        "treatment_block",
-        lambda: treatment_block(analysis.summary),
-    )
-
-    html = _cached_html(
-        state,
-        analysis.cache_key,
-        "gene_page",
-        lambda: render_gene_page(
-            analysis=analysis,
-            figures=figures,
-            search_query=query,
-            candidates=search_gene_candidates(state, query, limit=8),
-            fit_params=None if fit_params is None else asdict(fit_params),
-            treatment_block_html=treatment_html,
-            include_3d=include_3d,
-        ),
+    html = render_gene_page(
+        analysis=analysis,
+        figures=figures,
+        search_query=query,
+        candidates=search_gene_candidates(state, query, limit=8),
+        fit_params=None if fit_params is None else asdict(fit_params),
+        kbulk_params=None if kbulk_params is None else asdict(kbulk_params),
+        has_checkpoint=loaded.checkpoint is not None,
     )
     return Response.html(html)
 
 
 def handle_health(_: Request, state: AppState) -> Response:
-    print("[prism-server] route /api/health", flush=True)
     loaded = state.loaded
     return Response.json(
         {
@@ -355,12 +276,14 @@ def handle_health(_: Request, state: AppState) -> Response:
             "n_cells": 0 if loaded is None else loaded.n_cells,
             "n_genes": 0 if loaded is None else loaded.n_genes,
             "fitted_genes": 0 if loaded is None else len(loaded.fitted_gene_names),
+            "has_checkpoint": False
+            if loaded is None
+            else loaded.checkpoint is not None,
         }
     )
 
 
 def handle_search(request: Request, state: AppState) -> Response:
-    print(f"[prism-server] route /api/search query={request.query}", flush=True)
     if state.loaded is None:
         return Response.json([])
     query = (request.first("q") or "").strip()
@@ -372,28 +295,18 @@ def handle_asset(request: Request) -> Response:
     asset_name = request.path.removeprefix("/assets/")
     if not asset_name:
         return Response.text("Not Found", status=HTTPStatus.NOT_FOUND)
-
     asset_path = resources.files("prism.server.assets").joinpath(asset_name)
     if not asset_path.is_file():
         return Response.text("Not Found", status=HTTPStatus.NOT_FOUND)
-
     content_type = (
         "text/css; charset=utf-8"
         if asset_name.endswith(".css")
         else "application/octet-stream"
     )
-    body = _read_asset_bytes(asset_name)
-    if asset_name.endswith(".css"):
-        return Response(
-            status=HTTPStatus.OK,
-            content_type=content_type,
-            body=body,
-            headers={"Cache-Control": "public, max-age=3600"},
-        )
     return Response(
         status=HTTPStatus.OK,
         content_type=content_type,
-        body=body,
+        body=_read_asset_bytes(asset_name),
         headers={"Cache-Control": "public, max-age=3600"},
     )
 
@@ -416,9 +329,13 @@ def _parse_fit_params(request: Request) -> GeneFitParams:
     torch_dtype: Literal["float64", "float32"] | str = first("torch_dtype", "float64")
     if torch_dtype not in {"float64", "float32"}:
         torch_dtype = "float64"
-
+    reference_mode = first("reference_mode", "checkpoint")
+    if reference_mode not in {"checkpoint", "all"}:
+        reference_mode = "checkpoint"
+    s_raw = request.first("S")
     return GeneFitParams(
-        r=float(first("r", "0.05")),
+        S=None if s_raw is None or s_raw.strip() == "" else float(s_raw),
+        reference_mode=cast(Literal["checkpoint", "all"], reference_mode),
         grid_size=int(first("grid_size", "512")),
         sigma_bins=float(first("sigma_bins", "1.0")),
         align_loss_weight=float(first("align_loss_weight", "1.0")),
@@ -433,7 +350,7 @@ def _parse_fit_params(request: Request) -> GeneFitParams:
         optimizer=cast(OptimizerName, optimizer),
         scheduler=cast(SchedulerName, scheduler),
         torch_dtype=cast(Literal["float64", "float32"], torch_dtype),
-        device=first("device", "cuda"),
+        device=first("device", "cpu"),
     )
 
 
@@ -442,46 +359,33 @@ def _parse_global_eval_params(request: Request) -> GlobalEvalParams:
         value = request.first(name)
         return default if value is None or value == "" else value
 
-    max_cells = max(0, int(first("ge_max_cells", "2000")))
-    max_genes = max(16, int(first("ge_max_genes", "256")))
-    gene_batch_size = max(8, int(first("ge_batch", "64")))
-    random_seed = max(0, int(first("ge_seed", "0")))
     return GlobalEvalParams(
-        max_cells=max_cells,
-        max_genes=max_genes,
-        gene_batch_size=gene_batch_size,
-        random_seed=random_seed,
+        max_cells=max(64, int(first("ge_max_cells", "2000"))),
+        max_genes=max(8, int(first("ge_max_genes", "256"))),
+        gene_batch_size=max(1, int(first("ge_batch", "64"))),
+        random_seed=max(0, int(first("ge_seed", "0"))),
+    )
+
+
+def _parse_kbulk_params(request: Request) -> KBulkParams:
+    def first(name: str, default: str) -> str:
+        value = request.first(name)
+        return default if value is None or value == "" else value
+
+    return KBulkParams(
+        k=max(2, int(first("kbulk_k", "8"))),
+        n_samples=max(1, int(first("kbulk_samples", "24"))),
+        max_groups=max(1, int(first("kbulk_groups", "4"))),
+        min_cells_per_group=max(4, int(first("kbulk_min_cells", "24"))),
+        random_seed=max(0, int(first("kbulk_seed", "0"))),
     )
 
 
 def _cached_figure(
-    state: AppState,
-    analysis_key: str,
-    figure_name: str,
-    factory,
+    state: AppState, analysis_key: str, figure_name: str, factory
 ) -> str:
     cache_key = state.make_cache_key("figures", analysis_key, figure_name)
-    cached = state.get_cache("figures", cache_key)
-    if cached is not None:
-        print(f"[prism-server] figure cache hit name={figure_name}", flush=True)
-        return cast(str, cached)
-    print(f"[prism-server] figure cache miss name={figure_name}", flush=True)
     return cast(str, state.get_or_create_cache("figures", cache_key, factory))
-
-
-def _cached_html(
-    state: AppState,
-    analysis_key: str,
-    name: str,
-    factory,
-) -> str:
-    cache_key = state.make_cache_key("html", analysis_key, name)
-    cached = state.get_cache("html", cache_key)
-    if cached is not None:
-        print(f"[prism-server] html cache hit name={name}", flush=True)
-        return cast(str, cached)
-    print(f"[prism-server] html cache miss name={name}", flush=True)
-    return cast(str, state.get_or_create_cache("html", cache_key, factory))
 
 
 @lru_cache(maxsize=32)
