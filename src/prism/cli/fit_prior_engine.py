@@ -43,12 +43,12 @@ def fit_priors_command(
     output_path: Path = typer.Option(
         ..., "--output", "-o", help="Output checkpoint path."
     ),
-    reference_genes_path: Path = typer.Option(
-        ...,
+    reference_genes_path: Path | None = typer.Option(
+        None,
         "--reference-genes",
         exists=True,
         dir_okay=False,
-        help="Text file with reference gene names used to compute reference counts.",
+        help="Optional text file with reference gene names used to compute reference counts. Defaults to all genes in the dataset.",
     ),
     fit_genes_path: Path | None = typer.Option(
         None,
@@ -101,7 +101,11 @@ def fit_priors_command(
     start_time = perf_counter()
     h5ad_path = h5ad_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
-    reference_genes_path = reference_genes_path.expanduser().resolve()
+    reference_genes_path = (
+        None
+        if reference_genes_path is None
+        else reference_genes_path.expanduser().resolve()
+    )
     fit_genes_path = (
         None if fit_genes_path is None else fit_genes_path.expanduser().resolve()
     )
@@ -128,11 +132,15 @@ def fit_priors_command(
     gene_names = [str(name) for name in adata.var_names.tolist()]
     gene_to_idx = {name: idx for idx, name in enumerate(gene_names)}
 
-    reference_gene_names, missing_reference = _resolve_gene_list(
-        reference_genes_path, gene_to_idx
-    )
-    if not reference_gene_names:
-        raise ValueError("reference gene list has no overlap with the dataset")
+    if reference_genes_path is None:
+        reference_gene_names = list(gene_names)
+        missing_reference: list[str] = []
+    else:
+        reference_gene_names, missing_reference = _resolve_gene_list(
+            reference_genes_path, gene_to_idx
+        )
+        if not reference_gene_names:
+            raise ValueError("reference gene list has no overlap with the dataset")
     fit_gene_names, missing_fit = _resolve_fit_gene_list(
         fit_genes_path, gene_names, gene_to_idx
     )
