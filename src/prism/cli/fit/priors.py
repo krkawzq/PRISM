@@ -32,6 +32,7 @@ from .common import (
     build_fit_tasks,
     checkpoint_gene_names,
     compute_reference_counts,
+    ensure_dense_matrix,
     parse_shard,
     print_fit_plan,
     print_fit_summary,
@@ -154,7 +155,10 @@ def fit_priors_command(
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
-    matrix = select_matrix(adata, layer)
+    matrix = ensure_dense_matrix(select_matrix(adata, layer))
+    console.print(
+        f"[bold cyan]Matrix[/bold cyan] densified to numpy array with shape {matrix.shape}"
+    )
     gene_names = [str(name) for name in adata.var_names.tolist()]
     gene_to_idx = {name: idx for idx, name in enumerate(gene_names)}
     fit_mode_resolved = resolve_fit_mode(fit_mode)
@@ -190,6 +194,7 @@ def fit_priors_command(
         label_values=label_values,
         fit_mode=fit_mode_resolved,
     )
+    label_group_sizes = [int(indices.shape[0]) for _, indices in label_groups]
     print_fit_plan(
         h5ad_path=h5ad_path,
         layer=layer,
@@ -210,6 +215,17 @@ def fit_priors_command(
         gene_batch_size=gene_batch_size,
         shard=f"{rank}/{world_size}",
         output_path=output_path,
+        label_group_size_mean=(
+            None
+            if not label_group_sizes
+            else round(float(np.mean(label_group_sizes)), 2)
+        ),
+        label_group_size_min=(
+            None if not label_group_sizes else int(np.min(label_group_sizes))
+        ),
+        label_group_size_max=(
+            None if not label_group_sizes else int(np.max(label_group_sizes))
+        ),
     )
     if missing_reference:
         console.print(

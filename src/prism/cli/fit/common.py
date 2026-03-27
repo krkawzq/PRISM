@@ -168,6 +168,12 @@ def select_matrix(adata: ad.AnnData, layer: str | None):
     return adata.layers[layer]
 
 
+def ensure_dense_matrix(matrix) -> np.ndarray:
+    if sparse.issparse(matrix):
+        return np.asarray(matrix.toarray(), dtype=np.float32)
+    return np.asarray(matrix, dtype=np.float32)
+
+
 def slice_gene_counts(
     matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
