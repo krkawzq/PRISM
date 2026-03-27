@@ -12,16 +12,20 @@ class CheckpointState:
     checkpoint: ModelCheckpoint
     fitted_gene_names: tuple[str, ...]
     reference_gene_names: tuple[str, ...]
+    label_prior_names: tuple[str, ...]
 
 
 def load_checkpoint_state(path: Path, dataset_gene_names: list[str]) -> CheckpointState:
     checkpoint = load_checkpoint(path)
     dataset_gene_set = set(dataset_gene_names)
-    fitted_gene_names = tuple(
-        name for name in checkpoint.gene_names if name in dataset_gene_set
-    )
-    if not fitted_gene_names:
-        raise ValueError("checkpoint has no fitted genes overlapping the dataset")
+    fitted_gene_names = tuple()
+    if checkpoint.priors is not None:
+        fitted_gene_names = tuple(
+            name for name in checkpoint.priors.gene_names if name in dataset_gene_set
+        )
+    label_prior_names = tuple(sorted(checkpoint.label_priors))
+    if not fitted_gene_names and not label_prior_names:
+        raise ValueError("checkpoint has no usable priors")
     reference_gene_names = _read_reference_gene_names(checkpoint)
     overlap_reference = tuple(
         name for name in reference_gene_names if name in dataset_gene_set
@@ -33,6 +37,7 @@ def load_checkpoint_state(path: Path, dataset_gene_names: list[str]) -> Checkpoi
         checkpoint=checkpoint,
         fitted_gene_names=fitted_gene_names,
         reference_gene_names=overlap_reference,
+        label_prior_names=label_prior_names,
     )
 
 

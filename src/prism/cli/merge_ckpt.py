@@ -7,7 +7,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from prism.model import ModelCheckpoint, PriorGrid, load_checkpoint, save_checkpoint
+from prism.model import (
+    ModelCheckpoint,
+    PriorGrid,
+    ScaleMetadata,
+    load_checkpoint,
+    save_checkpoint,
+)
 
 checkpoint_app = typer.Typer(help="Checkpoint utilities.", no_args_is_help=True)
 console = Console()
@@ -54,9 +60,14 @@ def inspect_checkpoint_command(
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("genes", str(len(checkpoint.gene_names)))
-    table.add_row("S", f"{checkpoint.scale.S:.4f}")
+    table.add_row("global_priors", str(checkpoint.priors is not None))
+    table.add_row("label_priors", str(len(checkpoint.label_priors)))
+    table.add_row("S", "-" if checkpoint.scale is None else f"{checkpoint.scale.S:.4f}")
     table.add_row(
-        "mean_reference_count", f"{checkpoint.scale.mean_reference_count:.4f}"
+        "mean_reference_count",
+        "-"
+        if checkpoint.scale is None
+        else f"{checkpoint.scale.mean_reference_count:.4f}",
     )
     table.add_row("S_source", str(metadata.get("S_source", "")))
     table.add_row(
@@ -90,57 +101,58 @@ def _merge_checkpoints(
     first = checkpoints[0]
     _validate_shared_metadata(checkpoints, source_paths)
 
-    rows: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for checkpoint in checkpoints:
-        priors = checkpoint.priors.batched()
-        for idx, gene_name in enumerate(priors.gene_names):
-            if gene_name in rows:
-                raise ValueError(
-                    f"duplicate fitted gene across checkpoints: {gene_name}"
-                )
-            rows[gene_name] = (
-                np.asarray(priors.p_grid[idx], dtype=np.float64),
-                np.asarray(priors.weights[idx], dtype=np.float64),
-            )
-
-    requested_gene_names = _safe_string_list(
-        first.metadata.get("requested_fit_gene_names")
+    global_priors, global_scale = _merge_prior_scope(
+        [checkpoint.priors for checkpoint in checkpoints],
+        [checkpoint.scale for checkpoint in checkpoints],
+        requested_gene_names=_safe_string_list(
+            first.metadata.get("requested_fit_gene_names")
+        ),
+        allow_partial=allow_partial,
+        scope_name="global",
     )
-    ordered_gene_names = (
-        requested_gene_names if requested_gene_names else list(rows.keys())
+    label_names = sorted(
+        {label for checkpoint in checkpoints for label in checkpoint.label_priors}
     )
-    missing = [name for name in ordered_gene_names if name not in rows]
-    if missing and not allow_partial:
-        raise ValueError(
-            f"merged checkpoints still miss {len(missing)} genes, e.g. {missing[:5]}"
+    merged_label_priors: dict[str, PriorGrid] = {}
+    merged_label_scales: dict[str, ScaleMetadata] = {}
+    for label in label_names:
+        priors, scale = _merge_prior_scope(
+            [checkpoint.label_priors.get(label) for checkpoint in checkpoints],
+            [checkpoint.label_scales.get(label) for checkpoint in checkpoints],
+            requested_gene_names=_safe_string_list(
+                first.metadata.get("requested_fit_gene_names")
+            ),
+            allow_partial=allow_partial,
+            scope_name=f"label:{label}",
         )
-    merged_gene_names = [name for name in ordered_gene_names if name in rows]
-    if not merged_gene_names:
-        raise ValueError("merged checkpoint contains no genes")
-    p_grid = np.stack([rows[name][0] for name in merged_gene_names], axis=0)
-    weights = np.stack([rows[name][1] for name in merged_gene_names], axis=0)
+        if priors is not None and scale is not None:
+            merged_label_priors[label] = priors
+            merged_label_scales[label] = scale
+
     metadata = dict(first.metadata)
+    checkpoint_gene_names = _checkpoint_gene_names(
+        global_priors,
+        merged_label_priors,
+        _safe_string_list(first.metadata.get("requested_fit_gene_names")),
+    )
     metadata.update(
         {
             "shard_rank": 0,
             "shard_world_size": 1,
-            "shard_gene_names": list(merged_gene_names),
+            "shard_gene_names": list(checkpoint_gene_names),
             "source_checkpoints": [str(path) for path in source_paths],
             "merge_allow_partial": bool(allow_partial),
-            "missing_after_merge": missing,
+            "merged_label_priors": sorted(merged_label_priors),
         }
     )
     return ModelCheckpoint(
-        gene_names=list(merged_gene_names),
-        priors=PriorGrid(
-            gene_names=list(merged_gene_names),
-            p_grid=p_grid,
-            weights=weights,
-            S=float(first.priors.S),
-        ),
-        scale=first.scale,
+        gene_names=checkpoint_gene_names,
+        priors=global_priors,
+        scale=global_scale,
         fit_config=dict(first.fit_config),
         metadata=metadata,
+        label_priors=merged_label_priors,
+        label_scales=merged_label_scales,
     )
 
 
@@ -149,8 +161,6 @@ def _validate_shared_metadata(
 ) -> None:
     first = checkpoints[0]
     for path, checkpoint in zip(paths[1:], checkpoints[1:], strict=True):
-        if checkpoint.priors.S != first.priors.S:
-            raise ValueError(f"{path} has a different S")
         if checkpoint.fit_config != first.fit_config:
             raise ValueError(f"{path} has a different fit configuration")
         for key in (
@@ -158,6 +168,8 @@ def _validate_shared_metadata(
             "layer",
             "reference_gene_names",
             "requested_fit_gene_names",
+            "fit_mode",
+            "label_key",
         ):
             if checkpoint.metadata.get(key) != first.metadata.get(key):
                 raise ValueError(f"{path} has different metadata for {key!r}")
@@ -175,11 +187,78 @@ def _print_merge_summary(
     table = Table(title="Merged Checkpoint")
     table.add_column("Input genes", justify="right")
     table.add_column("Merged genes", justify="right")
-    table.add_column("S", justify="right")
+    table.add_column("Label priors", justify="right")
     table.add_row(
         str(sum(len(checkpoint.gene_names) for checkpoint in checkpoints)),
         str(len(merged.gene_names)),
-        f"{merged.scale.S:.4f}",
+        str(len(merged.label_priors)),
     )
     console.print(table)
     console.print(f"[bold green]Saved[/bold green] {output_path}")
+
+
+def _merge_prior_scope(
+    priors_list: list[PriorGrid | None],
+    scales: list[ScaleMetadata | None],
+    *,
+    requested_gene_names: list[str],
+    allow_partial: bool,
+    scope_name: str,
+) -> tuple[PriorGrid | None, ScaleMetadata | None]:
+    present = [
+        (priors, scale)
+        for priors, scale in zip(priors_list, scales, strict=True)
+        if priors is not None
+    ]
+    if not present:
+        return None, None
+    rows: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    first_priors, first_scale = present[0]
+    assert first_priors is not None and first_scale is not None
+    for priors, _scale in present:
+        batched = priors.batched()
+        if priors.S != first_priors.S:
+            raise ValueError(f"{scope_name} has inconsistent S across checkpoints")
+        for idx, gene_name in enumerate(batched.gene_names):
+            if gene_name in rows:
+                raise ValueError(
+                    f"duplicate fitted gene across checkpoints in {scope_name}: {gene_name}"
+                )
+            rows[gene_name] = (
+                np.asarray(batched.p_grid[idx], dtype=np.float64),
+                np.asarray(batched.weights[idx], dtype=np.float64),
+            )
+    ordered_gene_names = (
+        requested_gene_names if requested_gene_names else list(rows.keys())
+    )
+    missing = [name for name in ordered_gene_names if name not in rows]
+    if missing and not allow_partial:
+        raise ValueError(
+            f"{scope_name} is missing {len(missing)} genes, e.g. {missing[:5]}"
+        )
+    merged_gene_names = [name for name in ordered_gene_names if name in rows]
+    if not merged_gene_names:
+        return None, None
+    p_grid = np.stack([rows[name][0] for name in merged_gene_names], axis=0)
+    weights = np.stack([rows[name][1] for name in merged_gene_names], axis=0)
+    return (
+        PriorGrid(
+            gene_names=list(merged_gene_names),
+            p_grid=p_grid,
+            weights=weights,
+            S=float(first_priors.S),
+        ),
+        first_scale,
+    )
+
+
+def _checkpoint_gene_names(
+    global_priors: PriorGrid | None,
+    label_priors: dict[str, PriorGrid],
+    fallback_gene_names: list[str],
+) -> list[str]:
+    if global_priors is not None:
+        return list(global_priors.gene_names)
+    if label_priors:
+        return list(next(iter(label_priors.values())).gene_names)
+    return list(fallback_gene_names)

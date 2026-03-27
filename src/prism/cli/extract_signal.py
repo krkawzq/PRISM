@@ -53,6 +53,14 @@ def extract_signals_command(
     output_mode: str = typer.Option(
         "fitted-only", help="Output layout: fitted-only or full-matrix."
     ),
+    prior_source: str = typer.Option(
+        "global",
+        help="Prior source: global or label.",
+    ),
+    label_key: str | None = typer.Option(
+        None,
+        help="Obs column used when --prior-source label.",
+    ),
     batch_size: int = typer.Option(128, min=1, help="Genes per extraction batch."),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
     dtype: str = typer.Option("float32", help="Output dtype: float32 or float64."),
@@ -75,6 +83,7 @@ def extract_signals_command(
     reference_gene_names = _require_reference_genes(checkpoint.metadata)
     selected_channels = _resolve_channels(channels)
     output_dtype = _resolve_dtype(dtype)
+    prior_source_resolved = _resolve_prior_source(prior_source)
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
@@ -91,13 +100,18 @@ def extract_signals_command(
         )
     reference_counts = _compute_reference_counts(matrix, ref_positions)
 
+    available_gene_names = checkpoint.gene_names
+    if prior_source_resolved == "global" and checkpoint.priors is None:
+        raise ValueError("checkpoint does not contain global priors")
+    if prior_source_resolved == "label" and not checkpoint.label_priors:
+        raise ValueError("checkpoint does not contain label-specific priors")
     requested_genes = (
-        checkpoint.gene_names if genes_path is None else _read_gene_list(genes_path)
+        available_gene_names if genes_path is None else _read_gene_list(genes_path)
     )
     selected_genes = [
         name
         for name in requested_genes
-        if name in gene_to_idx and name in set(checkpoint.gene_names)
+        if name in gene_to_idx and name in set(available_gene_names)
     ]
     if not selected_genes:
         raise ValueError(
@@ -113,6 +127,8 @@ def extract_signals_command(
         n_checkpoint_genes=len(checkpoint.gene_names),
         n_selected_genes=len(selected_genes),
         n_reference_genes=len(reference_gene_names),
+        prior_source=prior_source_resolved,
+        label_key=label_key,
         output_mode=output_mode,
         channels=",".join(selected_channels),
         output_path=output_path,
@@ -121,9 +137,6 @@ def extract_signals_command(
     if dry_run:
         return 0
 
-    posterior = Posterior(
-        selected_genes, checkpoint.priors.subset(selected_genes), device=device
-    )
     if output_mode == "fitted-only":
         output_adata = adata[:, [gene_to_idx[name] for name in selected_genes]].copy()
         output_positions = {name: idx for idx, name in enumerate(selected_genes)}
@@ -156,13 +169,16 @@ def extract_signals_command(
             batch_counts = _slice_gene_counts(
                 matrix, [gene_to_idx[name] for name in batch_names]
             )
-            extracted = posterior.extract(
-                ObservationBatch(
-                    gene_names=batch_names,
-                    counts=batch_counts,
-                    reference_counts=reference_counts,
-                ),
-                channels=cast(set[SignalChannel], set(selected_channels)),
+            extracted = _extract_batch(
+                checkpoint=checkpoint,
+                adata=adata,
+                batch_names=batch_names,
+                batch_counts=batch_counts,
+                reference_counts=reference_counts,
+                prior_source=prior_source_resolved,
+                label_key=label_key,
+                device=device,
+                selected_channels=selected_channels,
             )
             for channel in selected_channels:
                 values = np.asarray(extracted[channel], dtype=np.float64)
@@ -194,6 +210,13 @@ def _require_reference_genes(metadata: dict[str, object]) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("checkpoint metadata is missing reference_gene_names")
     return list(value)
+
+
+def _resolve_prior_source(value: str) -> str:
+    resolved = value.strip().lower()
+    if resolved not in {"global", "label"}:
+        raise ValueError("prior_source must be either 'global' or 'label'")
+    return resolved
 
 
 def _resolve_channels(channels: list[str] | None) -> list[str]:
@@ -244,6 +267,64 @@ def _compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
     else:
         totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
     return np.asarray(totals, dtype=np.float64).reshape(-1)
+
+
+def _extract_batch(
+    *,
+    checkpoint,
+    adata: ad.AnnData,
+    batch_names: list[str],
+    batch_counts: np.ndarray,
+    reference_counts: np.ndarray,
+    prior_source: str,
+    label_key: str | None,
+    device: str,
+    selected_channels: list[str],
+) -> dict[str, np.ndarray]:
+    requested_channels = cast(set[SignalChannel], set(selected_channels))
+    if prior_source == "global":
+        assert checkpoint.priors is not None
+        posterior = Posterior(
+            batch_names, checkpoint.priors.subset(batch_names), device=device
+        )
+        return posterior.extract(
+            ObservationBatch(
+                gene_names=batch_names,
+                counts=batch_counts,
+                reference_counts=reference_counts,
+            ),
+            channels=requested_channels,
+        )
+    if label_key is None:
+        raise ValueError("--label-key is required when --prior-source label")
+    if label_key not in adata.obs.columns:
+        raise KeyError(f"obs column {label_key!r} does not exist")
+    labels = np.asarray(adata.obs[label_key].astype(str)).reshape(-1)
+    layer_values = {
+        channel: np.full(
+            (batch_counts.shape[0], len(batch_names)), np.nan, dtype=np.float64
+        )
+        for channel in selected_channels
+    }
+    for label in np.unique(labels).tolist():
+        if label not in checkpoint.label_priors:
+            raise ValueError(f"checkpoint does not contain priors for label {label!r}")
+        cell_indices = np.flatnonzero(labels == label)
+        priors = checkpoint.label_priors[label].subset(batch_names)
+        posterior = Posterior(batch_names, priors, device=device)
+        extracted = posterior.extract(
+            ObservationBatch(
+                gene_names=batch_names,
+                counts=batch_counts[cell_indices],
+                reference_counts=reference_counts[cell_indices],
+            ),
+            channels=requested_channels,
+        )
+        for channel in selected_channels:
+            layer_values[channel][cell_indices] = np.asarray(
+                extracted[channel], dtype=np.float64
+            )
+    return layer_values
 
 
 def _print_extract_plan(**values: object) -> None:
