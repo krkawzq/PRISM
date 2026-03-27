@@ -18,6 +18,7 @@ import matplotlib
 import numpy as np
 import torch
 import typer
+from scipy import sparse
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -33,6 +34,7 @@ from rich.table import Table
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from prism.baseline.metrics import log1p_normalize_total
 from prism.model import (
     GeneBatch,
     Posterior,
@@ -122,6 +124,81 @@ def _read_ranked_gene_list(path: Path) -> list[str]:
     return genes
 
 
+def _to_dense_float64(matrix_slice) -> np.ndarray:
+    if hasattr(matrix_slice, "toarray"):
+        return np.asarray(matrix_slice.toarray(), dtype=np.float64)
+    return np.asarray(matrix_slice, dtype=np.float64)
+
+
+def _compute_lognorm_gene_variances(
+    matrix,
+    totals: np.ndarray,
+    *,
+    chunk_size: int,
+) -> np.ndarray:
+    totals_np = np.asarray(totals, dtype=np.float64).reshape(-1)
+    if totals_np.ndim != 1:
+        raise ValueError("totals must be 1D")
+    n_cells = totals_np.shape[0]
+    if n_cells < 2:
+        raise ValueError("at least two cells are required to compute variances")
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+    target = float(np.median(totals_np))
+    target = max(target, 1e-12)
+
+    sum_x = None
+    sum_x2 = None
+    for start in range(0, n_cells, chunk_size):
+        stop = min(start + chunk_size, n_cells)
+        totals_chunk = totals_np[start:stop]
+        chunk = matrix[start:stop]
+        if sparse.issparse(chunk):
+            chunk_csr = chunk.tocsr(copy=True).astype(np.float64)
+            row_scale = target / np.maximum(totals_chunk, 1e-12)
+            row_nnz = np.diff(chunk_csr.indptr)
+            chunk_csr.data *= np.repeat(row_scale, row_nnz)
+            np.log1p(chunk_csr.data, out=chunk_csr.data)
+            chunk_sum = np.asarray(chunk_csr.sum(axis=0)).reshape(-1)
+            chunk_sq = chunk_csr.copy()
+            chunk_sq.data **= 2.0
+            chunk_sum2 = np.asarray(chunk_sq.sum(axis=0)).reshape(-1)
+        else:
+            chunk_dense = _to_dense_float64(chunk)
+            chunk_log = log1p_normalize_total(
+                chunk_dense,
+                totals_chunk,
+                target=target,
+            )
+            chunk_sum = np.sum(chunk_log, axis=0, dtype=np.float64)
+            chunk_sum2 = np.sum(np.square(chunk_log), axis=0, dtype=np.float64)
+        if sum_x is None:
+            sum_x = chunk_sum
+            sum_x2 = chunk_sum2
+        else:
+            sum_x += chunk_sum
+            sum_x2 += chunk_sum2
+
+    assert sum_x is not None
+    assert sum_x2 is not None
+    mean = sum_x / float(n_cells)
+    var = (sum_x2 - float(n_cells) * np.square(mean)) / float(n_cells - 1)
+    return np.maximum(var, 0.0)
+
+
+def _rank_genes_by_lognorm_variance(
+    *,
+    matrix,
+    totals: np.ndarray,
+    gene_names: np.ndarray,
+    chunk_size: int,
+) -> tuple[list[str], np.ndarray]:
+    variances = _compute_lognorm_gene_variances(matrix, totals, chunk_size=chunk_size)
+    order = np.argsort(variances)[::-1]
+    ranked = [str(gene_names[idx]) for idx in order.tolist()]
+    return ranked, np.asarray(variances[order], dtype=np.float64)
+
+
 def _resolve_device(device: str) -> str:
     requested = device.strip().lower()
     if requested == "cuda" and not torch.cuda.is_available():
@@ -135,10 +212,59 @@ def _infer_total_key(adata: ad.AnnData, total_key: str | None) -> str | None:
         if total_key not in adata.obs.columns:
             raise KeyError(f"total key {total_key!r} not found in obs")
         return total_key
-    for candidate in ("total_umi", "UMI_count", "ncounts", "total_counts"):
+    for candidate in ("ncounts", "total_counts", "total_umi", "UMI_count"):
         if candidate in adata.obs.columns:
             return candidate
     return None
+
+
+def _counts_fit_totals(counts_matrix: np.ndarray, totals: np.ndarray) -> bool:
+    totals_np = np.asarray(totals, dtype=np.float64).reshape(-1)
+    counts_np = np.asarray(counts_matrix, dtype=np.float64)
+    return bool(np.all(counts_np <= totals_np[:, None] + 1e-12))
+
+
+def _resolve_totals_with_validation(
+    *,
+    adata: ad.AnnData,
+    matrix,
+    counts_matrix: np.ndarray,
+    total_key: str | None,
+) -> tuple[np.ndarray, str]:
+    resolved_total_key = _infer_total_key(adata, total_key)
+    attempted: list[str] = []
+    if resolved_total_key is not None:
+        totals = np.asarray(adata.obs[resolved_total_key], dtype=DTYPE_NP).reshape(-1)
+        attempted.append(resolved_total_key)
+        if _counts_fit_totals(counts_matrix, totals):
+            return totals, resolved_total_key
+        if total_key is not None:
+            raise ValueError(
+                f"total key {total_key!r} is incompatible with the selected genes: found counts > totals"
+            )
+        console.print(
+            f"[yellow]Inferred total key {resolved_total_key!r} is incompatible with selected genes; trying fallback totals.[/yellow]"
+        )
+
+    for candidate in ("ncounts", "total_counts", "total_umi", "UMI_count"):
+        if candidate in attempted or candidate not in adata.obs.columns:
+            continue
+        totals = np.asarray(adata.obs[candidate], dtype=DTYPE_NP).reshape(-1)
+        if _counts_fit_totals(counts_matrix, totals):
+            console.print(
+                f"[yellow]Using fallback total key {candidate!r} because it is consistent with selected genes.[/yellow]"
+            )
+            return totals, candidate
+
+    console.print(
+        "[yellow]No obs total column is consistent with selected genes; computing totals from matrix.[/yellow]"
+    )
+    totals = _compute_totals(matrix)
+    if not _counts_fit_totals(counts_matrix, totals):
+        raise ValueError(
+            "computed matrix totals are still incompatible with selected genes"
+        )
+    return totals, "__computed_from_matrix__"
 
 
 def _compute_totals(matrix) -> np.ndarray:
@@ -467,6 +593,7 @@ def _resolve_selected_genes(
     *,
     gene: str | None,
     ranked_genes: Path | None,
+    computed_ranked_genes: list[str] | None,
     gene_rank: int | None,
     top_ranked: int | None,
     gene_names: np.ndarray,
@@ -474,12 +601,23 @@ def _resolve_selected_genes(
     gene_to_idx: dict[str, int],
     gene_lower_to_idx: dict[str, int],
 ) -> tuple[list[str], list[int], str | None]:
-    if gene is None and ranked_genes is None:
-        raise typer.BadParameter("provide GENE or --ranked-genes")
-    if gene is not None and ranked_genes is not None:
-        raise typer.BadParameter("provide either GENE or --ranked-genes, not both")
-    if (gene_rank is not None or top_ranked is not None) and ranked_genes is None:
-        raise typer.BadParameter("--gene-rank/--top-ranked require --ranked-genes")
+    if ranked_genes is not None and computed_ranked_genes is not None:
+        raise typer.BadParameter(
+            "use either --ranked-genes or --compute-lognorm-var-ranked-genes"
+        )
+    has_ranked_source = ranked_genes is not None or computed_ranked_genes is not None
+    if gene is None and not has_ranked_source:
+        raise typer.BadParameter(
+            "provide GENE, --ranked-genes, or --compute-lognorm-var-ranked-genes"
+        )
+    if gene is not None and has_ranked_source:
+        raise typer.BadParameter(
+            "provide either GENE or a ranked gene source, not both"
+        )
+    if (gene_rank is not None or top_ranked is not None) and not has_ranked_source:
+        raise typer.BadParameter(
+            "--gene-rank/--top-ranked require a ranked gene source"
+        )
     if gene_rank is not None and top_ranked is not None:
         raise typer.BadParameter("use either --gene-rank or --top-ranked")
 
@@ -487,14 +625,20 @@ def _resolve_selected_genes(
     if gene is not None:
         selected_tokens = [gene]
     else:
-        ranked = _read_ranked_gene_list(ranked_genes)
+        if ranked_genes is not None:
+            ranked = _read_ranked_gene_list(ranked_genes)
+            ranked_source = f"file={ranked_genes}"
+        else:
+            assert computed_ranked_genes is not None
+            ranked = computed_ranked_genes
+            ranked_source = "computed=lognorm_var"
         if top_ranked is not None:
             if top_ranked > len(ranked):
                 raise ValueError(
                     f"top_ranked={top_ranked} exceeds ranked list length {len(ranked)}"
                 )
             selected_tokens = ranked[:top_ranked]
-            note = f"ranked source={ranked_genes} top={top_ranked}"
+            note = f"ranked source={ranked_source} top={top_ranked}"
         else:
             rank = 1 if gene_rank is None else gene_rank
             if rank > len(ranked):
@@ -502,7 +646,7 @@ def _resolve_selected_genes(
                     f"gene_rank={rank} exceeds ranked list length {len(ranked)}"
                 )
             selected_tokens = [ranked[rank - 1]]
-            note = f"ranked source={ranked_genes} rank={rank}"
+            note = f"ranked source={ranked_source} rank={rank}"
 
     resolved_names: list[str] = []
     resolved_indices: list[int] = []
@@ -1755,6 +1899,14 @@ def main(
         readable=True,
         help="Optional ranked gene list file, one gene per line.",
     ),
+    compute_lognorm_var_ranked_genes: bool = typer.Option(
+        False,
+        help="Rank genes by log1p(normalize_total(.)) variance computed from this dataset.",
+    ),
+    write_lognorm_var_ranked_genes: Path | None = typer.Option(
+        None,
+        help="Optional output path for the computed log-normalized variance ranked gene list.",
+    ),
     gene_rank: int | None = typer.Option(
         None, min=1, help="1-based rank to select from --ranked-genes."
     ),
@@ -1809,6 +1961,16 @@ def main(
     representative_cells: int = typer.Option(
         4, min=2, help="Representative cells per fit for posterior gallery."
     ),
+    batch_limit: int | None = typer.Option(
+        None,
+        min=1,
+        help="Optional cap on the number of batches to analyze; defaults to all batches.",
+    ),
+    lognorm_var_chunk_size: int = typer.Option(
+        256,
+        min=1,
+        help="Cell chunk size used to compute log-normalized gene variances.",
+    ),
 ) -> int:
     resolved_device = _resolve_device(device)
     adata = ad.read_h5ad(h5ad, backed="r")
@@ -1825,10 +1987,40 @@ def main(
         for idx, name in enumerate(gene_names_lower):
             gene_lower_to_idx.setdefault(name, idx)
 
+        computed_ranked_genes: list[str] | None = None
+        if compute_lognorm_var_ranked_genes:
+            console.print(
+                "[bold cyan]Ranking genes[/bold cyan]: log1p(normalize_total(.)) variance"
+            )
+            computed_ranked_genes, ranked_variances = _rank_genes_by_lognorm_variance(
+                matrix=matrix,
+                totals=totals,
+                gene_names=gene_names_all,
+                chunk_size=lognorm_var_chunk_size,
+            )
+            ranked_out = (
+                write_lognorm_var_ranked_genes.expanduser().resolve()
+                if write_lognorm_var_ranked_genes is not None
+                else None
+            )
+            if ranked_out is not None:
+                ranked_out.parent.mkdir(parents=True, exist_ok=True)
+                ranked_out.write_text(
+                    "\n".join(computed_ranked_genes) + "\n", encoding="utf-8"
+                )
+                console.print(
+                    f"[bold cyan]Ranked genes saved[/bold cyan]: {ranked_out}"
+                )
+            preview = ", ".join(computed_ranked_genes[:10])
+            preview_var = ", ".join(f"{x:.4f}" for x in ranked_variances[:5])
+            console.print(f"[bold cyan]Top lognorm-var genes[/bold cyan]: {preview}")
+            console.print(f"[bold cyan]Top variances[/bold cyan]: {preview_var}")
+
         selected_gene_names, selected_gene_indices, selection_note = (
             _resolve_selected_genes(
                 gene=gene,
                 ranked_genes=ranked_genes,
+                computed_ranked_genes=computed_ranked_genes,
                 gene_rank=gene_rank,
                 top_ranked=top_ranked,
                 gene_names=gene_names_all,
@@ -1838,17 +2030,12 @@ def main(
             )
         )
         counts_matrix = _slice_gene_matrix(matrix, selected_gene_indices)
-
-        resolved_total_key = _infer_total_key(adata, total_key)
-        if resolved_total_key is None:
-            console.print(
-                "[yellow]No total column found in obs; computing totals from matrix.[/yellow]"
-            )
-            totals = _compute_totals(matrix)
-        else:
-            totals = np.asarray(adata.obs[resolved_total_key], dtype=DTYPE_NP).reshape(
-                -1
-            )
+        totals, resolved_total_key = _resolve_totals_with_validation(
+            adata=adata,
+            matrix=matrix,
+            counts_matrix=counts_matrix,
+            total_key=total_key,
+        )
         shared_support_ratio_max = _compute_shared_ratio_quantiles(
             counts_matrix,
             totals,
@@ -1859,12 +2046,14 @@ def main(
         all_batch_values = _top_batch_values(
             real_batch_labels, int(np.unique(real_batch_labels).size)
         )
-        batch_limit = (
+        resolved_batch_limit = (
             len(all_batch_values)
-            if top_ranked is None
-            else min(top_ranked, len(all_batch_values))
+            if batch_limit is None
+            else min(batch_limit, len(all_batch_values))
         )
-        top_values, batch_sizes = _select_batch_values(real_batch_labels, batch_limit)
+        top_values, batch_sizes = _select_batch_values(
+            real_batch_labels, resolved_batch_limit
+        )
         batch_mode = "randomized" if random_select_batch else "real"
         if random_select_batch:
             batch_labels, top_values, batch_sizes = _randomize_selected_batches(
@@ -1898,9 +2087,13 @@ def main(
             console.print(f"[bold cyan]Selection[/bold cyan]: {selection_note}")
         console.print(f"[bold cyan]Cells[/bold cyan]: {adata.n_obs:,}")
         console.print(f"[bold cyan]Batch mode[/bold cyan]: {batch_mode}")
+        console.print(f"[bold cyan]Total key[/bold cyan]: {resolved_total_key}")
         if random_select_batch:
             console.print(f"[bold cyan]Random seed[/bold cyan]: {random_seed}")
         console.print(f"[bold cyan]Batches[/bold cyan]: {len(top_values)}")
+        console.print(
+            f"[bold cyan]Batch limit[/bold cyan]: {'all' if batch_limit is None else batch_limit}"
+        )
         console.print(f"[bold cyan]Fit gene chunk[/bold cyan]: {fit_gene_batch_size}")
         console.print(f"[bold cyan]Shared grid q[/bold cyan]: {shared_grid_quantile}")
         console.print(f"[bold cyan]Output[/bold cyan]: {output_dir}")

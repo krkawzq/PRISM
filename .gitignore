@@ -12,5 +12,9 @@ uv.lock
 
 # Generated dataset artifacts
 data/
-
 output/
+
+
+.claude/
+.opencode/
+.ruff_cache/
