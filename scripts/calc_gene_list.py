@@ -50,6 +50,18 @@ def parse_args() -> argparse.Namespace:
         choices=("seurat", "cell_ranger", "seurat_v3", "seurat_v3_paper"),
         default="seurat_v3",
     )
+    parser.add_argument(
+        "--prior-source",
+        choices=("global", "label"),
+        default="global",
+        help="Checkpoint prior source used by prior-entropy methods.",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default=None,
+        help="Label name used when --prior-source label.",
+    )
     return parser.parse_args()
 
 
@@ -160,9 +172,26 @@ def compute_signal_ranking(
 
 def compute_prior_entropy_ranking(
     checkpoint_path: Path,
+    *,
+    prior_source: str,
+    label: str | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     checkpoint = load_checkpoint(checkpoint_path)
-    priors = checkpoint.priors.batched()
+    if prior_source == "global":
+        if checkpoint.priors is None:
+            raise ValueError("checkpoint does not contain global priors")
+        priors = checkpoint.priors.batched()
+    elif prior_source == "label":
+        if label is None or not label.strip():
+            raise ValueError("--label is required when --prior-source label")
+        if label not in checkpoint.label_priors:
+            available = sorted(checkpoint.label_priors)
+            raise ValueError(
+                f"checkpoint does not contain label priors for {label!r}; available labels: {available}"
+            )
+        priors = checkpoint.label_priors[label].batched()
+    else:
+        raise ValueError(f"unsupported prior source: {prior_source}")
     weights = np.asarray(priors.weights, dtype=np.float64)
     entropy = -(weights * np.log(np.clip(weights, EPS, None))).sum(axis=-1)
     return np.asarray(priors.gene_names), np.nan_to_num(
@@ -242,12 +271,18 @@ def main() -> None:
         adata = ad.read_h5ad(input_path)
         gene_names, scores, metadata = compute_signal_ranking(adata, method=args.method)
     elif args.method in {"prior-entropy", "prior-entropy-reverse"}:
-        gene_names, scores = compute_prior_entropy_ranking(input_path)
+        gene_names, scores = compute_prior_entropy_ranking(
+            input_path,
+            prior_source=args.prior_source,
+            label=args.label,
+        )
         metadata = {
             "score_definition": "prior entropy of F_g",
             "score_mean": float(np.mean(scores)),
             "score_max": float(np.max(scores)),
             "score_min": float(np.min(scores)),
+            "prior_source": args.prior_source,
+            "label": args.label,
         }
         descending = args.method == "prior-entropy"
     else:

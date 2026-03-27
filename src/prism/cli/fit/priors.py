@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from datetime import datetime, UTC
+from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -9,7 +9,6 @@ from typing import Any, cast
 import anndata as ad
 import numpy as np
 import typer
-from rich.console import Console
 from rich.progress import (
     BarColumn,
     Progress,
@@ -18,8 +17,6 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.table import Table
-from scipy import sparse
 
 from prism.model import (
     ModelCheckpoint,
@@ -31,19 +28,25 @@ from prism.model import (
     save_checkpoint,
 )
 
-fit_app = typer.Typer(help="Fit prior checkpoints.", no_args_is_help=True)
-console = Console()
+from .common import (
+    build_fit_tasks,
+    checkpoint_gene_names,
+    compute_reference_counts,
+    parse_shard,
+    print_fit_plan,
+    print_fit_summary,
+    resolve_fit_gene_list,
+    resolve_fit_mode,
+    resolve_gene_list,
+    resolve_label_groups,
+    sample_indices,
+    select_matrix,
+    shard_gene_names,
+    slice_gene_counts,
+    console,
+)
 
 
-@dataclass(frozen=True, slots=True)
-class _FitTask:
-    scope_kind: str
-    scope_name: str
-    cell_indices: np.ndarray
-    label_value: str | None = None
-
-
-@fit_app.command("priors")
 def fit_priors_command(
     h5ad_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Input h5ad file."
@@ -67,8 +70,7 @@ def fit_priors_command(
     ),
     layer: str | None = typer.Option(None, help="Input AnnData layer. Defaults to X."),
     label_key: str | None = typer.Option(
-        None,
-        help="Optional obs column used for class-specific fitting.",
+        None, help="Optional obs column used for class-specific fitting."
     ),
     label_values: list[str] | None = typer.Option(
         None,
@@ -76,13 +78,10 @@ def fit_priors_command(
         help="Optional repeatable label values to fit when --label-key is set.",
     ),
     fit_mode: str = typer.Option(
-        "global",
-        help="Fit scope: global, by-label, or both.",
+        "global", help="Fit scope: global, by-label, or both."
     ),
     n_samples: int | None = typer.Option(
-        None,
-        min=1,
-        help="Optional random cell subsample size per fit scope.",
+        None, min=1, help="Optional random cell subsample size per fit scope."
     ),
     sample_seed: int = typer.Option(0, min=0, help="Random seed for cell subsampling."),
     S: float | None = typer.Option(
@@ -137,7 +136,7 @@ def fit_priors_command(
         None if fit_genes_path is None else fit_genes_path.expanduser().resolve()
     )
 
-    rank, world_size = _parse_shard(shard)
+    rank, world_size = parse_shard(shard)
     fit_config = PriorFitConfig(
         grid_size=grid_size,
         sigma_bins=sigma_bins,
@@ -155,50 +154,50 @@ def fit_priors_command(
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
-    matrix = _select_matrix(adata, layer)
+    matrix = select_matrix(adata, layer)
     gene_names = [str(name) for name in adata.var_names.tolist()]
     gene_to_idx = {name: idx for idx, name in enumerate(gene_names)}
-    fit_mode_resolved = _resolve_fit_mode(fit_mode)
+    fit_mode_resolved = resolve_fit_mode(fit_mode)
 
     if reference_genes_path is None:
         reference_gene_names = list(gene_names)
         missing_reference: list[str] = []
     else:
-        reference_gene_names, missing_reference = _resolve_gene_list(
+        reference_gene_names, missing_reference = resolve_gene_list(
             reference_genes_path, gene_to_idx
         )
         if not reference_gene_names:
             raise ValueError("reference gene list has no overlap with the dataset")
-    fit_gene_names, missing_fit = _resolve_fit_gene_list(
+    fit_gene_names, missing_fit = resolve_fit_gene_list(
         fit_genes_path, gene_names, gene_to_idx
     )
     if not fit_gene_names:
         raise ValueError("fit gene list is empty after intersecting with the dataset")
-    shard_gene_names = _shard_gene_names(
+    shard_gene_names_list = shard_gene_names(
         fit_gene_names, rank=rank, world_size=world_size
     )
-    if not shard_gene_names:
+    if not shard_gene_names_list:
         raise ValueError(f"shard {rank}/{world_size} has no assigned genes")
 
     reference_positions = [gene_to_idx[name] for name in reference_gene_names]
-    reference_counts = _compute_reference_counts(matrix, reference_positions)
+    reference_counts = compute_reference_counts(matrix, reference_positions)
     default_S = float(np.mean(reference_counts))
     resolved_S = default_S if S is None else float(S)
     S_source = "default:N_avg" if S is None else "user"
-    label_groups = _resolve_label_groups(
+    label_groups = resolve_label_groups(
         adata=adata,
         label_key=label_key,
         label_values=label_values,
         fit_mode=fit_mode_resolved,
     )
-    _print_fit_plan(
+    print_fit_plan(
         h5ad_path=h5ad_path,
         layer=layer,
         n_cells=int(adata.n_obs),
         n_dataset_genes=int(adata.n_vars),
         n_reference_genes=len(reference_gene_names),
         n_fit_genes=len(fit_gene_names),
-        n_shard_genes=len(shard_gene_names),
+        n_shard_genes=len(shard_gene_names_list),
         fit_mode=fit_mode_resolved,
         label_key=label_key,
         n_label_groups=len(label_groups),
@@ -221,12 +220,10 @@ def fit_priors_command(
     if dry_run:
         return 0
 
-    fit_tasks = _build_fit_tasks(
+    fit_tasks = build_fit_tasks(
         fit_mode_resolved, label_groups, n_cells=int(adata.n_obs)
     )
-    global_gene_names: list[str] | None = None
-    global_p_grids: list[np.ndarray] = []
-    global_weights: list[np.ndarray] = []
+    global_priors: PriorGrid | None = None
     global_scale: ScaleMetadata | None = None
     global_metadata: dict[str, Any] | None = None
     label_priors: dict[str, PriorGrid] = {}
@@ -243,10 +240,10 @@ def fit_priors_command(
     ) as progress:
         task_id = progress.add_task("fitting priors", total=len(fit_tasks))
         for task_index, task in enumerate(fit_tasks, start=1):
-            sampled_indices = _sample_indices(
+            sampled_indices = sample_indices(
                 task.cell_indices, n_samples=n_samples, seed=sample_seed + task_index
             )
-            task_reference_counts = _compute_reference_counts(
+            task_reference_counts = compute_reference_counts(
                 matrix, reference_positions, cell_indices=sampled_indices
             )
             valid_mask = task_reference_counts > 0
@@ -257,14 +254,14 @@ def fit_priors_command(
             sampled_indices = sampled_indices[valid_mask]
             task_reference_counts = task_reference_counts[valid_mask]
             batches = [
-                shard_gene_names[start : start + gene_batch_size]
-                for start in range(0, len(shard_gene_names), gene_batch_size)
+                shard_gene_names_list[start : start + gene_batch_size]
+                for start in range(0, len(shard_gene_names_list), gene_batch_size)
             ]
             fitted_p_grids: list[np.ndarray] = []
             fitted_weights: list[np.ndarray] = []
             batch_summaries: list[dict[str, Any]] = []
             for batch_index, names in enumerate(batches, start=1):
-                batch_counts = _slice_gene_counts(
+                batch_counts = slice_gene_counts(
                     matrix,
                     [gene_to_idx[name] for name in names],
                     cell_indices=sampled_indices,
@@ -291,7 +288,7 @@ def fit_priors_command(
                     }
                 )
             merged_priors = PriorGrid(
-                gene_names=list(shard_gene_names),
+                gene_names=list(shard_gene_names_list),
                 p_grid=np.concatenate(fitted_p_grids, axis=0),
                 weights=np.concatenate(fitted_weights, axis=0),
                 S=resolved_S,
@@ -309,9 +306,7 @@ def fit_priors_command(
                 "batch_summaries": batch_summaries,
             }
             if task.scope_kind == "global":
-                global_gene_names = list(shard_gene_names)
-                global_p_grids = [np.asarray(merged_priors.p_grid, dtype=np.float64)]
-                global_weights = [np.asarray(merged_priors.weights, dtype=np.float64)]
+                global_priors = merged_priors
                 global_scale = task_scale
                 global_metadata = task_meta
             else:
@@ -325,19 +320,11 @@ def fit_priors_command(
                 description=f"fitting priors ({task_index}/{len(fit_tasks)})",
             )
 
-    merged_priors = None
-    if global_gene_names is not None:
-        merged_priors = PriorGrid(
-            gene_names=list(global_gene_names),
-            p_grid=np.concatenate(global_p_grids, axis=0),
-            weights=np.concatenate(global_weights, axis=0),
-            S=resolved_S,
-        )
     checkpoint = ModelCheckpoint(
-        gene_names=_checkpoint_gene_names(
-            merged_priors, label_priors, shard_gene_names
+        gene_names=checkpoint_gene_names(
+            global_priors, label_priors, shard_gene_names_list
         ),
-        priors=merged_priors,
+        priors=global_priors,
         scale=global_scale,
         fit_config=asdict(fit_config),
         metadata={
@@ -346,7 +333,7 @@ def fit_priors_command(
             "layer": layer,
             "reference_gene_names": list(reference_gene_names),
             "requested_fit_gene_names": list(fit_gene_names),
-            "shard_gene_names": list(shard_gene_names),
+            "shard_gene_names": list(shard_gene_names_list),
             "missing_reference_genes": list(missing_reference),
             "missing_fit_genes": list(missing_fit),
             "n_cells": int(adata.n_obs),
@@ -370,7 +357,7 @@ def fit_priors_command(
         label_scales=label_scales,
     )
     save_checkpoint(checkpoint, output_path)
-    _print_fit_summary(
+    print_fit_summary(
         output_path=output_path,
         elapsed_sec=perf_counter() - start_time,
         checkpoint=checkpoint,
@@ -378,205 +365,4 @@ def fit_priors_command(
     return 0
 
 
-def _parse_shard(value: str) -> tuple[int, int]:
-    parts = value.split("/")
-    if len(parts) != 2:
-        raise ValueError("shard must be formatted as rank/world, e.g. 0/4")
-    rank = int(parts[0])
-    world_size = int(parts[1])
-    if world_size < 1 or rank < 0 or rank >= world_size:
-        raise ValueError(f"invalid shard specification: {value}")
-    return rank, world_size
-
-
-def _resolve_fit_mode(value: str) -> str:
-    resolved = value.strip().lower()
-    if resolved not in {"global", "by-label", "both"}:
-        raise ValueError("fit_mode must be one of: global, by-label, both")
-    return resolved
-
-
-def _resolve_label_groups(
-    *,
-    adata: ad.AnnData,
-    label_key: str | None,
-    label_values: list[str] | None,
-    fit_mode: str,
-) -> list[tuple[str, np.ndarray]]:
-    if fit_mode == "global":
-        return []
-    if label_key is None:
-        raise ValueError("--label-key is required when fit_mode is by-label or both")
-    if label_key not in adata.obs.columns:
-        raise KeyError(f"obs column {label_key!r} does not exist")
-    labels = np.asarray(adata.obs[label_key].astype(str)).reshape(-1)
-    chosen_values = (
-        list(dict.fromkeys(label_values))
-        if label_values
-        else sorted(np.unique(labels).tolist())
-    )
-    groups: list[tuple[str, np.ndarray]] = []
-    for value in chosen_values:
-        indices = np.flatnonzero(labels == value).astype(np.int64)
-        if indices.size == 0:
-            raise ValueError(f"label value {value!r} has no cells")
-        groups.append((value, indices))
-    return groups
-
-
-def _build_fit_tasks(
-    fit_mode: str, label_groups: list[tuple[str, np.ndarray]], *, n_cells: int
-) -> list[_FitTask]:
-    tasks: list[_FitTask] = []
-    if fit_mode in {"global", "both"}:
-        if label_groups:
-            all_indices = np.unique(
-                np.concatenate([indices for _, indices in label_groups])
-            )
-        else:
-            all_indices = np.arange(n_cells, dtype=np.int64)
-        tasks.append(
-            _FitTask(scope_kind="global", scope_name="global", cell_indices=all_indices)
-        )
-    if fit_mode in {"by-label", "both"}:
-        tasks.extend(
-            _FitTask(
-                scope_kind="label",
-                scope_name=f"label:{label}",
-                cell_indices=indices,
-                label_value=label,
-            )
-            for label, indices in label_groups
-        )
-    return tasks
-
-
-def _sample_indices(
-    cell_indices: np.ndarray, *, n_samples: int | None, seed: int
-) -> np.ndarray:
-    if cell_indices.size == 0:
-        return cell_indices
-    if n_samples is None or cell_indices.size <= n_samples:
-        return np.asarray(cell_indices, dtype=np.int64)
-    rng = np.random.default_rng(seed)
-    chosen = rng.choice(cell_indices, size=n_samples, replace=False)
-    return np.sort(np.asarray(chosen, dtype=np.int64))
-
-
-def _checkpoint_gene_names(
-    global_priors: PriorGrid | None,
-    label_priors: dict[str, PriorGrid],
-    fallback_gene_names: list[str],
-) -> list[str]:
-    if global_priors is not None:
-        return list(global_priors.gene_names)
-    if label_priors:
-        first = next(iter(label_priors.values()))
-        return list(first.gene_names)
-    return list(fallback_gene_names)
-
-
-def _read_gene_list(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
-def _resolve_gene_list(
-    path: Path, gene_to_idx: dict[str, int]
-) -> tuple[list[str], list[str]]:
-    requested = _read_gene_list(path)
-    ordered: list[str] = []
-    missing: list[str] = []
-    seen: set[str] = set()
-    for name in requested:
-        if name in seen:
-            continue
-        seen.add(name)
-        if name in gene_to_idx:
-            ordered.append(name)
-        else:
-            missing.append(name)
-    return ordered, missing
-
-
-def _resolve_fit_gene_list(
-    fit_genes_path: Path | None,
-    dataset_gene_names: list[str],
-    gene_to_idx: dict[str, int],
-) -> tuple[list[str], list[str]]:
-    if fit_genes_path is None:
-        return list(dataset_gene_names), []
-    return _resolve_gene_list(fit_genes_path, gene_to_idx)
-
-
-def _shard_gene_names(
-    gene_names: list[str], *, rank: int, world_size: int
-) -> list[str]:
-    return [name for idx, name in enumerate(gene_names) if idx % world_size == rank]
-
-
-def _select_matrix(adata: ad.AnnData, layer: str | None):
-    if layer is None:
-        return adata.X
-    if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} does not exist")
-    return adata.layers[layer]
-
-
-def _slice_gene_counts(
-    matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
-) -> np.ndarray:
-    subset = matrix[:, positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=np.float64)
-    return np.asarray(subset, dtype=np.float64)
-
-
-def _compute_reference_counts(
-    matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
-) -> np.ndarray:
-    subset = matrix[:, positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
-    else:
-        totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
-    return np.asarray(totals, dtype=np.float64).reshape(-1)
-
-
-def _print_fit_plan(**values: Any) -> None:
-    table = Table(title="Fit Plan")
-    table.add_column("Field")
-    table.add_column("Value")
-    for key, value in values.items():
-        table.add_row(key, str(value))
-    console.print(table)
-
-
-def _print_fit_summary(
-    *, output_path: Path, elapsed_sec: float, checkpoint: ModelCheckpoint
-) -> None:
-    s_value = "-" if checkpoint.scale is None else f"{checkpoint.scale.S:.4f}"
-    mean_ref = (
-        "-"
-        if checkpoint.scale is None
-        else f"{checkpoint.scale.mean_reference_count:.4f}"
-    )
-    table = Table(title="Fit Summary")
-    table.add_column("Genes", justify="right")
-    table.add_column("S", justify="right")
-    table.add_column("Mean ref count", justify="right")
-    table.add_row(
-        str(len(checkpoint.gene_names)),
-        s_value,
-        mean_ref,
-    )
-    console.print(table)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
-    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+__all__ = ["fit_priors_command"]

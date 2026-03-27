@@ -24,3 +24,6 @@ def serve(
         )
     )
     return 0
+
+
+__all__ = ["serve"]

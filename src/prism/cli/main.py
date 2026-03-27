@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import typer
 
-from prism.cli.extract_signal import extract_app
-from prism.cli.fit_prior_engine import fit_app
-from prism.cli.gene_lists import genes_app
-from prism.cli.merge_ckpt import checkpoint_app
-from prism.cli.serve import serve
+from prism.cli.checkpoint.app import checkpoint_app
+from prism.cli.extract.app import extract_app
+from prism.cli.fit.app import fit_app
+from prism.cli.genes.app import genes_app
+from prism.cli.serve.app import serve
 
 app = typer.Typer(
     name="prism",

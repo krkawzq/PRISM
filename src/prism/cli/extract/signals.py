@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import perf_counter
-from typing import cast
 
 import anndata as ad
 import numpy as np
 import typer
-from rich.console import Console
 from rich.progress import (
     BarColumn,
     Progress,
@@ -16,24 +14,25 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
-from rich.table import Table
-from scipy import sparse
 
-from prism.model import (
-    CORE_CHANNELS,
-    ObservationBatch,
-    Posterior,
-    SignalChannel,
-    load_checkpoint,
+from prism.model import load_checkpoint
+
+from .common import (
+    compute_reference_counts,
+    extract_batch,
+    print_extract_plan,
+    print_extract_summary,
+    read_gene_list,
+    require_reference_genes,
+    resolve_channels,
+    resolve_dtype,
+    resolve_prior_source,
+    select_matrix,
+    slice_gene_counts,
+    console,
 )
 
-extract_app = typer.Typer(
-    help="Extract signal layers from checkpoints.", no_args_is_help=True
-)
-console = Console()
 
-
-@extract_app.command("signals")
 def extract_signals_command(
     checkpoint_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Input checkpoint path."
@@ -53,13 +52,9 @@ def extract_signals_command(
     output_mode: str = typer.Option(
         "fitted-only", help="Output layout: fitted-only or full-matrix."
     ),
-    prior_source: str = typer.Option(
-        "global",
-        help="Prior source: global or label.",
-    ),
+    prior_source: str = typer.Option("global", help="Prior source: global or label."),
     label_key: str | None = typer.Option(
-        None,
-        help="Obs column used when --prior-source label.",
+        None, help="Obs column used when --prior-source label."
     ),
     batch_size: int = typer.Option(128, min=1, help="Genes per extraction batch."),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
@@ -80,17 +75,16 @@ def extract_signals_command(
     genes_path = None if genes_path is None else genes_path.expanduser().resolve()
 
     checkpoint = load_checkpoint(checkpoint_path)
-    reference_gene_names = _require_reference_genes(checkpoint.metadata)
-    selected_channels = _resolve_channels(channels)
-    output_dtype = _resolve_dtype(dtype)
-    prior_source_resolved = _resolve_prior_source(prior_source)
+    reference_gene_names = require_reference_genes(checkpoint.metadata)
+    selected_channels = resolve_channels(channels)
+    output_dtype = resolve_dtype(dtype)
+    prior_source_resolved = resolve_prior_source(prior_source)
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
-    matrix = _select_matrix(adata, layer)
+    matrix = select_matrix(adata, layer)
     dataset_gene_names = [str(name) for name in adata.var_names.tolist()]
     gene_to_idx = {name: idx for idx, name in enumerate(dataset_gene_names)}
-
     ref_positions = [
         gene_to_idx[name] for name in reference_gene_names if name in gene_to_idx
     ]
@@ -98,15 +92,14 @@ def extract_signals_command(
         raise ValueError(
             "checkpoint reference genes do not overlap with the input dataset"
         )
-    reference_counts = _compute_reference_counts(matrix, ref_positions)
-
+    reference_counts = compute_reference_counts(matrix, ref_positions)
     available_gene_names = checkpoint.gene_names
     if prior_source_resolved == "global" and checkpoint.priors is None:
         raise ValueError("checkpoint does not contain global priors")
     if prior_source_resolved == "label" and not checkpoint.label_priors:
         raise ValueError("checkpoint does not contain label-specific priors")
     requested_genes = (
-        available_gene_names if genes_path is None else _read_gene_list(genes_path)
+        available_gene_names if genes_path is None else read_gene_list(genes_path)
     )
     selected_genes = [
         name
@@ -117,8 +110,7 @@ def extract_signals_command(
         raise ValueError(
             "no selected genes overlap between the dataset and the checkpoint"
         )
-
-    _print_extract_plan(
+    print_extract_plan(
         checkpoint_path=checkpoint_path,
         h5ad_path=h5ad_path,
         layer=layer,
@@ -136,7 +128,6 @@ def extract_signals_command(
     )
     if dry_run:
         return 0
-
     if output_mode == "fitted-only":
         output_adata = adata[:, [gene_to_idx[name] for name in selected_genes]].copy()
         output_positions = {name: idx for idx, name in enumerate(selected_genes)}
@@ -147,7 +138,6 @@ def extract_signals_command(
         shape = (int(output_adata.n_obs), int(output_adata.n_vars))
     else:
         raise ValueError("output_mode must be 'fitted-only' or 'full-matrix'")
-
     layer_arrays = {
         channel: np.full(shape, np.nan, dtype=output_dtype)
         for channel in selected_channels
@@ -166,10 +156,10 @@ def extract_signals_command(
     ) as progress:
         task_id = progress.add_task("extracting", total=len(batches))
         for batch_index, batch_names in enumerate(batches, start=1):
-            batch_counts = _slice_gene_counts(
+            batch_counts = slice_gene_counts(
                 matrix, [gene_to_idx[name] for name in batch_names]
             )
-            extracted = _extract_batch(
+            extracted = extract_batch(
                 checkpoint=checkpoint,
                 adata=adata,
                 batch_names=batch_names,
@@ -191,12 +181,11 @@ def extract_signals_command(
                 advance=1,
                 description=f"extracting ({batch_index}/{len(batches)})",
             )
-
     for channel, values in layer_arrays.items():
         output_adata.layers[channel] = values
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_adata.write_h5ad(output_path)
-    _print_extract_summary(
+    print_extract_summary(
         output_path=output_path,
         elapsed_sec=perf_counter() - start_time,
         n_genes=len(selected_genes),
@@ -205,144 +194,4 @@ def extract_signals_command(
     return 0
 
 
-def _require_reference_genes(metadata: dict[str, object]) -> list[str]:
-    value = metadata.get("reference_gene_names")
-    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-        raise ValueError("checkpoint metadata is missing reference_gene_names")
-    return list(value)
-
-
-def _resolve_prior_source(value: str) -> str:
-    resolved = value.strip().lower()
-    if resolved not in {"global", "label"}:
-        raise ValueError("prior_source must be either 'global' or 'label'")
-    return resolved
-
-
-def _resolve_channels(channels: list[str] | None) -> list[str]:
-    if not channels:
-        return sorted(CORE_CHANNELS)
-    valid = set(CORE_CHANNELS) | {"map_p", "map_mu"}
-    unknown = [channel for channel in channels if channel not in valid]
-    if unknown:
-        raise ValueError(f"unknown channels: {unknown}")
-    return list(dict.fromkeys(channels))
-
-
-def _resolve_dtype(value: str) -> np.dtype:
-    if value == "float32":
-        return np.dtype(np.float32)
-    if value == "float64":
-        return np.dtype(np.float64)
-    raise ValueError(f"unsupported dtype: {value}")
-
-
-def _read_gene_list(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-
-
-def _select_matrix(adata: ad.AnnData, layer: str | None):
-    if layer is None:
-        return adata.X
-    if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} does not exist")
-    return adata.layers[layer]
-
-
-def _slice_gene_counts(matrix, positions: list[int]) -> np.ndarray:
-    subset = matrix[:, positions]
-    if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=np.float64)
-    return np.asarray(subset, dtype=np.float64)
-
-
-def _compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
-    subset = matrix[:, positions]
-    if sparse.issparse(subset):
-        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
-    else:
-        totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
-    return np.asarray(totals, dtype=np.float64).reshape(-1)
-
-
-def _extract_batch(
-    *,
-    checkpoint,
-    adata: ad.AnnData,
-    batch_names: list[str],
-    batch_counts: np.ndarray,
-    reference_counts: np.ndarray,
-    prior_source: str,
-    label_key: str | None,
-    device: str,
-    selected_channels: list[str],
-) -> dict[str, np.ndarray]:
-    requested_channels = cast(set[SignalChannel], set(selected_channels))
-    if prior_source == "global":
-        assert checkpoint.priors is not None
-        posterior = Posterior(
-            batch_names, checkpoint.priors.subset(batch_names), device=device
-        )
-        return posterior.extract(
-            ObservationBatch(
-                gene_names=batch_names,
-                counts=batch_counts,
-                reference_counts=reference_counts,
-            ),
-            channels=requested_channels,
-        )
-    if label_key is None:
-        raise ValueError("--label-key is required when --prior-source label")
-    if label_key not in adata.obs.columns:
-        raise KeyError(f"obs column {label_key!r} does not exist")
-    labels = np.asarray(adata.obs[label_key].astype(str)).reshape(-1)
-    layer_values = {
-        channel: np.full(
-            (batch_counts.shape[0], len(batch_names)), np.nan, dtype=np.float64
-        )
-        for channel in selected_channels
-    }
-    for label in np.unique(labels).tolist():
-        if label not in checkpoint.label_priors:
-            raise ValueError(f"checkpoint does not contain priors for label {label!r}")
-        cell_indices = np.flatnonzero(labels == label)
-        priors = checkpoint.label_priors[label].subset(batch_names)
-        posterior = Posterior(batch_names, priors, device=device)
-        extracted = posterior.extract(
-            ObservationBatch(
-                gene_names=batch_names,
-                counts=batch_counts[cell_indices],
-                reference_counts=reference_counts[cell_indices],
-            ),
-            channels=requested_channels,
-        )
-        for channel in selected_channels:
-            layer_values[channel][cell_indices] = np.asarray(
-                extracted[channel], dtype=np.float64
-            )
-    return layer_values
-
-
-def _print_extract_plan(**values: object) -> None:
-    table = Table(title="Extract Plan")
-    table.add_column("Field")
-    table.add_column("Value")
-    for key, value in values.items():
-        table.add_row(key, str(value))
-    console.print(table)
-
-
-def _print_extract_summary(
-    *, output_path: Path, elapsed_sec: float, n_genes: int, channels: list[str]
-) -> None:
-    table = Table(title="Extract Summary")
-    table.add_column("Genes", justify="right")
-    table.add_column("Channels")
-    table.add_row(str(n_genes), ", ".join(channels))
-    console.print(table)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
-    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+__all__ = ["extract_signals_command"]
