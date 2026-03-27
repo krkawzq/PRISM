@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import pickle
 from dataclasses import asdict
+from datetime import datetime, UTC
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -10,369 +10,357 @@ import anndata as ad
 import numpy as np
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 from scipy import sparse
-from tqdm.auto import tqdm
 
 from prism.model import (
-    GeneBatch,
-    PriorEngine,
-    PriorEngineSetting,
-    PriorEngineTrainingConfig,
-    fit_pool_scale,
+    ModelCheckpoint,
+    ObservationBatch,
+    PriorFitConfig,
+    PriorGrid,
+    ScaleMetadata,
+    fit_gene_priors,
+    save_checkpoint,
 )
-from prism.model._typing import DTYPE_NP, OptimizerName, SchedulerName
 
+fit_app = typer.Typer(help="Fit prior checkpoints.", no_args_is_help=True)
 console = Console()
-DEFAULT_ENGINE_SETTING = PriorEngineSetting()
-DEFAULT_TRAINING_CONFIG = PriorEngineTrainingConfig()
 
 
-def fit_prior_engine(
+@fit_app.command("priors")
+def fit_priors_command(
     h5ad_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Input h5ad file."
     ),
-    output_path: Path = typer.Argument(..., help="Output checkpoint pickle path."),
-    layer: str | None = typer.Option(None, help="AnnData layer name to use."),
-    device: str = typer.Option("cuda", help="Torch device, e.g. cpu or cuda."),
-    batch_size: int = typer.Option(64, min=1, help="Genes per fit batch."),
-    max_genes: int | None = typer.Option(
-        None, min=1, help="Fit only the first N selected genes."
+    output_path: Path = typer.Option(
+        ..., "--output", "-o", help="Output checkpoint path."
     ),
-    gene_start: int = typer.Option(0, min=0, help="Start gene index, inclusive."),
-    gene_end: int | None = typer.Option(None, min=0, help="End gene index, exclusive."),
-    r: float = typer.Option(
-        0.05, min=1e-12, max=1.0, help="Capture efficiency used to convert rS to S."
+    reference_genes_path: Path = typer.Option(
+        ...,
+        "--reference-genes",
+        exists=True,
+        dir_okay=False,
+        help="Text file with reference gene names used to compute reference counts.",
     ),
-    grid_size: int = typer.Option(
-        DEFAULT_ENGINE_SETTING.grid_size, min=2, help="Prior grid size."
+    fit_genes_path: Path | None = typer.Option(
+        None,
+        "--fit-genes",
+        exists=True,
+        dir_okay=False,
+        help="Optional text file with genes to fit. Defaults to all genes in the dataset.",
     ),
-    torch_dtype: str = typer.Option(
-        DEFAULT_ENGINE_SETTING.torch_dtype,
-        help="Torch dtype for fitting: float64 or float32.",
+    layer: str | None = typer.Option(None, help="Input AnnData layer. Defaults to X."),
+    S: float | None = typer.Option(
+        None,
+        min=1e-12,
+        help="Global scale marker used by the model. Defaults to mean reference count N_avg.",
     ),
+    device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
+    gene_batch_size: int = typer.Option(
+        64, min=1, help="Number of genes per fit batch."
+    ),
+    shard: str = typer.Option(
+        "0/1", help="Shard specification as rank/world, e.g. 0/4."
+    ),
+    grid_size: int = typer.Option(512, min=2, help="Prior grid size."),
     sigma_bins: float = typer.Option(
-        DEFAULT_ENGINE_SETTING.sigma_bins,
-        min=0.0,
-        help="Gaussian smoothing sigma in bins.",
+        1.0, min=0.0, help="Gaussian smoothing sigma in grid bins."
     ),
     align_loss_weight: float = typer.Option(
-        DEFAULT_ENGINE_SETTING.align_loss_weight, min=0.0, help="JSD alignment weight."
+        1.0, min=0.0, help="Posterior-prior alignment weight."
     ),
-    lr: float = typer.Option(
-        DEFAULT_TRAINING_CONFIG.lr, min=1e-12, help="Optimizer learning rate."
-    ),
-    n_iter: int = typer.Option(
-        DEFAULT_TRAINING_CONFIG.n_iter, min=1, help="Optimization iterations."
-    ),
+    lr: float = typer.Option(0.05, min=1e-12, help="Optimizer learning rate."),
+    n_iter: int = typer.Option(100, min=1, help="Optimization iterations."),
     lr_min_ratio: float = typer.Option(
-        DEFAULT_TRAINING_CONFIG.lr_min_ratio,
-        min=0.0,
-        help="Minimum lr ratio for scheduler.",
+        0.1, min=0.0, help="Scheduler minimum lr ratio."
     ),
     grad_clip: float | None = typer.Option(
-        DEFAULT_TRAINING_CONFIG.grad_clip, min=0.0, help="Optional gradient clip."
+        None, min=0.0, help="Optional gradient clipping threshold."
     ),
     init_temperature: float = typer.Option(
-        DEFAULT_TRAINING_CONFIG.init_temperature,
-        min=1e-12,
-        help="Cold-start initialization temperature.",
+        1.0, min=1e-12, help="Initialization temperature."
     ),
     cell_chunk_size: int = typer.Option(
-        DEFAULT_TRAINING_CONFIG.cell_chunk_size,
-        min=1,
-        help="Cells per likelihood chunk during fitting.",
+        512, min=1, help="Likelihood chunk size over cells."
     ),
-    optimizer: str = typer.Option(
-        DEFAULT_TRAINING_CONFIG.optimizer, help="Optimizer name."
+    optimizer: str = typer.Option("adamw", help="Optimizer name."),
+    scheduler: str = typer.Option("cosine", help="Scheduler name."),
+    torch_dtype: str = typer.Option("float64", help="Torch dtype: float64 or float32."),
+    dry_run: bool = typer.Option(
+        False, help="Show the execution plan without fitting."
     ),
-    scheduler: str = typer.Option(
-        DEFAULT_TRAINING_CONFIG.scheduler, help="Scheduler name."
-    ),
-    pool_max_iter: int = typer.Option(120, min=1, help="Pool scale EM max iterations."),
-    pool_tol: float = typer.Option(1e-6, min=1e-16, help="Pool scale EM tolerance."),
-    pool_n_quad: int = typer.Option(128, min=2, help="Pool scale quadrature points."),
-    use_posterior_mu: bool = typer.Option(
-        False, help="Use posterior softargmax point estimate for pool scale."
-    ),
-    pool_softargmax_temperature: float = typer.Option(
-        0.05,
-        min=1e-12,
-        help="Softargmax temperature when posterior pool estimate is enabled.",
-    ),
-    rank: int = typer.Option(0, min=0, help="Current worker rank."),
-    world_size: int = typer.Option(1, min=1, help="Total number of workers."),
 ) -> int:
     start_time = perf_counter()
-    h5ad_path = h5ad_path.resolve()
-    output_path = output_path.resolve()
-
-    console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
-    adata = ad.read_h5ad(h5ad_path)
-    matrix = _select_matrix(adata, layer)
-    totals = _compute_totals(matrix)
-    all_gene_names = np.asarray(adata.var_names.astype(str))
-    selected_gene_names, resolved_gene_start, resolved_gene_end = _select_gene_names(
-        all_gene_names,
-        gene_start=gene_start,
-        gene_end=gene_end,
-        max_genes=max_genes,
+    h5ad_path = h5ad_path.expanduser().resolve()
+    output_path = output_path.expanduser().resolve()
+    reference_genes_path = reference_genes_path.expanduser().resolve()
+    fit_genes_path = (
+        None if fit_genes_path is None else fit_genes_path.expanduser().resolve()
     )
-    if rank >= world_size:
-        raise ValueError(
-            f"rank 必须满足 rank < world_size，收到 {rank} >= {world_size}"
-        )
 
-    console.print("[bold cyan]Fitting[/bold cyan] pool scale")
-    pool_estimate = fit_pool_scale(
-        totals,
-        max_iter=pool_max_iter,
-        tol=pool_tol,
-        n_quad=pool_n_quad,
-        use_posterior_mu=use_posterior_mu,
-        softargmax_temperature=pool_softargmax_temperature,
-    )
-    s_hat = float(pool_estimate.point_eta / r)
-    _print_pool_summary(pool_estimate.mu, pool_estimate.sigma, s_hat)
-
-    setting = PriorEngineSetting(
+    rank, world_size = _parse_shard(shard)
+    fit_config = PriorFitConfig(
         grid_size=grid_size,
-        torch_dtype=cast(Any, torch_dtype),
         sigma_bins=sigma_bins,
         align_loss_weight=align_loss_weight,
-    )
-    training_cfg = PriorEngineTrainingConfig(
         lr=lr,
         n_iter=n_iter,
         lr_min_ratio=lr_min_ratio,
         grad_clip=grad_clip,
         init_temperature=init_temperature,
         cell_chunk_size=cell_chunk_size,
-        optimizer=cast(OptimizerName, optimizer),
-        scheduler=cast(SchedulerName, scheduler),
+        optimizer=cast(Any, optimizer),
+        scheduler=cast(Any, scheduler),
+        torch_dtype=cast(Any, torch_dtype),
     )
-    batch_ranges = _split_gene_batches(
-        n_genes=len(selected_gene_names),
-        batch_size=batch_size,
-        rank=rank,
-        world_size=world_size,
+
+    console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
+    adata = ad.read_h5ad(h5ad_path)
+    matrix = _select_matrix(adata, layer)
+    gene_names = [str(name) for name in adata.var_names.tolist()]
+    gene_to_idx = {name: idx for idx, name in enumerate(gene_names)}
+
+    reference_gene_names, missing_reference = _resolve_gene_list(
+        reference_genes_path, gene_to_idx
     )
-    if not batch_ranges:
-        raise ValueError("当前 rank 没有分配到任何基因批次")
-    local_gene_names = np.concatenate(
-        [selected_gene_names[start:end] for _, start, end in batch_ranges]
+    if not reference_gene_names:
+        raise ValueError("reference gene list has no overlap with the dataset")
+    fit_gene_names, missing_fit = _resolve_fit_gene_list(
+        fit_genes_path, gene_names, gene_to_idx
     )
-    resolved_device = _resolve_fit_device(
-        requested_device=device,
-        n_cells=int(adata.n_obs),
-        batch_size=batch_size,
-        grid_size=setting.grid_size,
-        torch_dtype=setting.torch_dtype,
-        cell_chunk_size=training_cfg.cell_chunk_size,
+    if not fit_gene_names:
+        raise ValueError("fit gene list is empty after intersecting with the dataset")
+    shard_gene_names = _shard_gene_names(
+        fit_gene_names, rank=rank, world_size=world_size
     )
-    _print_dataset_summary(
-        n_cells=int(adata.n_obs),
-        total_genes=int(adata.n_vars),
-        selected_genes=len(selected_gene_names),
-        local_genes=int(local_gene_names.size),
+    if not shard_gene_names:
+        raise ValueError(f"shard {rank}/{world_size} has no assigned genes")
+
+    reference_counts = _compute_reference_counts(
+        matrix, [gene_to_idx[name] for name in reference_gene_names]
+    )
+    default_S = float(np.mean(reference_counts))
+    resolved_S = default_S if S is None else float(S)
+    S_source = "default:N_avg" if S is None else "user"
+    _print_fit_plan(
+        h5ad_path=h5ad_path,
         layer=layer,
-        device=resolved_device,
-        batch_size=batch_size,
-        cell_chunk_size=training_cfg.cell_chunk_size,
-        rank=rank,
-        world_size=world_size,
+        n_cells=int(adata.n_obs),
+        n_dataset_genes=int(adata.n_vars),
+        n_reference_genes=len(reference_gene_names),
+        n_fit_genes=len(fit_gene_names),
+        n_shard_genes=len(shard_gene_names),
+        S=resolved_S,
+        S_source=S_source,
+        N_avg=default_S,
+        device=device,
+        gene_batch_size=gene_batch_size,
+        shard=f"{rank}/{world_size}",
+        output_path=output_path,
     )
-    engine = PriorEngine(
-        local_gene_names.tolist(), setting=setting, device=resolved_device
+    if missing_reference:
+        console.print(
+            f"[yellow]Skipped[/yellow] {len(missing_reference)} missing reference genes"
+        )
+    if missing_fit:
+        console.print(f"[yellow]Skipped[/yellow] {len(missing_fit)} missing fit genes")
+    if dry_run:
+        return 0
+
+    batch_names = [
+        shard_gene_names[start : start + gene_batch_size]
+        for start in range(0, len(shard_gene_names), gene_batch_size)
+    ]
+    fitted_p_grids: list[np.ndarray] = []
+    fitted_weights: list[np.ndarray] = []
+    batch_summaries: list[dict[str, Any]] = []
+    mean_reference_count = float(np.mean(reference_counts))
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("fitting priors", total=len(batch_names))
+        for batch_index, names in enumerate(batch_names, start=1):
+            batch_counts = _slice_gene_counts(
+                matrix, [gene_to_idx[name] for name in names]
+            )
+            result = fit_gene_priors(
+                ObservationBatch(
+                    gene_names=list(names),
+                    counts=batch_counts,
+                    reference_counts=reference_counts,
+                ),
+                S=resolved_S,
+                config=fit_config,
+                device=device,
+            )
+            priors = result.priors.batched()
+            fitted_p_grids.append(np.asarray(priors.p_grid, dtype=np.float64))
+            fitted_weights.append(np.asarray(priors.weights, dtype=np.float64))
+            batch_summaries.append(
+                {
+                    "batch_index": batch_index,
+                    "n_genes": len(names),
+                    "final_loss": float(result.final_loss),
+                    "best_loss": float(result.best_loss),
+                }
+            )
+            progress.update(
+                task_id,
+                advance=1,
+                description=f"fitting priors ({batch_index}/{len(batch_names)})",
+            )
+
+    merged_priors = PriorGrid(
+        gene_names=list(shard_gene_names),
+        p_grid=np.concatenate(fitted_p_grids, axis=0),
+        weights=np.concatenate(fitted_weights, axis=0),
+        S=resolved_S,
     )
-
-    fit_history: list[dict[str, Any]] = []
-    for local_batch_index, (global_batch_index, start, end) in enumerate(
-        tqdm(
-            batch_ranges,
-            desc=f"fit rank {rank}/{world_size}",
-            unit="batch",
-            dynamic_ncols=True,
-        ),
-        start=1,
-    ):
-        batch_gene_names = selected_gene_names[start:end]
-        batch_counts = _slice_gene_counts(
-            matrix,
-            resolved_gene_start + start,
-            resolved_gene_start + end,
-        )
-        gene_batch = GeneBatch(
-            gene_names=batch_gene_names.tolist(),
-            counts=batch_counts,
-            totals=totals,
-        )
-        fit_summary = engine.fit(gene_batch, s_hat=s_hat, training_cfg=training_cfg)
-        fit_history.append(
-            {
-                "local_batch_index": local_batch_index,
-                "global_batch_index": global_batch_index,
-                **asdict(fit_summary),
-            }
-        )
-
-    elapsed_sec = perf_counter() - start_time
-    checkpoint = {
-        "engine": engine,
-        "pool_estimate": pool_estimate,
-        "s_hat": s_hat,
-        "h5ad_path": str(h5ad_path),
-        "layer": layer,
-        "gene_start": resolved_gene_start,
-        "gene_end": resolved_gene_end,
-        "gene_names": local_gene_names.tolist(),
-        "global_gene_names": selected_gene_names.tolist(),
-        "setting": asdict(setting),
-        "training_config": asdict(training_cfg),
-        "fit_history": fit_history,
-        "n_cells": int(adata.n_obs),
-        "elapsed_sec": elapsed_sec,
-        "rank": rank,
-        "world_size": world_size,
-    }
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as fh:
-        pickle.dump(checkpoint, fh)
-
-    console.print(f"[bold green]Saved[/bold green] checkpoint to {output_path}")
-    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+    checkpoint = ModelCheckpoint(
+        gene_names=list(shard_gene_names),
+        priors=merged_priors,
+        scale=ScaleMetadata(S=resolved_S, mean_reference_count=mean_reference_count),
+        fit_config=asdict(fit_config),
+        metadata={
+            "schema_version": 1,
+            "source_h5ad_path": str(h5ad_path),
+            "layer": layer,
+            "reference_gene_names": list(reference_gene_names),
+            "requested_fit_gene_names": list(fit_gene_names),
+            "shard_gene_names": list(shard_gene_names),
+            "missing_reference_genes": list(missing_reference),
+            "missing_fit_genes": list(missing_fit),
+            "n_cells": int(adata.n_obs),
+            "gene_batch_size": int(gene_batch_size),
+            "shard_rank": int(rank),
+            "shard_world_size": int(world_size),
+            "S_source": S_source,
+            "default_S_from_reference_mean": default_S,
+            "created_at": datetime.now(UTC).isoformat(),
+            "batch_summaries": batch_summaries,
+        },
+    )
+    save_checkpoint(checkpoint, output_path)
+    _print_fit_summary(
+        output_path=output_path,
+        elapsed_sec=perf_counter() - start_time,
+        checkpoint=checkpoint,
+    )
     return 0
+
+
+def _parse_shard(value: str) -> tuple[int, int]:
+    parts = value.split("/")
+    if len(parts) != 2:
+        raise ValueError("shard must be formatted as rank/world, e.g. 0/4")
+    rank = int(parts[0])
+    world_size = int(parts[1])
+    if world_size < 1 or rank < 0 or rank >= world_size:
+        raise ValueError(f"invalid shard specification: {value}")
+    return rank, world_size
+
+
+def _read_gene_list(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _resolve_gene_list(
+    path: Path, gene_to_idx: dict[str, int]
+) -> tuple[list[str], list[str]]:
+    requested = _read_gene_list(path)
+    ordered: list[str] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for name in requested:
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in gene_to_idx:
+            ordered.append(name)
+        else:
+            missing.append(name)
+    return ordered, missing
+
+
+def _resolve_fit_gene_list(
+    fit_genes_path: Path | None,
+    dataset_gene_names: list[str],
+    gene_to_idx: dict[str, int],
+) -> tuple[list[str], list[str]]:
+    if fit_genes_path is None:
+        return list(dataset_gene_names), []
+    return _resolve_gene_list(fit_genes_path, gene_to_idx)
+
+
+def _shard_gene_names(
+    gene_names: list[str], *, rank: int, world_size: int
+) -> list[str]:
+    return [name for idx, name in enumerate(gene_names) if idx % world_size == rank]
 
 
 def _select_matrix(adata: ad.AnnData, layer: str | None):
     if layer is None:
         return adata.X
     if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} 不存在")
+        raise KeyError(f"layer {layer!r} does not exist")
     return adata.layers[layer]
 
 
-def _compute_totals(matrix) -> np.ndarray:
-    if sparse.issparse(matrix):
-        totals = np.asarray(matrix.sum(axis=1)).ravel()
-    else:
-        totals = np.asarray(matrix, dtype=DTYPE_NP).sum(axis=1)
-    return np.asarray(totals, dtype=DTYPE_NP).reshape(-1)
-
-
-def _select_gene_names(
-    gene_names: np.ndarray,
-    *,
-    gene_start: int,
-    gene_end: int | None,
-    max_genes: int | None,
-) -> tuple[np.ndarray, int, int]:
-    n_genes = len(gene_names)
-    if gene_start < 0 or gene_start >= n_genes:
-        raise ValueError(f"gene_start 超出范围: {gene_start}")
-
-    resolved_end = n_genes if gene_end is None else min(gene_end, n_genes)
-    if resolved_end <= gene_start:
-        raise ValueError(
-            f"gene_end 必须大于 gene_start，收到 {resolved_end} <= {gene_start}"
-        )
-
-    selected = gene_names[gene_start:resolved_end]
-    if max_genes is not None:
-        selected = selected[:max_genes]
-        resolved_end = gene_start + len(selected)
-
-    return selected, gene_start, resolved_end
-
-
-def _slice_gene_counts(matrix, start: int, end: int) -> np.ndarray:
-    subset = matrix[:, start:end]
+def _slice_gene_counts(matrix, positions: list[int]) -> np.ndarray:
+    subset = matrix[:, positions]
     if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=DTYPE_NP)
-    return np.asarray(subset, dtype=DTYPE_NP)
+        return np.asarray(subset.toarray(), dtype=np.float64)
+    return np.asarray(subset, dtype=np.float64)
 
 
-def _split_gene_batches(
-    *,
-    n_genes: int,
-    batch_size: int,
-    rank: int,
-    world_size: int,
-) -> list[tuple[int, int, int]]:
-    all_ranges = [
-        (batch_index, start, min(start + batch_size, n_genes))
-        for batch_index, start in enumerate(range(0, n_genes, batch_size))
-    ]
-    return [item for item in all_ranges if item[0] % world_size == rank]
+def _compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
+    subset = matrix[:, positions]
+    if sparse.issparse(subset):
+        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
+    else:
+        totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
+    return np.asarray(totals, dtype=np.float64).reshape(-1)
 
 
-def _print_dataset_summary(
-    *,
-    n_cells: int,
-    total_genes: int,
-    selected_genes: int,
-    local_genes: int,
-    layer: str | None,
-    device: str,
-    batch_size: int,
-    cell_chunk_size: int,
-    rank: int,
-    world_size: int,
+def _print_fit_plan(**values: Any) -> None:
+    table = Table(title="Fit Plan")
+    table.add_column("Field")
+    table.add_column("Value")
+    for key, value in values.items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+def _print_fit_summary(
+    *, output_path: Path, elapsed_sec: float, checkpoint: ModelCheckpoint
 ) -> None:
-    table = Table(title="Dataset")
-    table.add_column("Cells", justify="right")
+    table = Table(title="Fit Summary")
     table.add_column("Genes", justify="right")
-    table.add_column("Selected", justify="right")
-    table.add_column("Local", justify="right")
-    table.add_column("Layer")
-    table.add_column("Device")
-    table.add_column("Batch", justify="right")
-    table.add_column("CellChunk", justify="right")
-    table.add_column("Rank", justify="right")
+    table.add_column("S", justify="right")
+    table.add_column("Mean ref count", justify="right")
     table.add_row(
-        str(n_cells),
-        str(total_genes),
-        str(selected_genes),
-        str(local_genes),
-        layer or "X",
-        device,
-        str(batch_size),
-        str(cell_chunk_size),
-        f"{rank}/{world_size}",
+        str(len(checkpoint.gene_names)),
+        f"{checkpoint.scale.S:.4f}",
+        f"{checkpoint.scale.mean_reference_count:.4f}",
     )
     console.print(table)
-
-
-def _print_pool_summary(mu: float, sigma: float, s_hat: float) -> None:
-    table = Table(title="Pool Scale")
-    table.add_column("mu", justify="right")
-    table.add_column("sigma", justify="right")
-    table.add_column("s_hat", justify="right")
-    table.add_row(f"{mu:.4f}", f"{sigma:.4f}", f"{s_hat:.4f}")
-    console.print(table)
-
-
-def _resolve_fit_device(
-    *,
-    requested_device: str,
-    n_cells: int,
-    batch_size: int,
-    grid_size: int,
-    torch_dtype: str,
-    cell_chunk_size: int,
-) -> str:
-    if not requested_device.startswith("cuda"):
-        return requested_device
-
-    bytes_per_value = 8 if torch_dtype == "float64" else 4
-    effective_cells = min(n_cells, cell_chunk_size)
-    estimated_bytes = effective_cells * batch_size * grid_size * bytes_per_value * 4
-    estimated_gib = estimated_bytes / (1024**3)
-    if estimated_gib > 8.0:
-        console.print(
-            "[yellow]Warning:[/yellow] estimated likelihood cache is too large for efficient GPU fitting; "
-            f"falling back to CPU (est. cache {estimated_gib:.2f} GiB)."
-        )
-        return "cpu"
-    return requested_device
+    console.print(f"[bold green]Saved[/bold green] {output_path}")
+    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")

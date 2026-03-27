@@ -16,7 +16,7 @@ from rich.table import Table
 from scipy import sparse
 
 from prism.model import fit_pool_scale
-from prism.model._typing import DTYPE_NP, EPS
+from prism.model import DTYPE_NP, EPS
 from prism.model.estimator import _log_marginal, _posterior_grid_weights
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

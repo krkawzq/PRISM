@@ -1,182 +1,185 @@
 from __future__ import annotations
 
-import pickle
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
+import numpy as np
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from prism.model import PoolEstimate, PriorEngine, PriorEngineSetting
+from prism.model import ModelCheckpoint, PriorGrid, load_checkpoint, save_checkpoint
 
+checkpoint_app = typer.Typer(help="Checkpoint utilities.", no_args_is_help=True)
 console = Console()
 
 
-def merge_ckpt(
-    ckpt_paths: list[Path] = typer.Argument(
-        ..., exists=True, dir_okay=False, help="Input shard checkpoint paths."
+@checkpoint_app.command("merge")
+def merge_checkpoints_command(
+    checkpoint_paths: list[Path] = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Input checkpoint paths."
     ),
     output_path: Path = typer.Option(
-        ..., "--output", "-o", help="Output merged checkpoint path."
+        ..., "--output", "-o", help="Merged checkpoint path."
+    ),
+    allow_partial: bool = typer.Option(
+        False,
+        help="Allow merged checkpoints to miss genes from the declared requested set.",
     ),
 ) -> int:
-    if len(ckpt_paths) < 2:
-        raise ValueError("merge-ckpt 至少需要两个输入 checkpoint")
-
-    resolved_paths = [path.resolve() for path in ckpt_paths]
-    checkpoints = [_load_checkpoint(path) for path in resolved_paths]
-    _validate_shared_metadata(checkpoints, resolved_paths)
-
-    first = checkpoints[0]
-    global_gene_names = list(first["global_gene_names"])
-    setting = PriorEngineSetting(**first["setting"])
-    merged_engine = PriorEngine(global_gene_names, setting=setting, device="cpu")
-
-    assigned: set[str] = set()
-    fit_history: list[dict[str, Any]] = []
-    merged_ranks: list[int] = []
-    source_gene_counts: list[tuple[str, int, int]] = []
-
-    for path, checkpoint in zip(resolved_paths, checkpoints, strict=True):
-        shard_engine = checkpoint["engine"]
-        if not isinstance(shard_engine, PriorEngine):
-            raise TypeError(f"{path} 中的 engine 不是 PriorEngine")
-
-        shard_gene_names = list(checkpoint["gene_names"])
-        if len(shard_gene_names) != len(set(shard_gene_names)):
-            raise ValueError(f"{path} 的 gene_names 存在重复")
-
-        overlap = assigned.intersection(shard_gene_names)
-        if overlap:
-            overlap_preview = sorted(overlap)[:5]
-            raise ValueError(
-                f"{path} 与已有 shard 存在重复基因，例如 {overlap_preview}"
-            )
-
-        indices = [merged_engine._gene_to_idx[name] for name in shard_gene_names]
-        shard_logits = shard_engine.get_logits(shard_gene_names)
-        shard_priors = shard_engine.get_priors(shard_gene_names)
-        if shard_logits is None or shard_priors is None:
-            raise ValueError(f"{path} 含有未拟合基因，无法合并")
-
-        merged_engine._logits[indices] = shard_logits
-        merged_engine._grid_min[indices] = shard_priors.grid_min
-        merged_engine._grid_max[indices] = shard_priors.grid_max
-        merged_engine._fitted[indices] = True
-
-        assigned.update(shard_gene_names)
-        merged_ranks.append(int(checkpoint["rank"]))
-        source_gene_counts.append(
-            (path.name, int(checkpoint["rank"]), len(shard_gene_names))
-        )
-
-        for item in checkpoint.get("fit_history", []):
-            fit_history.append({"rank": int(checkpoint["rank"]), **item})
-
-    missing = [name for name in global_gene_names if name not in assigned]
-    if missing:
-        raise ValueError(f"合并后仍缺少 {len(missing)} 个基因，例如 {missing[:5]}")
-
-    merged_checkpoint = {
-        "engine": merged_engine,
-        "pool_estimate": _coerce_pool_estimate(first["pool_estimate"]),
-        "s_hat": float(first["s_hat"]),
-        "h5ad_path": first["h5ad_path"],
-        "layer": first["layer"],
-        "gene_start": int(first["gene_start"]),
-        "gene_end": int(first["gene_end"]),
-        "gene_names": global_gene_names,
-        "global_gene_names": global_gene_names,
-        "setting": first["setting"],
-        "training_config": first["training_config"],
-        "fit_history": fit_history,
-        "n_cells": int(first["n_cells"]),
-        "elapsed_sec": float(
-            sum(float(ckpt.get("elapsed_sec", 0.0)) for ckpt in checkpoints)
-        ),
-        "rank": 0,
-        "world_size": int(first["world_size"]),
-        "source_ckpts": [str(path) for path in resolved_paths],
-        "merged_from_ranks": sorted(merged_ranks),
-    }
-
-    output_path = output_path.resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("wb") as fh:
-        pickle.dump(merged_checkpoint, fh)
-
-    _print_merge_summary(source_gene_counts, output_path, len(global_gene_names))
+    if len(checkpoint_paths) < 2:
+        raise ValueError("merge requires at least two checkpoints")
+    checkpoints = [
+        load_checkpoint(path.expanduser().resolve()) for path in checkpoint_paths
+    ]
+    merged = _merge_checkpoints(
+        checkpoints,
+        [path.expanduser().resolve() for path in checkpoint_paths],
+        allow_partial=allow_partial,
+    )
+    output_path = output_path.expanduser().resolve()
+    save_checkpoint(merged, output_path)
+    _print_merge_summary(output_path, checkpoints, merged)
     return 0
 
 
-def _load_checkpoint(path: Path) -> dict[str, Any]:
-    with path.open("rb") as fh:
-        checkpoint = pickle.load(fh)
-    if not isinstance(checkpoint, dict):
-        raise TypeError(f"{path} 不是合法的 checkpoint 字典")
-    return checkpoint
+@checkpoint_app.command("inspect")
+def inspect_checkpoint_command(
+    checkpoint_path: Path = typer.Argument(
+        ..., exists=True, dir_okay=False, help="Checkpoint path."
+    ),
+) -> int:
+    checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
+    metadata = checkpoint.metadata
+    table = Table(title="Checkpoint")
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("genes", str(len(checkpoint.gene_names)))
+    table.add_row("S", f"{checkpoint.scale.S:.4f}")
+    table.add_row(
+        "mean_reference_count", f"{checkpoint.scale.mean_reference_count:.4f}"
+    )
+    table.add_row("S_source", str(metadata.get("S_source", "")))
+    table.add_row(
+        "default_S_from_reference_mean",
+        str(metadata.get("default_S_from_reference_mean", "")),
+    )
+    table.add_row("source_h5ad_path", str(metadata.get("source_h5ad_path", "")))
+    table.add_row("layer", str(metadata.get("layer", "")))
+    table.add_row(
+        "reference_genes",
+        str(len(_safe_string_list(metadata.get("reference_gene_names")))),
+    )
+    table.add_row(
+        "requested_fit_genes",
+        str(len(_safe_string_list(metadata.get("requested_fit_gene_names")))),
+    )
+    table.add_row(
+        "shard",
+        f"{metadata.get('shard_rank', 0)}/{metadata.get('shard_world_size', 1)}",
+    )
+    console.print(table)
+    return 0
 
 
-def _coerce_pool_estimate(value: Any) -> PoolEstimate:
-    if isinstance(value, PoolEstimate):
-        return value
-    if isinstance(value, dict):
-        return PoolEstimate(**value)
-    raise TypeError("checkpoint 中的 pool_estimate 不是合法类型")
+def _merge_checkpoints(
+    checkpoints: list[ModelCheckpoint],
+    source_paths: list[Path],
+    *,
+    allow_partial: bool,
+) -> ModelCheckpoint:
+    first = checkpoints[0]
+    _validate_shared_metadata(checkpoints, source_paths)
+
+    rows: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for checkpoint in checkpoints:
+        priors = checkpoint.priors.batched()
+        for idx, gene_name in enumerate(priors.gene_names):
+            if gene_name in rows:
+                raise ValueError(
+                    f"duplicate fitted gene across checkpoints: {gene_name}"
+                )
+            rows[gene_name] = (
+                np.asarray(priors.p_grid[idx], dtype=np.float64),
+                np.asarray(priors.weights[idx], dtype=np.float64),
+            )
+
+    requested_gene_names = _safe_string_list(
+        first.metadata.get("requested_fit_gene_names")
+    )
+    ordered_gene_names = (
+        requested_gene_names if requested_gene_names else list(rows.keys())
+    )
+    missing = [name for name in ordered_gene_names if name not in rows]
+    if missing and not allow_partial:
+        raise ValueError(
+            f"merged checkpoints still miss {len(missing)} genes, e.g. {missing[:5]}"
+        )
+    merged_gene_names = [name for name in ordered_gene_names if name in rows]
+    if not merged_gene_names:
+        raise ValueError("merged checkpoint contains no genes")
+    p_grid = np.stack([rows[name][0] for name in merged_gene_names], axis=0)
+    weights = np.stack([rows[name][1] for name in merged_gene_names], axis=0)
+    metadata = dict(first.metadata)
+    metadata.update(
+        {
+            "shard_rank": 0,
+            "shard_world_size": 1,
+            "shard_gene_names": list(merged_gene_names),
+            "source_checkpoints": [str(path) for path in source_paths],
+            "merge_allow_partial": bool(allow_partial),
+            "missing_after_merge": missing,
+        }
+    )
+    return ModelCheckpoint(
+        gene_names=list(merged_gene_names),
+        priors=PriorGrid(
+            gene_names=list(merged_gene_names),
+            p_grid=p_grid,
+            weights=weights,
+            S=float(first.priors.S),
+        ),
+        scale=first.scale,
+        fit_config=dict(first.fit_config),
+        metadata=metadata,
+    )
 
 
 def _validate_shared_metadata(
-    checkpoints: list[dict[str, Any]],
-    paths: list[Path],
+    checkpoints: list[ModelCheckpoint], paths: list[Path]
 ) -> None:
     first = checkpoints[0]
-    shared_keys = [
-        "h5ad_path",
-        "layer",
-        "gene_start",
-        "gene_end",
-        "global_gene_names",
-        "setting",
-        "training_config",
-        "world_size",
-    ]
-
-    first_pool = _coerce_pool_estimate(first["pool_estimate"])
-    first_pool_dict = asdict(first_pool)
     for path, checkpoint in zip(paths[1:], checkpoints[1:], strict=True):
-        for key in shared_keys:
-            if checkpoint.get(key) != first.get(key):
-                raise ValueError(f"{path} 的字段 {key!r} 与首个 checkpoint 不一致")
+        if checkpoint.priors.S != first.priors.S:
+            raise ValueError(f"{path} has a different S")
+        if checkpoint.fit_config != first.fit_config:
+            raise ValueError(f"{path} has a different fit configuration")
+        for key in (
+            "source_h5ad_path",
+            "layer",
+            "reference_gene_names",
+            "requested_fit_gene_names",
+        ):
+            if checkpoint.metadata.get(key) != first.metadata.get(key):
+                raise ValueError(f"{path} has different metadata for {key!r}")
 
-        pool_dict = asdict(_coerce_pool_estimate(checkpoint["pool_estimate"]))
-        if pool_dict != first_pool_dict:
-            raise ValueError(f"{path} 的 pool_estimate 与首个 checkpoint 不一致")
 
-        if float(checkpoint["s_hat"]) != float(first["s_hat"]):
-            raise ValueError(f"{path} 的 s_hat 与首个 checkpoint 不一致")
-
-    expected_ranks = set(range(int(first["world_size"])))
-    found_ranks = {int(checkpoint["rank"]) for checkpoint in checkpoints}
-    if found_ranks != expected_ranks:
-        raise ValueError(
-            f"rank 集合不完整：期望 {sorted(expected_ranks)}，收到 {sorted(found_ranks)}"
-        )
+def _safe_string_list(value: object) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return []
+    return list(value)
 
 
 def _print_merge_summary(
-    source_gene_counts: list[tuple[str, int, int]],
-    output_path: Path,
-    total_genes: int,
+    output_path: Path, checkpoints: list[ModelCheckpoint], merged: ModelCheckpoint
 ) -> None:
     table = Table(title="Merged Checkpoint")
-    table.add_column("Shard")
-    table.add_column("Rank", justify="right")
-    table.add_column("Genes", justify="right")
-    for shard_name, rank, n_genes in source_gene_counts:
-        table.add_row(shard_name, str(rank), str(n_genes))
-    console.print(table)
-    console.print(
-        f"[bold green]Merged[/bold green] {total_genes} genes -> {output_path}"
+    table.add_column("Input genes", justify="right")
+    table.add_column("Merged genes", justify="right")
+    table.add_column("S", justify="right")
+    table.add_row(
+        str(sum(len(checkpoint.gene_names) for checkpoint in checkpoints)),
+        str(len(merged.gene_names)),
+        f"{merged.scale.S:.4f}",
     )
+    console.print(table)
+    console.print(f"[bold green]Saved[/bold green] {output_path}")

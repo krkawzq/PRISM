@@ -33,7 +33,7 @@ from prism.model import (
     PriorFitReport,
     fit_pool_scale_report,
 )
-from prism.model._typing import OptimizerName, SchedulerName
+from prism.model import OptimizerName, SchedulerName
 
 from ..state import AppState, LoadedState
 from .datasets import (

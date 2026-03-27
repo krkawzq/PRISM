@@ -5,8 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import stats
 
-from prism.model import GridDistribution
-from prism.model._typing import EPS
+from prism.model import EPS, GridDistribution
 
 
 @dataclass(frozen=True, slots=True)

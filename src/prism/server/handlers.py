@@ -6,7 +6,7 @@ from http import HTTPStatus
 from importlib import resources
 from typing import Literal, cast
 
-from prism.model._typing import OptimizerName, SchedulerName
+from prism.model import OptimizerName, SchedulerName
 
 from .router import Request, Response, Router
 from .services.analysis import (

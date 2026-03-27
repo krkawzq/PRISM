@@ -6,7 +6,7 @@ from typing import Any
 import numpy as np
 from scipy import sparse
 
-from prism.model._typing import DTYPE_NP
+from prism.model import DTYPE_NP
 
 
 class GeneLookupError(Exception):

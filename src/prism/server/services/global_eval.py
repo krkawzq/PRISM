@@ -21,8 +21,7 @@ from prism.baseline.fg_analysis import (
     summarize_fg_analysis,
 )
 from prism.baseline.metrics import treatment_conditional_cv
-from prism.model import GeneBatch, Posterior
-from prism.model._typing import DTYPE_NP
+from prism.model import DTYPE_NP, GeneBatch, Posterior
 
 from ..state import AppState, LoadedState
 
@@ -92,7 +91,6 @@ def _compute_global_evaluation_uncached(
     loaded: LoadedState,
     params: GlobalEvalParams,
 ) -> GlobalEvaluationResult:
-
     label_key, labels = _resolve_labels(loaded)
     print(
         f"[prism-server] global eval start label_key={label_key} max_cells={params.max_cells} max_genes={params.max_genes} batch={params.gene_batch_size} seed={params.random_seed}",

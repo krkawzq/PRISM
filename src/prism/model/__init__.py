@@ -1,40 +1,105 @@
-from ._typing import GeneBatch, GridDistribution, LikelihoodCache, PoolEstimate
+from __future__ import annotations
+
+from .checkpoint import (
+    ModelCheckpoint,
+    checkpoint_from_fit_result,
+    load_checkpoint,
+    save_checkpoint,
+)
+from .constants import (
+    DTYPE_NP,
+    DTYPE_TORCH,
+    EPS,
+    NEG_INF,
+    OPTIMIZERS,
+    SCHEDULERS,
+    OptimizerName,
+    SchedulerName,
+)
 from .engine import (
     FitSummary,
-    PriorFitReport,
     PriorEngine,
     PriorEngineSetting,
     PriorEngineTrainingConfig,
+    PriorFitReport,
+    PriorFitter,
 )
-from .estimator import PoolFitReport, fit_pool_scale, fit_pool_scale_report
+from .estimator import (
+    PoolFitReport,
+    fit_pool_scale,
+    fit_pool_scale_report,
+    summarize_reference_scale,
+)
+from .exposure import effective_exposure, mean_reference_count, ratio_observation_mean
+from .fit import fit_gene_priors
+from .infer import ALL_CHANNELS, CORE_CHANNELS, SignalChannel, infer_posteriors
+from .kbulk import KBulkAggregator, KBulkBatch, KBulkResult, infer_kbulk
 from .posterior import (
-    ALL_CHANNELS,
-    CORE_CHANNELS,
     Posterior,
     PosteriorBatchReport,
     PosteriorSummary,
-    SignalChannel,
     SignalExtractor,
+)
+from .types import (
+    GeneBatch,
+    GridDistribution,
+    InferenceResult,
+    ObservationBatch,
+    PoolEstimate,
+    PriorFitConfig,
+    PriorFitResult,
+    PriorGrid,
+    ScaleDiagnostic,
+    ScaleMetadata,
 )
 
 __all__ = [
     "ALL_CHANNELS",
     "CORE_CHANNELS",
+    "DTYPE_NP",
+    "DTYPE_TORCH",
+    "EPS",
     "FitSummary",
     "GeneBatch",
     "GridDistribution",
-    "LikelihoodCache",
-    "PoolFitReport",
-    "PoolEstimate",
+    "InferenceResult",
+    "KBulkAggregator",
+    "KBulkBatch",
+    "KBulkResult",
+    "ModelCheckpoint",
+    "NEG_INF",
+    "ObservationBatch",
+    "OPTIMIZERS",
+    "OptimizerName",
     "Posterior",
     "PosteriorBatchReport",
     "PosteriorSummary",
-    "PriorFitReport",
+    "PoolEstimate",
+    "PoolFitReport",
     "PriorEngine",
     "PriorEngineSetting",
     "PriorEngineTrainingConfig",
+    "PriorFitConfig",
+    "PriorFitReport",
+    "PriorFitResult",
+    "PriorFitter",
+    "PriorGrid",
+    "SCHEDULERS",
+    "ScaleDiagnostic",
+    "ScaleMetadata",
+    "SchedulerName",
     "SignalChannel",
     "SignalExtractor",
+    "checkpoint_from_fit_result",
+    "effective_exposure",
+    "fit_gene_priors",
     "fit_pool_scale",
     "fit_pool_scale_report",
+    "infer_posteriors",
+    "infer_kbulk",
+    "load_checkpoint",
+    "mean_reference_count",
+    "ratio_observation_mean",
+    "save_checkpoint",
+    "summarize_reference_scale",
 ]

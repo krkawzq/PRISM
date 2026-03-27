@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 from scipy import stats
 
-from ..model._typing import DTYPE_NP, EPS
+from ..model import DTYPE_NP, EPS
 
 __all__ = [
     "auroc_one_vs_rest",

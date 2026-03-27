@@ -29,7 +29,7 @@ from prism.model import (
     PriorEngineSetting,
     PriorEngineTrainingConfig,
 )
-from prism.model._typing import DTYPE_NP
+from prism.model import DTYPE_NP
 from prism.server.services.datasets import (
     resolve_gene_query,
     select_matrix,

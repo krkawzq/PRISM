@@ -2,455 +2,285 @@
 
 ---
 
-## 1. 符号与生成模型
+## 1. 符号体系与生成模型
 
 ### 1.1 符号表
 
 | 符号 | 名称 | 定义 | 备注 |
 |---|---|---|---|
-| $g$ | 基因索引 | $g = 1, \ldots, G$ | |
+| $\mathcal{G}^{\mathrm{ref}}$ | 参考基因集合 | 用于构造细胞参考总计数的基因集合 | 应尽可能大且结构均衡；应排除对总量有压倒性贡献的模块（如高占比线粒体基因、核糖体基因等） |
+| $\mathcal{G}^{\mathrm{fit}}$ | 拟合基因集合 | 需要进行单基因建模的目标基因集合 | 不要求与 $\mathcal{G}^{\mathrm{ref}}$ 重合；未参与 $N_c$ 构造的基因仍可被拟合 |
+| $G^{\mathrm{ref}}$ | 参考集合基数 | $G^{\mathrm{ref}} = \lvert\mathcal{G}^{\mathrm{ref}}\rvert$ | 决定 $N_c$ 的聚合稳定性 |
+| $g$ | 拟合基因索引 | $g \in \mathcal{G}^{\mathrm{fit}}$ | 不要求 $g \in \mathcal{G}^{\mathrm{ref}}$ |
+| $h$ | 参考基因索引 | $h \in \mathcal{G}^{\mathrm{ref}}$ | 仅用于定义 $N_c$ |
 | $c$ | 细胞索引 | $c = 1, \ldots, C$ | |
-| $\mu_{gc} > 0$ | 潜在表达水平 | 细胞 $c$ 中基因 $g$ 的去噪潜在丰度 | 有效信号变量；理论上对应程序性异质性，但工程上会吸收部分不可观测扰动 |
-| $\epsilon_c > 0$ | 细胞效率因子 | 细胞 $c$ 的全局乘性偏置 | 对所有基因共享；$\log \epsilon_c \sim \mathcal{N}(\mu_\epsilon, \sigma_\epsilon^2)$ |
-| $\epsilon_{gc} > 0$ | 基因-细胞独立扰动 | $(g,c)$ 对上的独立乘性扰动 | $\mathbb{E}[\epsilon_{gc}] = 1$；各 $(g,c)$ 对独立 |
-| $r \in (0, 1]$ | 捕获效率 | 分子被实际捕获为 UMI 的全局比例 | 超参数；所有基因和细胞共享 |
-| $\Lambda_c$ | 有效采样池 | $\Lambda_c = \epsilon_c \cdot \sum_g \epsilon_{gc} \cdot \mu_{gc}$ | 细胞 $c$ 中经过所有扰动后的总有效分子数 |
-| $X_{gc}$ | 观测 UMI 计数 | 最终观测值 | |
-| $N_c$ | 总 UMI 计数 | $N_c = \sum_g X_{gc}$ | |
-| $F_g$ | 基因先验 | $\mu_{gc} \sim F_g$ | 基因 $g$ 潜在表达的群体级有效先验 |
-| $S$ | 采样池标尺 | 全局参照常数，通过 §2 从数据中估计 | 作用是将跨基因耦合的分母替换为已知常数，使各基因解耦 |
+| $X_{gc}$ | 观测 UMI 计数 | 基因 $g$ 在细胞 $c$ 中的观测计数 | 直接可观测量 |
+| $N_c$ | 参考总计数 | $N_c = \sum_{h \in \mathcal{G}^{\mathrm{ref}}} X_{hc}$ | 细胞级 exposure 代理；是对潜在窗口 $T_c$ 的带噪估计，而非精确真值 |
+| $T_c$ | 潜在总窗口 | 细胞 $c$ 中不可直接完整观测的有效分子总体 | 概念性参照量；$N_c$ 是其有噪代理 |
+| $p_{gc} \in [0,1]$ | 相对表达比率 | 基因 $g$ 在细胞 $c$ 中相对于参考窗口的表达占比 | 框架的核心潜变量；语义由 $\mathcal{G}^{\mathrm{ref}}$ 诱导 |
+| $F_g$ | 基因级有效先验 | $p_{gc} \sim F_g$ | 定义在相对表达比率空间的群体级先验，吸收所有无法显式分解的局部扰动 |
+| $S > 0$ | 缩放标尺 | 任意选定的正实数常数 | 纯坐标变换量纲；仅在需要将 $p_{gc}$ 映射至绝对数值网格时引入 |
+| $\mu_{gc}$ | 缩放表达坐标 | $\mu_{gc} = S \cdot p_{gc}$ | $p_{gc}$ 的等价重参数化；便于可视化与旧接口兼容 |
+| $\epsilon_c > 0$ | 细胞级整体扰动 | 细胞 $c$ 共享的整体窗口缩放因子 | 主要效应由 $N_c$ 的细胞间差异吸收，不作为独立潜变量推断 |
+| $\epsilon_{gc} > 0$ | 基因-细胞局部扰动 | 基因 $g$ 在细胞 $c$ 中的局部组成波动 | 包括局部捕获偏差、微环境差异、转录 burst 等；其效应吸收入有效先验 $F_g$ |
+| $\bar N$ | 参考总计数均值 | $\bar N = \frac{1}{C}\sum_{c=1}^C N_c$ | 用于将不同细胞的 exposure 归一到共同尺度 |
+| $N_c^{\mathrm{eff}}$ | 有效参考计数 | $N_c^{\mathrm{eff}} = \frac{N_c}{\bar N} S$ | 进入工作 likelihood 的有效 exposure；同时编码细胞相对窗口大小与全局尺度 $S$ |
 
-### 1.2 跨批次扩展（可选）
-
-当需要进行跨批次或跨物种比较时，可以将 $\mu_{gc}$ 进一步分解为：
-
-| 符号 | 名称 | 定义 |
-|---|---|---|
-| $p_{gc} \in (0, 1)$ | 相对基因活性 | 由细胞类型 / 状态决定的无量纲活性 |
-| $L_g > 0$ | 表达域长度 | 基因 $g$ 表达范围的有效上界 |
-| $\tau \in (0, 1)$ | 覆盖阈值 | 控制 $L_g$ 截断点的超参数，例如 $\tau = 0.99$ |
-
-令 $\Phi_g$ 表示 $F_g$ 的 CDF。则 $L_g$ 定义为 $\tau$ 分位数：
-
-$$L_g = \inf\{x : \Phi_g(x) \geq \tau\}$$
-
-从而有 $\mu_{gc} = L_g \cdot p_{gc}$。
-
-**单批次分析不需要这一步分解。**
-
-### 1.3 生成模型
-
-数据生成过程由四层构成：
-
-**生物层（信号来源）：**
-
-$$\mu_{gc} \sim F_g$$
-
-每个基因 $g$ 有独立先验 $F_g$，可以是单峰、多峰、重尾或任意混合分布。理论上，$F_g$ 只描述程序性异质性；但在实际估计中，由于部分非程序性扰动不可分辨，$F_g$ 应理解为对去噪潜在丰度的有效先验（effective prior over denoised latent abundance）。跨基因依赖被留给下游模型处理。
-
-**基因-细胞独立扰动层：**
-
-$$\epsilon_{gc} > 0, \qquad \mathbb{E}[\epsilon_{gc}] = 1, \qquad \text{各 } (g,c) \text{ 对独立}$$
-
-每个 $(g,c)$ 对独立采样一个乘性扰动。$\epsilon_{gc}$ 刻画的是在群体级先验 $F_g$ 和细胞级效率 $\epsilon_c$ 之外，每个基因在每个细胞中各自经历的、具有一定范围的未知扰动。这包括单分子捕获的随机波动、局部反应微环境差异、转录脉冲噪声等非程序性来源。
-
-这里将 $\epsilon_{gc}$ 显式写出，主要是为了严谨分析分母
-
-$$\sum_{g'} \epsilon_{g'c} \mu_{g'c}$$
-
-在大数条件下为何可以稳定到 $S$，从而说明这类局部扰动对全局标尺估计的影响是次阶的。换言之，$\epsilon_{gc}$ 对 **$S$ 的角色** 是“需要被显式分析以证明其近似可消去”；但对 **$F_g$ 的角色** 则不同：由于 $\epsilon_{gc}$ 不可直接观测、影响相对较小，且本框架本身就是工作近似，在实际工程实现中更合理的做法是让其效应吸收到 $\hat{F}_g$ 的 effective prior 中，而不是试图单独恢复一个可辨识的 $\epsilon_{gc}$ 层。
-
-**细胞效率层：**
-
-$$\log \epsilon_c \sim \mathcal{N}(\mu_\epsilon, \sigma_\epsilon^2)$$
-
-$\epsilon_c$ 是细胞层面的全局乘性因子，来源于多个独立乘性过程的乘积（固定效率、透化效率、液滴反应产率等）。它对所有基因共享。
-
-**观测层（捕获 + 组成型抽样）：**
-
-经过所有扰动后，细胞 $c$ 的有效采样池为：
-
-$$\Lambda_c = \epsilon_c \cdot \sum_g \epsilon_{gc} \cdot \mu_{gc}$$
-
-测序过程从 $\Lambda_c$ 中以比例 $r$ 进行捕获，引入 Poisson 采样：
-
-$$N_c \sim \mathrm{Poisson}(r \cdot \Lambda_c)$$
-
-在给定 $N_c$ 的条件下，这 $N_c$ 个 UMI 按各基因有效丰度的相对比例分配。单基因的条件边缘为：
-
-$$X_{gc} \mid N_c \sim \mathrm{Binomial}\!\left(N_c,\; \frac{\epsilon_{gc} \cdot \mu_{gc}}{\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c}}\right)$$
-
-这是一个刻意简化的工作观测模型（deliberately simplified observation model）：真实 UMI 数据中可能存在额外的 overdispersion、零膨胀、gene-specific capture bias 等效应。本文的立场是，$\epsilon_{gc}$ 的显式引入主要服务于对 $S$ 的理论分析；而在实际推断中，这些局部复杂性并不需要被逐项恢复，它们最终会体现在 effective prior $F_g$ 的形状以及后验不确定性中。完成 nuisance 消去后，Binomial 是用于构建 per-gene 推断接口的主近似，而不是对实验物理过程的完整复刻。
-
-### 1.4 三重消去
-
-观测方程中包含三个 nuisance 量：$r$、$\epsilon_c$、$\epsilon_{gc}$。它们通过不同机制被消除：
-
-**$r$ 的消去（精确）。** 捕获效率 $r$ 只出现在 $N_c$ 的生成过程中。条件于 $N_c$ 后，$r$ 完全不出现在 Binomial 的参数里。
-
-**$\epsilon_c$ 的消去（精确）。** $\epsilon_c$ 在 Binomial 比例的分子分母中相互抵消。$\epsilon_c$ 的全部影响已被编码进 $N_c$ 的大小中。
-
-**$\epsilon_{gc}$ 的消去（大数近似）。** 分母 $\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c}$ 是大量独立扰动的加权和。由大数定律：
-
-$$\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c} \approx \sum_{g'} \mu_{g'c} \approx S$$
-
-第一个近似消去了 $\epsilon_{gc}$，第二个近似是大量独立基因求和后各细胞总转录组大小趋于稳定。两步联合精度为 $O(G_{\mathrm{eff}}^{-1/2})$（§1.5）。
-
-分子中该基因自己的 $\epsilon_{gc}$ 在理论上仍然残留——我们实际观测的是带有局部乘性扰动的信号经过采样后的结果。对方法实现而言，这并不意味着要单独恢复一个 $\epsilon_{gc}$；更实际的理解是：这类未显式建模的局部扰动最终会表现为 effective noise，并体现在 $\hat{F}_g$ 的形状和后验分布 $p(\mu_{gc} \mid X_{gc}, N_c, S, F_g)$ 的宽度中。
-
-**消去后的简化方程：**
-
-$$X_{gc} \mid N_c \;\approx\; \mathrm{Binomial}\!\left(N_c,\; \frac{\mu_{gc}}{S}\right), \qquad \mu_{gc} \sim F_g$$
-
-| 因子 | 性质 | 消去机制 | 精度 |
-|---|---|---|---|
-| $r$ | 全局常数 | 条件于 $N_c$ 后不出现 | 精确 |
-| $\epsilon_c$ | 跨基因共享 | 分子分母抵消 | 精确 |
-| $\epsilon_{gc}$（分母） | 每个 $(g,c)$ 独立 | 大数定律 | $O(G_{\mathrm{eff}}^{-1/2})$ |
-| $\epsilon_{gc}$（分子） | 同上 | 不消去；残留为不可约噪声 | — |
-
-### 1.5 采样池稳定性：大数定律分析
-
-§1.4 的核心近似是 $\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c} \approx S$。本节量化精度。
-
-由于 $\epsilon_{gc}$（均值 1、独立）和 $\mu_{gc} \sim F_g$（各基因独立采样）是两层独立的波动来源，分母的 CV 为二者的平方和开根号。引入表达占比 $\phi_g = \mu_{gc} / \sum_{g'} \mu_{g'c}$ 和有效基因数 $G_{\mathrm{eff}} = 1 / \sum_g \phi_g^2$，设 $\epsilon_{gc}$ 的对数方差为 $\sigma_\epsilon^2$（简化为全局常数），$\mu_{gc}$ 围绕基因均值的对数方差为 $\sigma_g^2$，则：
-
-$$\mathrm{CV}^2\!\left(\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c}\right) \;\approx\; \frac{\langle e^{\sigma_\epsilon^2} - 1 \rangle_\phi + \langle e^{\sigma_g^2} - 1 \rangle_\phi}{G_{\mathrm{eff}}}$$
-
-在典型参数下（$\sigma_\epsilon \lesssim 0.5$，$\sigma_g \lesssim 1$，$G_{\mathrm{eff}} \geq 500$），联合 CV 不超过 $\sim 10\%$，相比 $\epsilon_c$ 的 50%–300% 变异可忽略。
-
-这一估计基于跨基因独立的假设。共享转录程序等会引入正相关，使 CV 偏乐观。即使高出数倍，相对于 $\epsilon_c$ 仍然很小。
-
-**退化条件。** 当少数基因主导总表达时（如线粒体基因 $> 30\%$），$G_{\mathrm{eff}}$ 急剧下降，近似变差。
+**集合分工约定。** $\mathcal{G}^{\mathrm{ref}}$ 的职责是稳定估计细胞级参考 exposure，因此要求集合规模大、组成均衡、无强主导模块；$\mathcal{G}^{\mathrm{fit}}$ 的职责是定义待建模目标基因的范围，二者不必重合。值得强调的是，$N_c$ 不是一个可任意重标的纯数值量——改变其构造方式既改变数值尺度，也改变其方差结构，并最终影响 $F_g$ 的拟合不确定性。
 
 ---
 
-## 2. 采样池标尺估计
+### 1.2 框架立场与建模目标
 
-### 2.1 目标
+本框架不从"绝对分子数的真实物理生成过程"出发，而直接以**相对表达比率** $p_{gc}$ 为核心建模对象。对每个目标基因 $g$，观测计数 $X_{gc}$ 被理解为：在有限 exposure 条件下，对细胞内真实表达占比 $p_{gc}$ 的带噪测量。
 
-由 §1.4 的简化方程：
+建模目标因此聚焦于以下两类随机性的分离：
 
-$$X_{gc} \mid N_c \approx \mathrm{Binomial}\!\left(N_c,\; \frac{\mu_{gc}}{S}\right), \qquad \mu_{gc} \sim F_g$$
+- **采样随机性**：从有限分子总体中抽取有限计数所产生的不可避免波动，由显式 likelihood 处理；
+- **组成异质性**：采样前已经存在的真实生物变异与不可辨识局部扰动，吸收入基因级有效先验 $F_g$。
 
-$S$ 是所有基因和细胞共享的全局常数。一旦 $S$ 被确定，各基因完全解耦。本步骤的目标：从 $\{N_c\}_{c=1}^C$ 和超参 $r$ 估计 $S$。
-
-### 2.2 模型
-
-由 §1.3 的观测层：
-
-$$N_c \sim \mathrm{Poisson}(r \cdot \Lambda_c) \approx \mathrm{Poisson}(r \cdot S \cdot \epsilon_c)$$
-
-定义 $\eta_c = rS \cdot \epsilon_c$，则：
-
-$$N_c \sim \mathrm{Poisson}(\eta_c), \qquad \log \eta_c \sim \mathcal{N}(\mu, \sigma^2)$$
-
-其中 $\mu = \log(rS) + \mu_\epsilon$，$\sigma = \sigma_\epsilon$。这是标准 **Poisson-LogNormal** 混合模型，未知量只有 $(\mu, \sigma)$ 两个标量。
-
-### 2.3 EM 算法
-
-将 $\eta_c$ 视为潜变量，通过 EM 估计 $(\mu, \sigma)$。
-
-**E 步。** 对每个细胞 $c$，计算一维后验：
-
-$$p(\eta_c \mid N_c, \mu, \sigma) \propto \mathrm{Poisson}(N_c \mid \eta_c) \cdot \mathrm{LogNormal}(\eta_c \mid \mu, \sigma^2)$$
-
-所需的矩 $\mathbb{E}[\log \eta_c \mid N_c]$ 与 $\mathbb{E}[(\log \eta_c)^2 \mid N_c]$ 通过 Gauss-Hermite 求积高效计算。
-
-**M 步。** 更新参数：
-
-$$\mu \leftarrow \frac{1}{C} \sum_c \mathbb{E}[\log \eta_c \mid N_c]$$
-
-$$\sigma^2 \leftarrow \frac{1}{C} \sum_c \mathrm{Var}[\log \eta_c \mid N_c] + \mathrm{Var}_c\!\left(\mathbb{E}[\log \eta_c \mid N_c]\right)$$
-
-迭代直至收敛。参数空间只有二维，收敛表现稳定。
-
-### 2.4 提取 $S$
-
-EM 收敛后得到 $(\hat{\mu}, \hat{\sigma})$。当前代码默认取：
-
-$$\widehat{rS} = \exp(\hat{\mu}), \qquad \hat{S} = \frac{\widehat{rS}}{r}$$
-
-选择 $\exp(\hat{\mu})$（LogNormal 中位数）对应 $\mathrm{median}(\epsilon_c) = 1$ 的约定。其他选择（均值、众数）的差异在 $\sim 20\%$ 以内，被 $r$ 的调节吸收。当前 `prism.model.fit_pool_scale` 还提供一个**可选消融**：先聚合群体 posterior，再用 softargmax 产生代表性 `point_mu`；但默认实现仍使用 $\hat{\mu}$ 本身，因此 $\hat{S}$ 默认就是标量 $\exp(\hat{\mu})/r$。
-
-### 2.4.1 可识别性与标度约定
-
-需要强调：从 $\mu = \log(rS) + \mu_\epsilon$ 出发，数据直接识别的是 $rS$ 与 $\epsilon_c$ 标度约定的组合，而不是某个脱离约定的“真实物理 $S$”。因此，$S$ 只能在一个 gauge fixing 约定下被定义。
-
-本文采用的约定是：
-
-$$\mathrm{median}(\epsilon_c) = 1 \quad \Longleftrightarrow \quad \mu_\epsilon = 0$$
-
-在此约定下，$\exp(\hat{\mu})$ 被解释为 $\widehat{rS}$，再由 $r$ 提取 $\hat{S}$。若改用 $\mathbb{E}[\epsilon_c] = 1$ 或其他等价标度约定，得到的 $S$ 数值会整体缩放，但这种缩放会被 $r$ 吸收，最终的 per-gene Binomial 方程和后验接口语义不变。因此，本文中的 $S$ 应理解为规范化后的 effective pool scale，而不是由数据唯一识别出的原始物理量。
-
-### 2.5 解耦后的 per-gene 方程
-
-$$X_{gc} \mid N_c \sim \mathrm{Binomial}\!\left(N_c,\; \frac{\mu_{gc}}{\hat{S}}\right), \qquad \mu_{gc} \sim F_g$$
-
-- $N_c$：已知观测值（每个细胞不同）
-- $\hat{S}$：全局常数（所有基因所有细胞共享）
-- $\mu_{gc}$, $F_g$：待估量
-
-**所有基因完全解耦。** $r$ 通过 $\hat{S} = \widehat{rS}/r$ 控制分母大小，决定了先验和似然在后验中的相对权重。
-
-**网格范围。** $N_{gc}^{\mathrm{eff}} = (X_{gc}/N_c) \cdot \hat{S}$，$S_{\mathrm{eff}} = \max_c N_{gc}^{\mathrm{eff}}$。由于 $X_{gc} \leq N_c$，有 $N_{gc}^{\mathrm{eff}} \leq \hat{S}$，不存在网格越界问题。
-
-### 2.6 适用条件与失效模式
-
-分母稳定近似
-
-$$\sum_{g'} \epsilon_{g'c} \cdot \mu_{g'c} \approx S$$
-
-是整个解耦链条的核心适用条件。它依赖于足够大的有效基因数 $G_{\mathrm{eff}}$、有限的跨基因相关性，以及不存在少数基因长期主导总表达。以下情形会显著削弱该近似：
-
-- 高线粒体占比或核糖体基因占比，使少数基因主导总表达
-- 强细胞周期、stress response、interferon response 等共享程序，使跨基因正相关升高
-- 极端细胞类型混合或稀有亚群占比很高，使“稳定总池”假设变差
-- 少数超高表达 marker 或 burst-like 基因长期占据大部分分子预算
-- 跨物种、跨平台或强 batch 场景中，$\epsilon_c$ 与组成型偏差可能不再被单个全局标尺充分吸收
-
-这些场景下，$S$ 更应被解释为近似有效标尺，Signal / Confidence / Surprisal 可能出现系统偏差。实践上应结合 QC 指标（如 mt%）、$N_c$ 分布、以及模拟或留出验证来判断该近似是否可接受。
+scPRISM 不试图还原实验物理链条的每一个中间步骤，而是在一个可操作的统计框架内将上述两类随机性系统地分离。
 
 ---
 
-## 3. 基因先验估计
+### 1.3 从有限总体抽样到工作模型
 
-### 3.1 目标与范围
+**严格模型。** 设细胞 $c$ 中存在一个有效分子总体 $T_c$，其中基因 $g$ 的分子数为 $M_{gc} = p_{gc} T_c$。若从该总体中无放回地抽取 $n_c$ 个分子，则在有限总体抽样框架下，单基因计数服从超几何分布：
 
-对每个基因 $g$，从观测 $\{(X_{gc}, N_c)\}_{c=1}^C$ 和全局常数 $\hat{S}$ 估计群体级分布 $F_g$。这里的 $F_g$ 应理解为潜在表达量的有效群体先验，而不是可与所有实验扰动完全分离的“纯生物真值分布”。
+$$X_{gc} \mid T_c,\, M_{gc},\, n_c \;\sim\; \mathrm{Hypergeometric}(T_c,\, M_{gc},\, n_c)$$
 
-本框架是**逐基因的边际信号模型**，不建模跨基因依赖。其目的是为下游模型提供信号接口层。
+其条件一阶、二阶矩为：
 
-### 3.2 非参数离散表示
+$$\mathbb{E}[X_{gc} \mid T_c, M_{gc}, n_c] = n_c p_{gc}$$
 
-$F_g$ 表示在 $M$ 个等距网格点上（当前代码默认 $M = 512$）：
+$$\mathrm{Var}(X_{gc} \mid T_c, M_{gc}, n_c) = n_c p_{gc}(1-p_{gc}) \cdot \underbrace{\frac{T_c - n_c}{T_c - 1}}_{\text{有限总体修正}}$$
 
-$$0 \leq v_1 < v_2 < \cdots < v_M \leq S_{\mathrm{eff}}$$
+**Binomial 近似的适用条件。** 当以下条件同时成立时，超几何分布可由 Binomial 稳定近似：（i）总体规模 $T_c$ 足够大；（ii）采样比例 $n_c/T_c$ 较小，使有限总体修正因子接近 1；（iii）单基因占比 $p_{gc}$ 通常较小；（iv）关注单基因边缘分布而非多基因联合分配。此时一阶矩严格一致，二阶矩之差由有限总体修正控制，从而有：
 
-其中 $S_{\mathrm{eff}} = \max_c (X_{gc}/N_c) \cdot \hat{S}$。由于 $X_{gc} \leq N_c$，有 $S_{\mathrm{eff}} \leq \hat{S}$，Binomial 参数 $v_j/\hat{S} \leq 1$ 自动满足，不存在网格越界问题。
+$$\mathrm{Hypergeometric}(T_c,\, M_{gc},\, n_c) \;\approx\; \mathrm{Binomial}(n_c,\, p_{gc})$$
 
-**参数化。** $M$ 个无约束 logit $\{l_j\}_{j=1}^M$ 经过两步映射得到 $F_g$：
+**工作模型。** 由于实际抽样次数 $n_c$ 不可直接观测，以有效参考计数 $N_c^{\mathrm{eff}}$ 作为其统计代理，得到 scPRISM 的单基因工作公式：
 
-**Stage A：Softmax 归一化。**
+$$\boxed{X_{gc} \mid N_c^{\mathrm{eff}},\, p_{gc} \;\approx\; \mathrm{Binomial}(N_c^{\mathrm{eff}},\, p_{gc}), \qquad p_{gc} \sim F_g}$$
 
-$$w_j = \frac{\exp(l_j)}{\sum_k \exp(l_k)}$$
+其中
 
-**Stage B：高斯卷积平滑。**
+$$N_c^{\mathrm{eff}} = \frac{N_c}{\bar N} S, \qquad \bar N = \frac{1}{C}\sum_{c=1}^C N_c, \qquad \mu_{gc} = Sp_{gc}$$
 
-$$\tilde{w}_j = \sum_{k=1}^{M} w_k \; G_\sigma(v_j - v_k), \qquad G_\sigma(x) = \exp\!\left(-\frac{x^2}{2\sigma^2}\right)$$
-
-边缘处理使用 replicate padding（边缘外的值等于边缘值），这是图像处理中的标准做法。由于高斯卷积保持均值不变，且边缘位置的概率质量通常接近零，卷积后无需重归一化。若确实需要严格归一化，可使用环状卷积（circular padding）代替重归一化，因为重归一化会引入梯度不稳定。
-
-$\tilde{w}$ 就是 $\hat{F}_g$——不存在任何"逆变换"步骤，卷积后的分布就是最终的先验估计。
-
-**超参 $\sigma$。** 以网格间距 $\Delta v$ 为单位，$\sigma_{\mathrm{bins}}$ 是高斯核的标准差。当前代码默认值是 $\sigma_{\mathrm{bins}} = 1$。这对应较弱的构造性平滑：锯齿会被抑制，但窄峰不会被非常激进地抹平。更大的平滑核（例如 $\sigma_{\mathrm{bins}} = 5$）仍然是合理的**可选消融**，对应更强的低通约束；但它不再是当前实现的默认设置。
-
-**为什么用卷积而不是惩罚项？** 二阶差分惩罚 $\sum_j(w_{j-1} - 2w_j + w_{j+1})^2$ 是软约束，优化器可以牺牲平滑性换取似然。卷积是构造性保证——无论 logit 如何变化，$\tilde{w}$ 都不会出现锯齿。代价是偏差-方差权衡：$\sigma$ 过大会抹掉真实窄峰。
-
-### 3.3 似然计算与分块训练
-
-对每个细胞 $c$ 和每个网格点 $v_j$，Binomial 似然为：
-
-$$\mathrm{lik}_{cj} = \mathrm{Binomial}(X_{gc} \mid N_c, \; v_j / \hat{S})$$
-
-在理论上，由于 $\hat{S}$ 是全局常数，$X_{gc}$ 和 $N_c$ 在训练过程中不变，整个似然矩阵 $\mathrm{lik} \in \mathbb{R}^{C \times M}$ 可以在训练开始前一次性计算并缓存。
-
-但当前 `PriorEngine` 的最终实现默认采用**按细胞分块（cell chunking）即时计算**：每次迭代只对一个 cell slice 计算对应的 `log_lik`，以降低大数据集上的峰值内存占用，并支持多基因批量训练。也就是说，预计算缓存更适合作为参考实现或可选工程变体，而不是当前主代码路径的默认策略。
-
-实际存储的是对数似然 $\log \mathrm{lik}_{cj}$，所有后续计算在 log 空间中进行以保证数值稳定。
-
-每个细胞的似然向量形状类似一个钟形：在 $v_j \approx (X_{gc}/N_c) \cdot \hat{S}$ 附近最高，往两边衰减。$N_c$ 大的细胞钟形窄（信息多），$N_c$ 小的细胞钟形宽（信息少）。但所有细胞的钟形都定义在同一个网格上、指向同一个信号空间——这就是为什么群体级先验 $F_g$ 能起到去噪作用。
-
-### 3.4 损失函数
-
-总损失由两项组成：
-
-$$\mathcal{L} = \lambda_{\mathrm{nll}} \cdot \mathcal{L}_{\mathrm{NLL}} + \lambda_{\mathrm{align}} \cdot \mathcal{L}_{\mathrm{align}}$$
-
-无密度加权，无空间变换。$\tilde{w}$ 就是拟合目标，也是最终输出。
-
-#### 项一：负对数似然（NLL）
-
-对每个细胞 $c$，边际似然为先验和似然的加权求和：
-
-$$d_c = \sum_{j=1}^{M} \tilde{w}_j \cdot \mathrm{lik}_{cj}$$
-
-NLL 为所有细胞的均值：
-
-$$\mathcal{L}_{\mathrm{NLL}} = -\frac{1}{C} \sum_{c=1}^{C} \log d_c$$
-
-这是标准的经验贝叶斯 MLE 目标。每个观测 $(X_{gc}, N_c)$ 对 NLL 等权贡献。在模型设定充分接近真实数据、且样本量足够大时，MLE 提供一致的恢复基础；但在有限样本、模型失配或强噪声条件下，稀有结构是否能被恢复仍取决于信噪比、网格分辨率和正则化强度，不能仅由渐近性质保证。
-
-#### 项二：后验-先验对齐（JSD 正则化）
-
-**动机。** NLL 在高噪声或稀疏数据下可能对 $F_g$ 约束不足。JSD 对齐提供额外的自洽性正则：如果 $\tilde{w}$ 是合理的先验，那用它做后验推断再汇总，得到的群体决策分布不应与 $\tilde{w}$ 相差过大。这个机制有潜力保护受到少量细胞支持的稀有状态，但它不是无条件成立的 theorem；在低覆盖或多峰场景下，若初始化或当前迭代中出现窄小伪峰，JSD 也可能通过正反馈强化这些结构。因此它应被视为可调正则化项，并通过 $\sigma_{\mathrm{bins}}$、$\lambda_{\mathrm{align}}$ 与消融实验共同校准。
-
-**构造四步：**
-
-**第一步：后验计算。** 对每个细胞 $c$，用当前 $\tilde{w}$ 作为先验，通过 Bayes 公式计算后验：
-
-$$p(v_j \mid X_{gc}) = \frac{\tilde{w}_j \cdot \mathrm{lik}_{cj}}{\sum_k \tilde{w}_k \cdot \mathrm{lik}_{ck}}$$
-
-实现上在 log 空间完成：$\log p_j = \log \tilde{w}_j + \log \mathrm{lik}_{cj} - \mathrm{logsumexp}$。在当前主实现里，这一步通常和 cell chunking 结合：对每个 chunk 做广播加法和归一化，再把结果沿细胞维聚合。
-
-$F_g$ 在这里的作用是**调制似然**。一个测到 $X_{gc} = 0$ 的细胞，如果先验在 $\mu = 50$ 处有峰，后验不会完全塌到 $\mu = 0$，而是在 $\mu = 0$ 和 $\mu = 50$ 之间形成折衷——先验利用群体信息把噪声观测拉向更合理的位置。
-
-**第二步：默认汇总方式。** 当前代码默认不先做每细胞硬决策，而是直接将完整后验在细胞维求平均，得到后验对齐分布：
-
-$$\hat{Q}_g(v_j) = \frac{1}{C} \sum_{c=1}^{C} p(v_j \mid X_{gc})$$
-
-这对应 `posterior average`。它直接聚合完整后验分布，避免了硬决策的信息丢失；代价是会显式保留单细胞后验宽度，因此通常比 MAP-histogram 更平滑，也更容易把稀疏或窄峰摊宽。
-
-**第三步：可选点决策 / MAP histogram 消融。** 文档早期版本中的默认做法，是先对每个细胞取后验 MAP：
-
-$$\hat{\mu}_{gc} = v_{j^*}, \qquad j^* = \arg\max_j \; p(v_j \mid X_{gc})$$
-
-若采用这一路径，默认使用 $T = 0$（MAP，最硬的决策）。所有决策值精确落在网格点上。
-
-然后再汇总为后验对齐分布 $\hat{Q}_g$：
-
-MAP-histogram 消融是将所有细胞的 MAP 决策汇总成网格上的直方图。由于 $T = 0$ 时决策值就是网格点，直接统计频率即可：
-
-$$\hat{Q}_g(v_j) = \frac{1}{C} \sum_{c=1}^{C} \mathbf{1}[\hat{\mu}_{gc} = v_j]$$
-
-MAP histogram 不再是当前主实现的默认设置，而应视为**可选消融**。它的优点是语义更接近“群体中各离散状态的占比”，通常更利于保留稀疏峰；代价是更硬、更依赖局部决策稳定性，也更容易受早期伪峰影响。
-
-若使用 soft-argmax（$T > 0$），决策值可能不在网格点上，此时用线性插值法：对每个 $\hat{\mu}_{gc}$ 落在 $v_j \leq \hat{\mu}_{gc} < v_{j+1}$ 之间的，按距离比例将质量分配到左右两个网格点：
-
-$$\hat{Q}_g[j] \mathrel{+}= \frac{v_{j+1} - \hat{\mu}_{gc}}{\Delta v}, \qquad \hat{Q}_g[j+1] \mathrel{+}= \frac{\hat{\mu}_{gc} - v_j}{\Delta v}$$
-
-最后归一化。线性插值比直接 round 到最近网格点精度高一倍。
-
-**第四步：Jensen-Shannon 散度。**
-
-$$\mathcal{L}_{\mathrm{align}} = \mathrm{JSD}(\hat{Q}_g \| \tilde{w}) = \frac{1}{2}\mathrm{KL}(\hat{Q}_g \| \bar{M}) + \frac{1}{2}\mathrm{KL}(\tilde{w} \| \bar{M}), \qquad \bar{M} = \frac{1}{2}(\hat{Q}_g + \tilde{w})$$
-
-$\hat{Q}_g$ 在每步迭代开始时重新计算（用当前 $\tilde{w}$ 做后验），不参与梯度。梯度只通过 $\tilde{w}$ 回传到 logit。这形成了类似 EM 的交替结构：固定 $\hat{Q}_g$（E-step），优化 $\tilde{w}$（M-step）。当前主实现里，`posterior average` 与这一交替结构配合构成默认训练路径；MAP histogram 与 soft-decision 都应视为对齐项构造的可选消融。
-
-**JSD 对稀有信号的作用。** 稀有态在数据中只有少量细胞支持。NLL 中它们的梯度贡献通常较小，而 JSD 可能提供额外的群体级稳定作用：当某个稀有峰确实得到局部观测支持时，后验对齐分布会在该区域汇聚，从而减弱优化过程中该峰被完全抹平的趋势。需要同时强调的是，这种机制并不自动区分“真实稀有峰”和“初始化或噪声诱发的小峰”；在低覆盖和多峰先验下，JSD 也可能放大伪结构。因此，关于“保护稀有信号”的说法应理解为经验假设，需通过 ablation 和 simulation 验证，而不是先验保证。
-
-### 3.5 总损失与输出
-
-$$\mathcal{L} = \lambda_{\mathrm{nll}} \cdot \mathcal{L}_{\mathrm{NLL}} + \lambda_{\mathrm{align}} \cdot \mathcal{L}_{\mathrm{align}}$$
-
-$\tilde{w}$ 就是最终的 $\hat{F}_g$。不存在逆变换。
-
-其中，$\mathcal{L}_{\mathrm{NLL}}$ 是主数据项，$\mathcal{L}_{\mathrm{align}}$ 是可选的自洽性正则。实践上建议将 NLL-only 作为基线，并用消融实验评估 JSD 项对稀有峰恢复、过平滑和伪峰强化的影响。
-
-### 3.6 优化
-
-- **优化器：** AdamW + 余弦学习率调度
-- **批模式：** 默认按基因批量训练，并在细胞维使用 chunked full-batch；每次优化遍历全部细胞，但计算按 `cell_chunk_size` 分块完成
-- **初始化：** 对未拟合基因，先用均匀先验做一轮 posterior-average 聚合，得到 `posterior-generated distribution`，再将其反解析为 logits 作为 warm start；`init_temperature` 默认为 1.0
-- **似然计算：** 默认按 chunk 即时计算 `log_lik`，不预缓存完整矩阵
-
-| 超参 | 符号 | 作用 | 默认值 |
-|---|---|---|---|
-| 网格大小 | $M$ | $F_g$ 分辨率 | 512 |
-| 卷积标准差 | $\sigma_{\mathrm{bins}}$ | 构造性平滑强度（网格间距单位） | 1.0 |
-| 对齐分布 | — | JSD 中 $\hat{Q}_g$ 的默认构造 | posterior average |
-| 决策温度 | $T$ | MAP / soft-decision 消融中的后验点决策锐度 | 默认主实现未使用 |
-| NLL 权重 | $\lambda_{\mathrm{nll}}$ | 数据保真项权重 | 1.0 |
-| 对齐权重 | $\lambda_{\mathrm{align}}$ | JSD 自洽性权重 | 1.0 |
-| 学习率 | `lr` | AdamW 初始学习率 | 0.05 |
-| 迭代次数 | `n_iter` | 优化预算 | 100 |
-| 学习率下界比例 | `lr_min_ratio` | 余弦调度终点 / 初始 lr | 0.1 |
-| 初始化温度 | `init_temperature` | 冷启动 posterior 聚合温度 | 1.0 |
-| 细胞分块大小 | `cell_chunk_size` | 每次 likelihood 计算的 cell chunk 大小 | 512 |
-| 捕获效率 | $r$ | 通过 $\hat{S} = \widehat{rS}/r$ 控制 Binomial 似然宽度 | 0.02–0.1 |
+该公式是后续所有先验拟合、后验推断与信号提取的起点。需要强调：$N_c^{\mathrm{eff}}$ 并非"真实抽样次数"的还原，而是一个匹配一阶矩并近似刻画观测精度的有效量；当 $\frac{N_c}{\bar N}S$ 不是整数时，应将其理解为连续意义下的 effective sample size。上式应理解为**比例观测模型**（proportion observation model），而非对实验物理过程的逐步复刻。
 
 ---
 
-## 4. 概率信号接口
+### 1.4 参考总计数 $N_c$ 的统计语义
 
-### 4.1 后验推断
+参考总计数定义为：
 
-给定估计先验 $\hat{F}_g$（即 §3 输出的 $\tilde{w}$）和全局常数 $\hat{S}$，对每个细胞-基因对 $(g, c)$ 计算离散网格上的完整后验分布：
+$$N_c = \sum_{h \in \mathcal{G}^{\mathrm{ref}}} X_{hc}$$
 
-$$p(v_j \mid X_{gc}, N_c, \hat{S}, \hat{F}_g) = \frac{\tilde{w}_j \cdot \mathrm{Binomial}(X_{gc} \mid N_c, v_j/\hat{S})}{\sum_k \tilde{w}_k \cdot \mathrm{Binomial}(X_{gc} \mid N_c, v_k/\hat{S})}$$
+**$N_c$ 是带噪 exposure 代理，而非精确真值。** 从现象学角度，可将其近似写作：
 
-由于当前实现通常采用 cell chunking，此步在算法上仍是同一个 Bayes 更新，但工程上会按 cell slice 分块执行后验计算与聚合。
+$$N_c \approx T_c \cdot \epsilon_c \cdot \frac{G^{\mathrm{ref}}}{G_t}$$
 
-从后验中提取三个核心指标和一个可选指标：
+其中 $G_t$ 为更大背景窗口中的有效基因规模。这一关系式不是严格恒等式，而是强调：$N_c$ 的数值与参考集合的选择直接耦合，其方差结构同时受 $G^{\mathrm{ref}}$ 的规模与内部组成影响。当 $\mathcal{G}^{\mathrm{ref}}$ 足够大且无强主导模块时，聚合过程通过大数平均效应压低内部随机波动，使 $N_c$ 主要反映细胞级整体 exposure 的变化，而非少数基因局部起伏的直接投影。相反，若参考集合中存在整体性强干扰模块，则 $N_c$ 会偏离“共享 exposure 代理”的语义，转而混入显著的组成型偏差。
 
-- **观测 → 信号映射：** 观测能否被稳定地映射到一个信号值（Signal, Confidence）
-- **信号 → 群体语义：** 该信号在基因表达分布中的位置与结构（Surprisal, Sharpness）
+**$N_c$ 可用于拟合 $\mathcal{G}^{\mathrm{fit}}$ 中任意基因。** 由于 $N_c$ 的语义是**细胞级共享参考窗口**，而非"由目标基因自身定义的窗口"，因此它可以为任何 $g \in \mathcal{G}^{\mathrm{fit}}$ 提供 exposure 基准，无论该基因是否属于 $\mathcal{G}^{\mathrm{ref}}$。将潜在干扰组分（如高占比线粒体基因）排除出 $\mathcal{G}^{\mathrm{ref}}$ 以提升 $N_c$ 的稳定性，与在同一 $N_c$ 上拟合这些基因的相对表达比率 $p_{gc}$，这两件事并不矛盾。
 
-### 4.2 Signal
+**$N_c$ 不可任意重标。** 在本框架中，真正进入 likelihood 的并不是原始 $N_c$，而是归一化后的有效参考计数
 
-$$s_{gc} = v_{j^*}, \qquad j^* = \arg\max_j \; p(v_j \mid X_{gc})$$
+$$N_c^{\mathrm{eff}} = \frac{N_c}{\bar N} S$$
 
-后验 MAP 估计——后验概率最高的那个网格点。这是去噪后的表达量，交付给下游模型的主信号。
+因此，$N_c$ 只负责提供细胞间的相对 exposure 缩放，而全局观测精度由固定标尺 $S$ 统一控制。表面上，将 $N_c^{\mathrm{eff}}$ 乘以常数 $\lambda$、同时将 $p_{gc}$ 除以 $\lambda$，可以保持期望 $\mathbb{E}[X_{gc} \mid N_c^{\mathrm{eff}}, p_{gc}] = N_c^{\mathrm{eff}} p_{gc}$ 不变。但 Binomial likelihood 不仅依赖期望，还依赖观测精度，因为
 
-Signal 回答：**在当前先验和观测下，这个细胞-基因对最合理的潜在表达量是什么？**
+$$\mathrm{Var}(X_{gc} \mid N_c^{\mathrm{eff}}, p_{gc}) = N_c^{\mathrm{eff}} p_{gc}(1-p_{gc})$$
 
-Signal 的去噪机制来自先验 $\tilde{w}$ 对似然的调制。$N_c$ 大的细胞似然窄，后验接近似然峰值（Signal ≈ $N_{\mathrm{eff}}$）；$N_c$ 小的细胞似然宽，后验被先验主导，Signal 被拉向群体中的高概率状态。这就是经验贝叶斯收缩——信息弱的观测借用群体信息去噪。
+且在小 $p_{gc}$ 区域，对 $p_{gc}$ 的 Fisher information 近似正比于 $N_c^{\mathrm{eff}}$。因此，决定拟合质量的不是原始 $N_c$ 的绝对量级，而是归一化后 exposure 代理的**有效信噪比**。使用 $\frac{N_c}{\bar N}S$ 的好处在于：不同细胞之间保留相对窗口差异，而不同数据集之间只要采用相同的 $S$，则整体缩放语义保持一致，不会因为某个数据集的平均 $N_c$ 偏大或偏小而系统性改变后验精度。
 
-*约定：* 当前 `Posterior` / `SignalExtractor` 主接口默认并直接输出 MAP Signal。soft-argmax（$T > 0$）可作为参考实现或消融版本，但不是当前包默认暴露的信号定义。
+---
 
-### 4.3 Confidence
+### 1.5 噪声来源的分类与处理策略
 
-$$\mathrm{Conf}_{gc} = 1 - \frac{H\!\left[p(v_j \mid X_{gc})\right]}{\log M}$$
+在 scPRISM 的建模视角下，观测 UMI 计数的随机性可概念性地归结为四类来源，各自采取不同的处理方式。
 
-其中 $H[\cdot]$ 是后验分布的 Shannon 熵，$\log M$ 是最大可能熵（均匀分布）。$\mathrm{Conf} \in [0, 1]$：
+**第一类：采样随机性（显式建模）。** 这是从有限 exposure 中得到离散计数时不可避免的波动，对应工作公式中的 Binomial likelihood。框架显式处理并"消化"的核心正是这一部分：给定 $N_c^{\mathrm{eff}}$ 和 $p_{gc}$，观测值 $X_{gc}$ 的随机性被归因于采样过程，并通过后验推断加以分离。该层噪声决定了在固定 $p_{gc}$ 下单细胞观测会有多分散，也是本框架唯一被显式参数化的随机层。
 
-- $\mathrm{Conf} = 1$：后验是 delta 函数，观测完全确定了信号
-- $\mathrm{Conf} = 0$：后验是均匀分布，观测没有提供超出先验的任何信息
+**第二类：细胞级整体扰动 $\epsilon_c$（由 $N_c$ 吸收）。** $\epsilon_c$ 代表某一细胞整体窗口的系统性缩放，例如总捕获水平或整体反应效率的差异。它不作为独立潜变量被推断，而是通过 $N_c$ 的细胞间差异进入 likelihood 精度，从而隐式地被处理。也就是说，$\epsilon_c$ 的主要作用不是改变某个特定基因的相对位置，而是改变该细胞整体观测的有效分辨率。
 
-Confidence 回答：**观测 $(X_{gc}, N_c)$ 在当前先验下，为确定 $\mu_{gc}$ 提供了多少信息？**
+**第三类：基因-细胞局部扰动 $\epsilon_{gc}$（吸收入有效先验 $F_g$）。** 这类扰动包括局部捕获偏差、微环境差异、转录 burst 等无法逐项辨识的 gene-cell 特异性效应。参考集合聚合只能使 $N_c$ 成为较稳定的 exposure 代理，不能消除目标基因自身的局部组成波动。这些采样前已经存在、且来源无法进一步区分的波动，最终表现为 $p_{gc}$ 分布的有效变异性，并直接耦合进 $F_g$ 的形状与宽度。换言之，$F_g$ 是"包含不可辨识局部扰动后的有效先验"，而非"去除一切技术项后的纯净生物分布"。因此，scPRISM 所恢复的是适用于后验推断的 effective ratio prior，而不是严格意义上的机制分解结果。
 
-Confidence 主要受 $N_c$ 控制：深测序细胞的 Binomial 似然窄，后验集中，Confidence 高；浅测序细胞似然宽，后验分散，Confidence 低。先验形状也有影响——多峰先验可能产生多峰后验，即使在中等深度下也会降低 Confidence。
+**第四类：测序残余误差（默认忽略）。** 碱基识别错误、比对错误、UMI 冲突与纠错残差等采样后的技术误差，对于现代高质量 UMI 流程而言，经过 UMI 聚合、比对过滤与条形码纠错后，其对基因级计数的净影响通常远低于前三类效应，在当前主模型中视为高阶小量忽略不计。经验上，这类 read-level 或 base-level 错误常已被压低到约 $10^{-2}$ 或更低量级，而其传递到 gene-level UMI count 的净扰动通常更小。若特定平台、低质量样本或异常流程中此类误差不可忽略，可将其作为附加观测噪声层引入扩展模型。
 
-$\log M$ 归一化使 Confidence 在不同网格范围 $S_{\mathrm{eff}}$ 的基因之间可比。
+---
 
-### 4.4 Surprisal
+### 1.6 固定标尺 $S$ 与归一化 exposure
 
-$$\mathrm{Surprisal}_{gc} = -\log \tilde{w}_{j^*}$$
+在新的表述中，不再单独引入观测精度超参 $r$。相反，我们将全局尺度与观测精度统一吸收到固定标尺 $S$ 中，并定义
 
-其中 $j^*$ 是 Signal 对应的网格点（MAP 位置）。这是信号值在先验 $\hat{F}_g$ 下的负对数概率——先验在该位置分配的概率越低，Surprisal 越高。
+$$N_c^{\mathrm{eff}} = \frac{N_c}{\bar N} S, \qquad \bar N = \frac{1}{C}\sum_{c=1}^C N_c$$
 
-Surprisal 回答：**这个信号状态在该基因的群体分布中有多罕见？**
+于是，$N_c/\bar N$ 仅编码细胞间的相对 exposure 差异，而 $S$ 统一给出全局的参考尺度。这样做有三个直接好处：
 
-Surprisal 和 Confidence 正交：
+- 保留了不同细胞之间由 $N_c$ 反映的相对观测深度差异；
+- 避免了不同数据集因平均 $N_c$ 不同而导致整体 likelihood 宽度系统性漂移；
+- 使跨数据集比较时，只要使用相同的 $S$，就能够保持一致的 $\mu$ 轴与观测精度语义。
 
-| | 高 Confidence | 低 Confidence |
-|---|---|---|
-| **高 Surprisal** | 可信的稀有状态（如激活亚群 marker） | 观测模糊，稀有性不确定 |
-| **低 Surprisal** | 常见状态，判定清晰 | 常见区域，但观测信息不足 |
+因此，$S$ 在本框架中兼具两重角色：一方面，它定义缩放坐标 $\mu = Sp$；另一方面，它也控制整体 likelihood 的集中程度。$S$ 越大，$N_c^{\mathrm{eff}}$ 整体越大，观测约束越强；$S$ 越小，后验越依赖群体先验 $F_g$。
 
-高 Confidence + 高 Surprisal 的组合是下游稀有态发现和异常检测中最有价值的信号。
+从实践上看，$S$ 不是需要从数据中识别的物理量，而是一个统一的全局参考标尺。对于单一数据集，一个自然的默认选择是令
 
-**可选归一化。** 为跨基因可比，可归一化到 $[0, 1]$：
+$$S = \bar N$$
 
-$$\mathrm{Surprisal}_{gc}^{\mathrm{norm}} = \frac{-\log \tilde{w}_{j^*}}{\max_j(-\log \tilde{w}_j)}$$
+此时有 $N_c^{\mathrm{eff}} = N_c$。而当需要在多个数据集、多个平台或多个参考集合定义之间保持一致尺度时，可显式固定同一个 $S$，从而获得可比的 $\mu$ 轴与 likelihood 精度解释。
 
-### 4.5 Sharpness（可选）
+---
 
-$$\mathrm{Sharpness}_{gc} = -\bigl(\log(\tilde{w}_{j^*-1}+\varepsilon) - 2\log(\tilde{w}_{j^*}+\varepsilon) + \log(\tilde{w}_{j^*+1}+\varepsilon)\bigr)$$
+### 1.7 平台差异与 $\mu$ 轴缩放
 
-离散二阶差分近似对数密度的局部曲率 $-d^2/ds^2 \log f_g(s)$。高斯卷积保证 $\tilde{w}$ 光滑，$\varepsilon$ 用于避免尾部极小概率导致的数值不稳定。边缘网格点（$j^* = 1$ 或 $j^* = M$）取邻近内部值。
+跨测序平台、跨建库流程或跨引物设计比较时，需要额外注意：即便在相同生物体系下，观测到的 $\mu$ 轴也可能发生系统性缩放。造成这一现象的主要来源并非细胞内真实比例结构本身改变，而是平台相关的技术映射差异，例如引物体系、逆转录效率、扩增偏好、read 结构、比对策略与 UMI 处理流程等。这些因素会改变“相同真实比例”在观测坐标上的投影尺度。
 
-Sharpness 回答：**这个信号位于一个尖锐的窄峰上，还是一个宽泛的平坦区域？**
+可将这种现象学差异写为
 
-Sharpness 与 Surprisal 的区分：
+$$\mu_{gc}^{(k)} = a_g^{(k)} \cdot \mu_{gc}^{\star}$$
 
-- 常见状态可以位于尖锐峰上（管家基因的紧密调控——低 Surprisal，高 Sharpness）
-- 稀有状态可以位于宽泛尾部（高 Surprisal，低 Sharpness）
+其中 $k$ 表示平台或实验流程，$\mu_{gc}^{\star}$ 表示某个共同潜在坐标下的表达量，$a_g^{(k)} > 0$ 表示平台 $k$ 对基因 $g$ 的有效缩放系数。若平台差异是纯全局缩放，则有 $a_g^{(k)} \equiv a^{(k)}$；而在更现实的情形下，$a_g^{(k)}$ 往往是**gene-specific** 的，即不同基因会有不同程度的偏移。
 
-Sharpness 标记为可选，因为对多数单峰基因它与 Surprisal 高度相关。主要价值在多峰基因中，用于区分离散激活态（窄峰）和连续分化梯度（宽分布）。
+这意味着：跨平台时，$\mu$ 轴不应被直接解释为绝对可比的物理尺度。某些平台会整体压缩或拉伸表达轴，而另一些差异则体现在特定基因的额外偏移上。因此，若不做额外校正，不同平台下的 $\mu$ 数值本身通常只具有平台内语义，而不必然具有平台间的一一对应关系。
 
-### 4.6 下游使用
+然而，实验上经常可以观察到：即使 $\mu$ 轴发生缩放，部分基因所对应的 $F_g$ 形状仍然在不同平台之间表现出高度一致，尤其是在单峰/双峰结构、尾部厚度以及主要模态位置的相对关系上。这说明平台差异的主效应往往首先表现为坐标缩放或轻度基因特异性扭曲，而不是彻底改写该基因的群体分布结构。换言之，平台差异更像是对观测坐标的重参数化，而不是对生物分布形状的完全重写。
 
-| 指标 | 状态 | 范围 | 用途 |
-|---|---|---|---|
-| **Signal** | 核心 | $[0, S_{\mathrm{eff}}]$ | 下游模型主输入（去噪表达矩阵） |
-| **Confidence** | 核心 | $[0, 1]$ | 样本筛选、损失加权、不确定性感知训练 |
-| **Surprisal** | 核心 | $[0, +\infty)$ 或 $[0, 1]$ | 异常检测、稀有亚群发现 |
-| **Sharpness** | 可选 | $[0, +\infty)$ | 离散态 vs 连续态区分 |
+因此，在 scPRISM 中，跨平台比较应区分两个层面：
 
-**典型使用模式：**
+- **轴尺度差异：** 主要表现为 $\mu$ 轴的整体缩放或 gene-specific 偏移，需要通过额外归一化、锚定基因或校准模型处理；
+- **形状稳定性：** 若某些基因的 $F_g$ 形状在不同平台间仍保持一致，则这些基因可视为较稳健的结构锚点，说明框架所恢复的 effective prior 具有一定平台不变性。
 
-- **去噪：** 直接用 Signal 矩阵替代 raw UMI 矩阵
-- **不确定性感知自监督学习：** 用 Confidence 加权训练损失，高置信样本贡献更大
-- **稀有态发现：** 按 Surprisal 排序（或 Surprisal × Confidence 做联合筛选），阈值化识别候选
-- **离散 vs 连续状态标注：** 用 Sharpness 区分尖峰离散态和宽泛连续态，辅助 GRN 推断中的因果锚点选择
+这也进一步说明：$F_g$ 的可迁移性并不要求 $\mu$ 轴数值逐点一致。更现实、也更重要的目标，是在允许平台相关缩放与偏移存在的前提下，识别哪些基因保留了稳定的分布形状，以及哪些基因受平台效应影响更强。前者支持跨平台结构比较，后者则提示需要额外的 gene-specific 校正。
+
+---
+
+## 2. 基因先验估计
+
+### 2.1 目标与范围
+
+对每个基因 $g$，从观测 $\{(X_{gc}, N_c)\}_{c=1}^C$、有效参考计数 $N_c^{\mathrm{eff}} = \frac{N_c}{\bar N}S$ 以及固定缩放标尺 $S$ 估计群体级有效先验 $F_g$。这里的 $F_g$ 定义在相对表达比率 $p_{gc} \in [0,1]$ 上；若使用缩放坐标 $\mu_{gc} = Sp_{gc}$，则也可等价地表示为 $\mu$ 轴上的离散分布。
+
+需要强调，$F_g$ 是 effective prior：它描述的是在当前观测框架下，基因 $g$ 的有效群体分布，而不是已经与所有局部扰动、平台偏差和采样前噪声完全分离的“纯生物真值分布”。本框架是逐基因的边际经验贝叶斯模型，不显式建模跨基因依赖；其目标是为后续后验推断与信号提取提供稳定的单基因先验层。
+
+### 2.2 离散表示与缩放坐标
+
+对每个基因 $g$，在 $\mu$ 轴上引入 $M$ 个等距网格点：
+
+$$0 \le v_1 < v_2 < \cdots < v_M \le \mu_g^{\max}$$
+
+其中对应的比例坐标为
+
+$$p_j = \frac{v_j}{S} \in [0,1]$$
+
+于是 $F_g$ 被表示为这些网格点上的离散分布。设无约束参数为 logits $\{l_j\}_{j=1}^M$，先经 softmax 得到概率权重：
+
+$$w_j = \frac{\exp(l_j)}{\sum_{k=1}^M \exp(l_k)}$$
+
+随后对 $w$ 施加高斯平滑，得到最终分布：
+
+$$\tilde{w}_j = \sum_{k=1}^M w_k\,G_\sigma(v_j-v_k), \qquad G_\sigma(x)=\exp\left(-\frac{x^2}{2\sigma^2}\right)$$
+
+卷积后的 $\tilde{w}$ 即为估计先验 $\hat F_g$。这里不存在额外的“逆变换”：平滑后的分布本身就是最终输出。
+
+在新的框架下，$S$ 不再是待估参数，而是固定缩放标尺。一个自然且稳定的默认选择是
+
+$$S = \frac{1}{C}\sum_{c=1}^C N_c$$
+
+即取参考总计数的细胞均值。这样做的作用不是赋予 $S$ 物理可识别性，而是给 $\mu = Sp$ 提供一个稳定的公共尺度；特别地，当改变 $\mathcal{G}^{\mathrm{ref}}$ 的构造方式时，使用 $\mathrm{mean}(N_c)$ 作为标尺通常能使 $\mu$ 轴保持更稳定的量级语义。
+
+对于具体基因 $g$，网格上界建议取为
+
+$$\mu_g^{\max} = \max_c X_{gc} \cdot \frac{S}{\bar{N}}, \qquad \bar{N} = \frac{1}{C}\sum_{c=1}^C N_c$$
+
+亦即用该基因在全体细胞中的最大观测计数乘以 $S/N_c$ 的平均尺度。这样做的目的，是在网格范围与有效分辨率之间取得平衡：若上界取得过大，则大量网格点会落在几乎没有后验质量支撑的区域，导致有效分辨率下降；若上界取得过小，则会出现尾部质量被截断、后验概率在边界附近严重堆积的质量逸散问题。上述经验选择通常能够在不引入过大冗余范围的前提下，为该基因保留足够的动态空间。
+
+### 2.3 单细胞似然
+
+在第 1 节的工作模型下，单细胞观测满足
+
+$$X_{gc}\mid N_c^{\mathrm{eff}},p_{gc} \approx \mathrm{Binomial}(N_c^{\mathrm{eff}},p_{gc})$$
+
+因此，对离散网格点 $v_j$，单细胞似然写为
+
+$$\mathrm{lik}_{cj} = \mathrm{Binomial}\!\left(X_{gc}\mid N_c^{\mathrm{eff}}, \frac{v_j}{S}\right)$$
+
+其中 $N_c^{\mathrm{eff}} = \frac{N_c}{\bar N}S$，$v_j/S$ 是对应的比例参数。于是每个细胞都在同一条 $\mu$ 轴上诱导出一个单峰或近单峰的似然轮廓；其峰值大致位于
+
+$$v_j \approx \frac{X_{gc}}{N_c^{\mathrm{eff}}}\,S = X_{gc}\frac{\bar N}{N_c}$$
+
+附近。$N_c^{\mathrm{eff}}$ 越大，似然越窄，说明该细胞对 $p_{gc}$ 提供的约束越强；$N_c^{\mathrm{eff}}$ 越小，似然越宽，说明后验会更依赖群体先验。
+
+### 2.4 经验贝叶斯目标
+
+对每个细胞 $c$，边际似然为先验与单细胞似然的加权和：
+
+$$d_c = \sum_{j=1}^M \tilde{w}_j\,\mathrm{lik}_{cj}$$
+
+对应的负对数似然为
+
+$$\mathcal{L}_{\mathrm{NLL}} = -\frac{1}{C}\sum_{c=1}^C \log d_c$$
+
+这是经验贝叶斯意义下的主数据项：它要求找到一个群体级分布 $\tilde w$，使得所有单细胞观测在该分布下具有尽可能高的边际解释度。
+
+在样本量充足且模型近似合理时，NLL 提供了恢复 $F_g$ 的基本统计依据；但在有限样本、低覆盖或强噪声条件下，仅依赖 NLL 仍可能对稀有峰或弱结构约束不足。
+
+### 2.5 后验生成分布与自洽正则
+
+给定当前先验 $\tilde w$，对每个细胞可由 Bayes 公式得到离散后验：
+
+$$p(v_j\mid X_{gc}) = \frac{\tilde{w}_j\,\mathrm{lik}_{cj}}{\sum_{k=1}^M \tilde{w}_k\,\mathrm{lik}_{ck}}$$
+
+这里默认采用完整后验的平均来构造群体级“后验生成分布”：
+
+$$\hat Q_g(v_j) = \frac{1}{C}\sum_{c=1}^C p(v_j\mid X_{gc})$$
+
+$\hat Q_g$ 可理解为：在当前先验下，所有细胞经后验更新后重新“生成”的群体分布。它保留了单细胞后验的全部概率质量，而不是先做 MAP 硬决策再聚合，因此比 MAP histogram 更连续，也更符合后验一致性的原始动机。
+
+基于这一分布，引入自洽正则项：
+
+$$\mathcal{L}_{\mathrm{align}} = \mathrm{JSD}(\hat Q_g\|\tilde w)$$
+
+其中
+
+$$\mathrm{JSD}(\hat Q_g\|\tilde w)=\frac{1}{2}\mathrm{KL}(\hat Q_g\|\bar M)+\frac{1}{2}\mathrm{KL}(\tilde w\|\bar M), \qquad \bar M=\frac{1}{2}(\hat Q_g+\tilde w)$$
+
+总目标函数写为
+
+$$\mathcal{L} = \lambda_{\mathrm{nll}}\mathcal{L}_{\mathrm{NLL}}+\lambda_{\mathrm{align}}\mathcal{L}_{\mathrm{align}}$$
+
+这个正则项的含义是：若 $\tilde w$ 是一个合理的群体级先验，那么用它对单细胞观测做后验推断后，再将所有后验分布平均得到的群体分布，不应与原先验相差过大。
+
+需要强调，JSD 对齐是经验上的自洽约束，而不是普适定理。它可能帮助稳定稀有结构，也可能在低覆盖和多峰场景中强化偶然伪峰。因此，它应被理解为可调正则项，而非先验保证。
+
+### 2.6 平滑、梯度结构与偏差-方差权衡
+
+高斯卷积在这里的作用不只是让输出分布 $\tilde w$ 更平滑，也会通过链式法则平滑优化过程中的梯度场。也就是说，卷积不仅抑制最终分布中的锯齿，也降低了相邻网格点之间梯度的高频震荡，使优化更倾向于产生连续结构，而不是网格级别的尖锐抖动。
+
+即使不显式加入高斯模糊，仅使用 softmax-logit 参数化，在 NLL 与后验一致性目标的共同作用下，优化得到的分布也往往会趋向一定程度的平滑：因为相邻网格点对应的似然函数高度相关，梯度天然具有局部耦合性。因此，高斯模糊并不是唯一的平滑来源，而是一种更强的、显式的低通约束。
+
+这也解释了其偏差-方差权衡：
+
+- 较小的 $\sigma$ 保留更多局部结构，但对噪声更敏感；
+- 较大的 $\sigma$ 提供更强的稳定化作用，但可能抹平真实窄峰。
+
+因此，卷积平滑的作用应理解为：在本来就存在局部梯度相关性的优化问题上，进一步施加构造性的光滑先验。
+
+### 2.7 输出与超参数
+
+最终输出的 $\tilde w$ 就是估计得到的 $\hat F_g$。它定义了基因 $g$ 在比例空间或缩放坐标空间上的有效群体先验，并直接用于后续的单细胞后验推断。
+
+该部分的核心超参数为：
+
+- $M$：离散网格分辨率；
+- $\sigma$：高斯平滑核宽度；
+- $\lambda_{\mathrm{nll}}$：数据项权重；
+- $\lambda_{\mathrm{align}}$：后验一致性项权重；
+- $S$：固定缩放标尺，默认建议取 $\mathrm{mean}(N_c)$。
+
+在方法层面，最关键的不是具体优化器或工程实现，而是以下三点：
+
+- 用离散分布表示单基因先验；
+- 用 Binomial 比例观测模型连接观测与潜变量；
+- 用“边际似然 + 后验生成分布自洽”共同约束 $F_g$。
