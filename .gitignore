@@ -12,7 +12,7 @@ uv.lock
 
 # Generated dataset artifacts
 data/
-output/
+outputs/
 
 
 .claude/
