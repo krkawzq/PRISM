@@ -14,6 +14,16 @@ def inspect_checkpoint_command(
     checkpoint_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Checkpoint path."
     ),
+    show_labels: bool = typer.Option(
+        False,
+        "--show-labels",
+        help="Print available label prior names when present.",
+    ),
+    label_limit: int = typer.Option(
+        50,
+        min=1,
+        help="Maximum number of label names to print with --show-labels.",
+    ),
 ) -> int:
     checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
     metadata = checkpoint.metadata
@@ -45,11 +55,26 @@ def inspect_checkpoint_command(
         "requested_fit_genes",
         str(len(safe_string_list(metadata.get("requested_fit_gene_names")))),
     )
+    if checkpoint.label_priors:
+        labels = sorted(checkpoint.label_priors)
+        preview = ", ".join(labels[:label_limit])
+        if len(labels) > label_limit:
+            preview = f"{preview}, ..."
+        table.add_row("label_preview", preview)
     table.add_row(
         "shard",
         f"{metadata.get('shard_rank', 0)}/{metadata.get('shard_world_size', 1)}",
     )
     console.print(table)
+    if show_labels and checkpoint.label_priors:
+        label_table = Table(title="Label Priors")
+        label_table.add_column("Index", justify="right")
+        label_table.add_column("Label")
+        for idx, label in enumerate(
+            sorted(checkpoint.label_priors)[:label_limit], start=1
+        ):
+            label_table.add_row(str(idx), label)
+        console.print(label_table)
     return 0
 
 

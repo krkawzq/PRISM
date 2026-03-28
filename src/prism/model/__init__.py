@@ -31,7 +31,7 @@ from .estimator import (
     summarize_reference_scale,
 )
 from .exposure import effective_exposure, mean_reference_count, ratio_observation_mean
-from .fit import fit_gene_priors
+from .fit import fit_gene_priors, fit_gene_priors_em
 from .infer import ALL_CHANNELS, CORE_CHANNELS, SignalChannel, infer_posteriors
 from .kbulk import KBulkAggregator, KBulkBatch, KBulkResult, infer_kbulk
 from .posterior import (
@@ -93,6 +93,7 @@ __all__ = [
     "checkpoint_from_fit_result",
     "effective_exposure",
     "fit_gene_priors",
+    "fit_gene_priors_em",
     "fit_pool_scale",
     "fit_pool_scale_report",
     "infer_posteriors",

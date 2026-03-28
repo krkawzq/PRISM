@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any
 
 import matplotlib
@@ -20,6 +21,24 @@ def safe_string_list(value: object) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         return []
     return list(value)
+
+
+def load_gene_list_file(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        gene_names = payload.get("gene_names")
+        if not isinstance(gene_names, list) or not all(
+            isinstance(item, str) and item for item in gene_names
+        ):
+            raise ValueError(
+                f"gene-list JSON is missing a valid gene_names field: {path}"
+            )
+        return list(dict.fromkeys(gene_names))
+    genes = [line.strip() for line in text.splitlines() if line.strip()]
+    if not genes:
+        raise ValueError(f"gene list is empty: {path}")
+    return list(dict.fromkeys(genes))
 
 
 def checkpoint_gene_names(
@@ -145,7 +164,11 @@ def resolve_plot_curve_sets(
         label for label in selected_labels if label not in checkpoint.label_priors
     ]
     if unknown:
-        raise ValueError(f"unknown label priors: {unknown}")
+        available = sorted(checkpoint.label_priors)
+        preview = available[:10]
+        raise ValueError(
+            f"unknown label priors: {unknown}; available examples: {preview}"
+        )
     curve_sets: dict[str, list[tuple[str, np.ndarray, np.ndarray]]] = {}
     for gene_name in requested:
         curves: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -245,5 +268,75 @@ def plot_fg_figure(
         ax.set_ylabel("prior mass")
         ax.legend(frameon=False)
         ax.grid(alpha=0.18)
+    fig.tight_layout()
+    return fig
+
+
+def plot_fg_facet_figure(
+    curve_sets: dict[str, list[tuple[str, np.ndarray, np.ndarray]]],
+    *,
+    x_axis: str,
+    mass_quantile: float,
+):
+    genes = list(curve_sets)
+    if not genes:
+        raise ValueError("no genes available for plotting")
+    column_labels: list[str] = []
+    seen: set[str] = set()
+    for curves in curve_sets.values():
+        for label, _, _ in curves:
+            if label not in seen:
+                seen.add(label)
+                column_labels.append(label)
+    n_rows = len(genes)
+    n_cols = len(column_labels)
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.6 * n_cols, 3.2 * n_rows),
+        squeeze=False,
+        sharex=False,
+        sharey=False,
+    )
+    color_cycle = ["#1d4ed8", "#0f766e", "#c2410c", "#7c3aed", "#be123c", "#0891b2"]
+    for row_idx, gene_name in enumerate(genes):
+        curve_map = {
+            label: (mu, weights) for label, mu, weights in curve_sets[gene_name]
+        }
+        row_display_max = max(
+            display_cutoff(
+                mu_to_p(mu_values) if x_axis == "p" else mu_values,
+                weights,
+                mass_quantile,
+            )
+            for mu_values, weights in curve_map.values()
+        )
+        row_display_max = max(row_display_max, 1e-12)
+        for col_idx, column_label in enumerate(column_labels):
+            ax = axes[row_idx][col_idx]
+            if row_idx == 0:
+                ax.set_title(column_label)
+            if col_idx == 0:
+                ax.set_ylabel(f"{gene_name}\nprior mass")
+            else:
+                ax.set_ylabel("prior mass")
+            ax.set_xlabel(x_axis)
+            if column_label not in curve_map:
+                ax.set_xlim(0.0, row_display_max)
+                ax.set_visible(False)
+                continue
+            mu_values, weights = curve_map[column_label]
+            x_values = mu_to_p(mu_values) if x_axis == "p" else mu_values
+            mask = x_values <= row_display_max + 1e-12
+            if not np.any(mask):
+                mask = np.ones_like(x_values, dtype=bool)
+            ax.plot(
+                x_values[mask],
+                weights[mask],
+                lw=2.0,
+                color=color_cycle[col_idx % len(color_cycle)],
+            )
+            ax.set_xlim(0.0, row_display_max)
+            ax.grid(alpha=0.18)
     fig.tight_layout()
     return fig

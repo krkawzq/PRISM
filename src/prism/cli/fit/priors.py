@@ -25,6 +25,7 @@ from prism.model import (
     PriorGrid,
     ScaleMetadata,
     fit_gene_priors,
+    fit_gene_priors_em,
     save_checkpoint,
 )
 
@@ -121,6 +122,15 @@ def fit_priors_command(
     optimizer: str = typer.Option("adamw", help="Optimizer name."),
     scheduler: str = typer.Option("cosine", help="Scheduler name."),
     torch_dtype: str = typer.Option("float64", help="Torch dtype: float64 or float32."),
+    fit_method: str = typer.Option(
+        "gradient",
+        help="Prior fitting method: gradient or em.",
+    ),
+    em_tol: float = typer.Option(
+        1e-6,
+        min=0.0,
+        help="EM early-stop tolerance on the max absolute weight update.",
+    ),
     dry_run: bool = typer.Option(
         False, help="Show the execution plan without fitting."
     ),
@@ -138,6 +148,9 @@ def fit_priors_command(
     )
 
     rank, world_size = parse_shard(shard)
+    fit_method_resolved = fit_method.strip().lower()
+    if fit_method_resolved not in {"gradient", "em"}:
+        raise ValueError("fit_method must be one of: gradient, em")
     fit_config = PriorFitConfig(
         grid_size=grid_size,
         sigma_bins=sigma_bins,
@@ -212,6 +225,8 @@ def fit_priors_command(
         S_source=S_source,
         N_avg=default_S,
         device=device,
+        fit_method=fit_method_resolved,
+        em_tol=em_tol,
         gene_batch_size=gene_batch_size,
         shard=f"{rank}/{world_size}",
         output_path=output_path,
@@ -282,16 +297,26 @@ def fit_priors_command(
                     [gene_to_idx[name] for name in names],
                     cell_indices=sampled_indices,
                 )
-                result = fit_gene_priors(
-                    ObservationBatch(
-                        gene_names=list(names),
-                        counts=batch_counts,
-                        reference_counts=task_reference_counts,
-                    ),
-                    S=resolved_S,
-                    config=fit_config,
-                    device=device,
+                observation_batch = ObservationBatch(
+                    gene_names=list(names),
+                    counts=batch_counts,
+                    reference_counts=task_reference_counts,
                 )
+                if fit_method_resolved == "gradient":
+                    result = fit_gene_priors(
+                        observation_batch,
+                        S=resolved_S,
+                        config=fit_config,
+                        device=device,
+                    )
+                else:
+                    result = fit_gene_priors_em(
+                        observation_batch,
+                        S=resolved_S,
+                        config=fit_config,
+                        device=device,
+                        tol=em_tol,
+                    )
                 priors = result.priors.batched()
                 fitted_p_grids.append(np.asarray(priors.p_grid, dtype=np.float64))
                 fitted_weights.append(np.asarray(priors.weights, dtype=np.float64))
@@ -301,6 +326,7 @@ def fit_priors_command(
                         "n_genes": len(names),
                         "final_loss": float(result.final_loss),
                         "best_loss": float(result.best_loss),
+                        "n_iter_run": int(len(result.loss_history)),
                     }
                 )
             merged_priors = PriorGrid(
@@ -357,6 +383,8 @@ def fit_priors_command(
             "shard_rank": int(rank),
             "shard_world_size": int(world_size),
             "fit_mode": fit_mode_resolved,
+            "fit_method": fit_method_resolved,
+            "em_tol": float(em_tol),
             "label_key": label_key,
             "label_values": [
                 task.label_value for task in fit_tasks if task.label_value is not None
