@@ -41,6 +41,7 @@ from .common import (
     resolve_fit_mode,
     resolve_gene_list,
     resolve_label_groups,
+    read_gene_list,
     sample_indices,
     select_matrix,
     shard_gene_names,
@@ -79,6 +80,13 @@ def fit_priors_command(
         "--label-value",
         help="Optional repeatable label values to fit when --label-key is set.",
     ),
+    label_list_path: Path | None = typer.Option(
+        None,
+        "--label-list",
+        exists=True,
+        dir_okay=False,
+        help="Optional text file with one label value per line.",
+    ),
     fit_mode: str = typer.Option(
         "global", help="Fit scope: global, by-label, or both."
     ),
@@ -88,6 +96,8 @@ def fit_priors_command(
     sample_seed: int = typer.Option(0, min=0, help="Random seed for cell subsampling."),
     S: float | None = typer.Option(
         None,
+        "--S",
+        "--s",
         min=1e-12,
         help="Global scale marker used by the model. Defaults to mean reference count N_avg.",
     ),
@@ -146,6 +156,9 @@ def fit_priors_command(
     fit_genes_path = (
         None if fit_genes_path is None else fit_genes_path.expanduser().resolve()
     )
+    label_list_path = (
+        None if label_list_path is None else label_list_path.expanduser().resolve()
+    )
 
     rank, world_size = parse_shard(shard)
     fit_method_resolved = fit_method.strip().lower()
@@ -201,10 +214,18 @@ def fit_priors_command(
     default_S = float(np.mean(reference_counts))
     resolved_S = default_S if S is None else float(S)
     S_source = "default:N_avg" if S is None else "user"
+    resolved_label_values = None
+    if label_values or label_list_path is not None:
+        merged_labels: list[str] = []
+        if label_values:
+            merged_labels.extend(label_values)
+        if label_list_path is not None:
+            merged_labels.extend(read_gene_list(label_list_path))
+        resolved_label_values = list(dict.fromkeys(merged_labels))
     label_groups = resolve_label_groups(
         adata=adata,
         label_key=label_key,
-        label_values=label_values,
+        label_values=resolved_label_values,
         fit_mode=fit_mode_resolved,
     )
     label_group_sizes = [int(indices.shape[0]) for _, indices in label_groups]
@@ -219,6 +240,9 @@ def fit_priors_command(
         fit_mode=fit_mode_resolved,
         label_key=label_key,
         n_label_groups=len(label_groups),
+        n_requested_label_values=(
+            None if resolved_label_values is None else len(resolved_label_values)
+        ),
         n_samples=n_samples,
         sample_seed=sample_seed,
         S=resolved_S,
@@ -389,6 +413,9 @@ def fit_priors_command(
             "label_values": [
                 task.label_value for task in fit_tasks if task.label_value is not None
             ],
+            "label_list_path": None
+            if label_list_path is None
+            else str(label_list_path),
             "n_samples_requested": None if n_samples is None else int(n_samples),
             "sample_seed": int(sample_seed),
             "S_source": S_source,

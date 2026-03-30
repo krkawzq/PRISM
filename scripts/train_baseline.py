@@ -1,1304 +1,563 @@
 #!/usr/bin/env python3
+"""Baseline classifier trainer for AnnData representations."""
+
 from __future__ import annotations
 
 import argparse
 import copy
 import json
-import math
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, cast
+from time import perf_counter
+from typing import Any, cast
 
 import anndata as ad
 import numpy as np
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.traceback import install as install_rich_traceback
 import torch
 from scipy import sparse
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import train_test_split
-from tqdm.auto import tqdm
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from prism.baseline import DeepMLPClassifier, LinearClassifier, MLPClassifier
-from prism.baseline.metrics import log1p_normalize_total
-
-SIGNAL_LAYER = "signal"
-CONFIDENCE_LAYER = "confidence"
-LABEL_COLUMN = "treatment"
-BATCH_COLUMN = "batch"
-RANDOM_SEED = 0
-TRAIN_FRACTION = 0.8
-VAL_FRACTION = 0.1
-TEST_FRACTION = 0.1
-TRAIN_BATCH_SIZE = 512
-EVAL_BATCH_SIZE = 1024
-PRECOMPUTE_BATCH_SIZE = 2048
-LINEAR_EPOCHS = 30
-MLP_EPOCHS = 50
-DEEP_MLP_EPOCHS = 100
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
-MLP_HIDDEN_DIM = 1024
-DEEP_MLP_HIDDEN_DIMS = (1024, 512, 256)
-
-USE_RAW_UMI = True
-USE_RAW_UMI_PLUS_TOTAL = False
-USE_LOG1P_NORMALIZED = True
-USE_LOG1P_NORMALIZED_PLUS_TOTAL = False
-USE_SIGNAL = True
-USE_SIGNAL_PLUS_TOTAL = False
-USE_SIGNAL_X_CONFIDENCE = False
-USE_SIGNAL_X_CONFIDENCE_PLUS_TOTAL = False
-USE_SIGNAL_CONFIDENCE_CONCAT = False
-USE_SIGNAL_CONFIDENCE_CONCAT_PLUS_TOTAL = False
-USE_SIGNAL_CONFIDENCE_THRESHOLD = False
-
-CONFIDENCE_ZERO_THRESHOLD_QUANTILE = 0.001
-ALL_REPRESENTATIONS = (
-    "raw_umi",
-    "raw_umi_plus_total",
-    "log1p_normalized",
-    "log1p_normalized_plus_total",
-    "signal",
-    "signal_plus_total",
-    "signal_x_confidence",
-    "signal_x_confidence_plus_total",
-    "signal_confidence_concat",
-    "signal_confidence_concat_plus_total",
-    "signal_confidence_thresholded",
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-@dataclass(frozen=True, slots=True)
-class SplitIndices:
-    train: np.ndarray
-    val: np.ndarray
-    test: np.ndarray
-    split_mode: str = "random"
-    train_batch_values: tuple[str, ...] = ()
-    val_batch_values: tuple[str, ...] = ()
-    test_batch_values: tuple[str, ...] = ()
+from prism.baseline import DeepMLPClassifier, LinearClassifier, MLPClassifier
 
+console = Console()
+install_rich_traceback(show_locals=False)
 
-@dataclass(frozen=True, slots=True)
-class RepresentationResult:
-    name: str
-    accuracy: float
-    precision_macro: float
-    recall_macro: float
-    f1_macro: float
-    precision_weighted: float
-    recall_weighted: float
-    f1_weighted: float
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SEED = 0
+LR = 1e-3
+WD = 1e-4
+EPOCHS = {"linear": 30, "mlp": 50, "deep-mlp": 100}
+HIDDEN = {"mlp": (1024,), "deep-mlp": (1024, 512, 256)}
 
 
-@dataclass(frozen=True, slots=True)
-class FeatureCache:
-    raw_umi: np.ndarray | None = None
-    log1p_normalized: np.ndarray | None = None
-    signal: np.ndarray | None = None
-    confidence: np.ndarray | None = None
-    confidence_threshold: float | None = None
+def read_gene_list(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() == ".json":
+        payload = json.loads(text)
+        gene_names = payload.get("gene_names")
+        if not isinstance(gene_names, list) or not all(
+            isinstance(gene, str) and gene for gene in gene_names
+        ):
+            raise ValueError(
+                f"gene-list JSON is missing a valid gene_names field: {path}"
+            )
+        return list(dict.fromkeys(gene_names))
+    genes = [line.strip() for line in text.splitlines() if line.strip()]
+    if not genes:
+        raise ValueError(f"gene list is empty: {path}")
+    return list(dict.fromkeys(genes))
 
 
-@dataclass(frozen=True, slots=True)
-class GeneListSpec:
-    source_path: str
-    method: str
-    top_k: int
-    gene_indices: list[int]
-    gene_names: list[str]
-    scores: list[float]
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True, slots=True)
-class LabelFilterSpec:
-    label_column: str
-    top_k: int
-    selected_labels: tuple[str, ...]
-    original_n_obs: int
-    filtered_n_obs: int
+def load(path: Path, label_col: str, gene_list_path: Path | None) -> ad.AnnData:
+    adata = ad.read_h5ad(path)
+    if gene_list_path is not None:
+        requested = read_gene_list(gene_list_path)
+        var_names = [str(name) for name in adata.var_names.tolist()]
+        lookup = {name: idx for idx, name in enumerate(var_names)}
+        names = [gene for gene in requested if gene in lookup]
+        missing = [gene for gene in requested if gene not in lookup]
+        if missing:
+            console.print(
+                f"[yellow]Skipped[/yellow] {len(missing)} genes missing from dataset"
+            )
+        if not names:
+            raise ValueError("gene list has no overlap with the dataset")
+        idx = [lookup[g] for g in names]
+        adata = adata[:, idx].copy()
+    if label_col not in adata.obs:
+        raise KeyError(f"Label column '{label_col}' not found in obs.")
+    return adata
 
 
-@dataclass(frozen=True, slots=True)
-class RunConfig:
-    train_batch_size: int
-    eval_batch_size: int
-    precompute_batch_size: int
-    eval_every: int
-    cache_dense_representations: bool
-
-
-def enabled_representations() -> list[str]:
-    items: list[tuple[bool, str]] = [
-        (USE_RAW_UMI, "raw_umi"),
-        (USE_RAW_UMI_PLUS_TOTAL, "raw_umi_plus_total"),
-        (USE_LOG1P_NORMALIZED, "log1p_normalized"),
-        (USE_LOG1P_NORMALIZED_PLUS_TOTAL, "log1p_normalized_plus_total"),
-        (USE_SIGNAL, "signal"),
-        (USE_SIGNAL_PLUS_TOTAL, "signal_plus_total"),
-        (USE_SIGNAL_X_CONFIDENCE, "signal_x_confidence"),
-        (USE_SIGNAL_X_CONFIDENCE_PLUS_TOTAL, "signal_x_confidence_plus_total"),
-        (USE_SIGNAL_CONFIDENCE_CONCAT, "signal_confidence_concat"),
-        (
-            USE_SIGNAL_CONFIDENCE_CONCAT_PLUS_TOTAL,
-            "signal_confidence_concat_plus_total",
-        ),
-        (USE_SIGNAL_CONFIDENCE_THRESHOLD, "signal_confidence_thresholded"),
-    ]
-    return [name for enabled, name in items if enabled]
-
-
-def parse_representations(values: list[str] | None) -> list[str]:
-    if not values:
-        return enabled_representations()
-    unknown = sorted(set(values) - set(ALL_REPRESENTATIONS))
-    if unknown:
-        raise ValueError(f"未知表示: {unknown}")
-    return list(dict.fromkeys(values))
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Train a simple linear or MLP baseline on raw UMI, log1p-normalized, and signal features."
-        )
-    )
-    parser.add_argument("h5ad_path", type=Path, help="Input extracted h5ad file.")
-    parser.add_argument(
-        "--model",
-        choices=("linear", "mlp", "deep-mlp"),
-        required=True,
-        help="Baseline model type.",
-    )
-    parser.add_argument(
-        "--gene-list-json",
-        type=Path,
-        default=None,
-        help="Use only the gene subset stored in this JSON file.",
-    )
-    parser.add_argument(
-        "--label-column",
-        type=str,
-        default=LABEL_COLUMN,
-        help="obs column used as the classification target.",
-    )
-    parser.add_argument(
-        "--label-top-k",
-        type=int,
-        default=None,
-        help="Keep only the top-K most frequent labels in --label-column.",
-    )
-    parser.add_argument(
-        "--split-mode",
-        choices=("random", "batch"),
-        default="random",
-        help="How to split train/val/test: random cells or whole batches.",
-    )
-    parser.add_argument(
-        "--batch-key",
-        type=str,
-        default=BATCH_COLUMN,
-        help="obs column used to define batches when --split-mode=batch.",
-    )
-    parser.add_argument(
-        "--val-batch",
-        dest="val_batches",
-        action="append",
-        default=None,
-        help="Validation batch value. Repeat or pass comma-separated values.",
-    )
-    parser.add_argument(
-        "--test-batch",
-        dest="test_batches",
-        action="append",
-        default=None,
-        help="Test batch value. Repeat or pass comma-separated values.",
-    )
-    parser.add_argument(
-        "--device",
-        choices=("auto", "cpu", "cuda"),
-        default="auto",
-        help="Training device.",
-    )
-    parser.add_argument(
-        "--representation",
-        dest="representations",
-        action="append",
-        choices=ALL_REPRESENTATIONS,
-        help="Representation to train. Repeatable; defaults to the script's enabled set.",
-    )
-    parser.add_argument(
-        "--train-batch-size",
-        type=int,
-        default=TRAIN_BATCH_SIZE,
-        help="Training batch size.",
-    )
-    parser.add_argument(
-        "--eval-batch-size",
-        type=int,
-        default=EVAL_BATCH_SIZE,
-        help="Validation/test batch size.",
-    )
-    parser.add_argument(
-        "--precompute-batch-size",
-        type=int,
-        default=PRECOMPUTE_BATCH_SIZE,
-        help="Batch size used when precomputing dense features.",
-    )
-    parser.add_argument(
-        "--eval-every",
-        type=int,
-        default=1,
-        help="Run validation every N epochs.",
-    )
-    parser.add_argument(
-        "--cache-dense-representations",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Precompute dense raw/signal matrices once to reduce per-batch CPU overhead.",
-    )
-    return parser.parse_args()
-
-
-def resolve_device(requested: str) -> torch.device:
-    if requested == "cpu":
-        return torch.device("cpu")
-    if requested == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("请求了 cuda，但当前 PyTorch 看不到可用 GPU")
-        return torch.device("cuda")
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-def set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def read_adata(h5ad_path: Path) -> ad.AnnData:
-    return ad.read_h5ad(h5ad_path)
-
-
-def load_gene_list_spec(path: Path) -> GeneListSpec:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return GeneListSpec(
-        source_path=str(payload.get("source_path", "")),
-        method=str(payload["method"]),
-        top_k=int(payload["top_k"]),
-        gene_indices=[int(v) for v in payload["gene_indices"]],
-        gene_names=[str(v) for v in payload["gene_names"]],
-        scores=[float(v) for v in payload.get("scores", [])],
-    )
-
-
-def maybe_subset_gene_list(
-    adata: ad.AnnData, gene_list_json: Path | None
-) -> tuple[ad.AnnData, GeneListSpec | None]:
-    if gene_list_json is None:
-        return adata, None
-    spec = load_gene_list_spec(gene_list_json.expanduser().resolve())
-    name_to_idx = {str(name): idx for idx, name in enumerate(adata.var_names.tolist())}
-    indices = np.asarray(
-        [name_to_idx[name] for name in spec.gene_names], dtype=np.int64
-    )
-    subset_view = adata[:, indices]
-    subset = subset_view.to_memory() if adata.isbacked else subset_view.copy()
-    return subset, spec
-
-
-def maybe_subset_top_labels(
-    adata: ad.AnnData,
+def split(
+    labels: np.ndarray,
     *,
-    label_column: str,
-    label_top_k: int | None,
-) -> tuple[ad.AnnData, LabelFilterSpec | None]:
-    if label_top_k is None:
-        return adata, None
-    if label_top_k < 1:
-        raise ValueError("--label-top-k 必须 >= 1")
-    if label_column not in adata.obs:
-        raise KeyError(f"输入文件缺少标签列: {label_column!r}")
-
-    series = adata.obs[label_column].astype(str)
-    counts = series.value_counts(sort=True)
-    if counts.empty:
-        raise ValueError(f"标签列 {label_column!r} 为空，无法筛选 top-k")
-
-    top_labels = tuple(str(label) for label in counts.index[:label_top_k].tolist())
-    if not top_labels:
-        raise ValueError("筛选 top-k 标签后结果为空")
-    mask = series.isin(top_labels).to_numpy(dtype=bool, copy=False)
-    filtered_view = adata[mask]
-    filtered = filtered_view.to_memory() if adata.isbacked else filtered_view.copy()
-    spec = LabelFilterSpec(
-        label_column=label_column,
-        top_k=min(label_top_k, int(counts.shape[0])),
-        selected_labels=top_labels,
-        original_n_obs=int(adata.n_obs),
-        filtered_n_obs=int(filtered.n_obs),
-    )
-    return filtered, spec
-
-
-def encode_labels(adata: ad.AnnData, label_column: str) -> tuple[np.ndarray, list[str]]:
-    if label_column not in adata.obs:
-        raise KeyError(f"输入文件缺少标签列: {label_column!r}")
-    series = adata.obs[label_column].astype("category")
-    labels = series.cat.codes.to_numpy(dtype=np.int64, copy=False)
-    if np.any(labels < 0):
-        raise ValueError(f"标签列 {label_column!r} 包含缺失值")
-    class_names = [str(value) for value in series.cat.categories.tolist()]
-    return labels, class_names
-
-
-def get_batch_values(adata: ad.AnnData, batch_key: str) -> np.ndarray:
-    if batch_key not in adata.obs:
-        raise KeyError(f"输入文件缺少 batch 列: {batch_key!r}")
-    values = adata.obs[batch_key].astype(str).to_numpy(copy=False)
-    if np.any(values == ""):
-        raise ValueError(f"batch 列 {batch_key!r} 包含空字符串")
-    return np.asarray(values, dtype=object)
-
-
-def compute_totals(adata: ad.AnnData) -> np.ndarray:
-    matrix = adata.X
-    if matrix is None:
-        raise ValueError("输入 h5ad 的 X 为空，无法计算 raw/log1p baseline")
-    if sparse.issparse(matrix):
-        totals = np.asarray(cast(Any, matrix).sum(axis=1)).ravel()
-    else:
-        totals = np.asarray(matrix).sum(axis=1)
-    return np.asarray(totals, dtype=np.float32)
-
-
-def _stratify_or_none(labels: np.ndarray | None) -> np.ndarray | None:
-    if labels is None:
-        return None
-    labels = np.asarray(labels, dtype=np.int64)
-    if labels.size == 0:
-        return None
+    seed: int,
+    train_fraction: float,
+    val_fraction: float,
+    test_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    idx = np.arange(len(labels))
     _, counts = np.unique(labels, return_counts=True)
-    if counts.min() < 2:
-        return None
-    return labels
-
-
-def build_splits(labels: np.ndarray) -> SplitIndices:
-    all_idx = np.arange(labels.shape[0], dtype=np.int64)
-    stratify_labels = _stratify_or_none(labels)
-    train_idx, temp_idx, _train_y, temp_y = train_test_split(
-        all_idx,
-        labels,
-        test_size=(1.0 - TRAIN_FRACTION),
-        random_state=RANDOM_SEED,
-        stratify=stratify_labels,
+    strat = labels if counts.min() >= 2 else None
+    holdout_fraction = val_fraction + test_fraction
+    train, tmp, _, tmp_y = train_test_split(
+        idx, labels, test_size=holdout_fraction, random_state=seed, stratify=strat
     )
-    val_relative = VAL_FRACTION / (VAL_FRACTION + TEST_FRACTION)
-    temp_stratify = _stratify_or_none(np.asarray(temp_y, dtype=np.int64))
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=(1.0 - val_relative),
-        random_state=RANDOM_SEED,
-        stratify=temp_stratify,
+    strat2 = tmp_y if np.unique(tmp_y, return_counts=True)[1].min() >= 2 else None
+    val_share = val_fraction / max(holdout_fraction, 1e-12)
+    val, test = train_test_split(
+        tmp, train_size=val_share, random_state=seed, stratify=strat2
     )
-    return SplitIndices(
-        train=np.asarray(train_idx, dtype=np.int64),
-        val=np.asarray(val_idx, dtype=np.int64),
-        test=np.asarray(test_idx, dtype=np.int64),
-        split_mode="random",
+    return (
+        np.asarray(train, dtype=np.int64),
+        np.asarray(val, dtype=np.int64),
+        np.asarray(test, dtype=np.int64),
     )
 
 
-def _parse_batch_selection(values: list[str] | None) -> tuple[str, ...]:
-    if not values:
-        return ()
-    parsed: list[str] = []
-    for item in values:
-        for piece in item.split(","):
-            value = piece.strip()
-            if value:
-                parsed.append(value)
-    return tuple(dict.fromkeys(parsed))
+def to_dense_float32(matrix: Any) -> np.ndarray:
+    if sparse.issparse(matrix):
+        return np.asarray(cast(Any, matrix).toarray(), dtype=np.float32)
+    return np.asarray(matrix, dtype=np.float32)
 
 
-def _select_batch_subset(
-    candidate_batches: np.ndarray,
-    *,
-    size: int,
-    rng: np.random.RandomState,
-) -> tuple[str, ...]:
-    if size <= 0:
-        return ()
-    if size >= candidate_batches.size:
-        return tuple(sorted(candidate_batches.astype(str).tolist()))
-    selected = rng.choice(candidate_batches, size=size, replace=False)
-    return tuple(sorted(np.asarray(selected, dtype=str).tolist()))
-
-
-def _validate_seen_classes(
-    *,
-    split_name: str,
-    split_idx: np.ndarray,
+def align_class_means(
+    X: np.ndarray,
     labels: np.ndarray,
-    class_names: list[str],
-    seen_train_labels: set[int],
-) -> None:
-    missing = sorted(set(np.unique(labels[split_idx]).tolist()) - seen_train_labels)
-    if missing:
-        missing_names = ", ".join(class_names[idx] for idx in missing[:10])
-        suffix = "" if len(missing) <= 10 else f" ... (+{len(missing) - 10} more)"
-        raise ValueError(
-            f"{split_name} split contains classes unseen in train: {missing_names}{suffix}"
-        )
-
-
-def build_batch_splits(
     *,
-    labels: np.ndarray,
-    class_names: list[str],
-    batch_values: np.ndarray,
-    val_batches: tuple[str, ...] = (),
-    test_batches: tuple[str, ...] = (),
-) -> SplitIndices:
-    unique_batches = np.unique(batch_values.astype(str))
-    if unique_batches.size < 3:
+    expr_dim: int,
+    eps: float,
+    min_scale: float,
+    max_scale: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    if expr_dim <= 0:
+        raise ValueError("expr_dim must be positive for align-avg")
+    if min_scale <= 0 or max_scale <= 0 or min_scale > max_scale:
         raise ValueError(
-            f"按 batch 切分至少需要 3 个 batch，当前只有 {unique_batches.size} 个"
+            "align-avg scale bounds must satisfy 0 < min_scale <= max_scale"
         )
-
-    available_batches = set(unique_batches.tolist())
-    unknown_val = sorted(set(val_batches) - available_batches)
-    unknown_test = sorted(set(test_batches) - available_batches)
-    if unknown_val:
-        raise ValueError(f"未找到这些 val batches: {unknown_val}")
-    if unknown_test:
-        raise ValueError(f"未找到这些 test batches: {unknown_test}")
-    overlap = sorted(set(val_batches) & set(test_batches))
-    if overlap:
-        raise ValueError(f"val/test batches 不能重叠: {overlap}")
-
-    rng = np.random.RandomState(RANDOM_SEED)
-    remaining_after_test = np.asarray(
-        sorted(available_batches - set(test_batches)), dtype=object
-    )
-    if not test_batches:
-        test_size = max(int(round(unique_batches.size * TEST_FRACTION)), 1)
-        test_size = min(test_size, unique_batches.size - 2)
-        test_batches = _select_batch_subset(
-            unique_batches.astype(object), size=test_size, rng=rng
-        )
-        remaining_after_test = np.asarray(
-            sorted(available_batches - set(test_batches)), dtype=object
-        )
-
-    if remaining_after_test.size < 2:
-        raise ValueError("留出 test batches 后，剩余 batch 不足以再划分 train/val")
-
-    if not val_batches:
-        val_size = max(
-            int(
-                round(
-                    remaining_after_test.size
-                    * (VAL_FRACTION / (TRAIN_FRACTION + VAL_FRACTION))
-                )
-            ),
-            1,
-        )
-        val_size = min(val_size, remaining_after_test.size - 1)
-        val_batches = _select_batch_subset(remaining_after_test, size=val_size, rng=rng)
-
-    train_batches = tuple(
-        sorted(available_batches - set(val_batches) - set(test_batches))
-    )
-    if not train_batches or not val_batches or not test_batches:
-        raise ValueError("按 batch 切分后 train/val/test 中至少有一个为空")
-
-    batch_values_str = batch_values.astype(str)
-    train_mask = np.isin(batch_values_str, np.asarray(train_batches, dtype=object))
-    val_mask = np.isin(batch_values_str, np.asarray(val_batches, dtype=object))
-    test_mask = np.isin(batch_values_str, np.asarray(test_batches, dtype=object))
-    train_idx = np.flatnonzero(train_mask).astype(np.int64, copy=False)
-    val_idx = np.flatnonzero(val_mask).astype(np.int64, copy=False)
-    test_idx = np.flatnonzero(test_mask).astype(np.int64, copy=False)
-
-    seen_train_labels = set(np.unique(labels[train_idx]).tolist())
-    _validate_seen_classes(
-        split_name="val",
-        split_idx=val_idx,
-        labels=labels,
-        class_names=class_names,
-        seen_train_labels=seen_train_labels,
-    )
-    _validate_seen_classes(
-        split_name="test",
-        split_idx=test_idx,
-        labels=labels,
-        class_names=class_names,
-        seen_train_labels=seen_train_labels,
-    )
-
-    return SplitIndices(
-        train=train_idx,
-        val=val_idx,
-        test=test_idx,
-        split_mode="batch",
-        train_batch_values=train_batches,
-        val_batch_values=val_batches,
-        test_batch_values=test_batches,
-    )
+    classes, counts = np.unique(labels, return_counts=True)
+    ref_pos = int(np.argmax(counts))
+    ref_label = int(classes[ref_pos])
+    ref_mask = labels == ref_label
+    ref_mean = X[ref_mask, :expr_dim].mean(axis=0)
+    scale_min = float("inf")
+    scale_max = float("-inf")
+    out = X.copy()
+    for cls in classes:
+        cls_mask = labels == cls
+        cls_mean = out[cls_mask, :expr_dim].mean(axis=0)
+        scale = np.ones(expr_dim, dtype=np.float32)
+        ref_active = ref_mean > eps
+        cls_active = cls_mean > eps
+        both_active = ref_active & cls_active
+        scale[both_active] = ref_mean[both_active] / cls_mean[both_active]
+        only_ref_active = ref_active & ~cls_active
+        scale[only_ref_active] = max_scale
+        only_cls_active = ~ref_active & cls_active
+        scale[only_cls_active] = min_scale
+        np.clip(scale, min_scale, max_scale, out=scale)
+        out[cls_mask, :expr_dim] *= scale
+        scale_min = min(scale_min, float(scale.min()))
+        scale_max = max(scale_max, float(scale.max()))
+    return out, {
+        "reference_label": ref_label,
+        "reference_size": int(counts[ref_pos]),
+        "expr_dim": int(expr_dim),
+        "scale_min": scale_min,
+        "scale_max": scale_max,
+        "min_scale": float(min_scale),
+        "max_scale": float(max_scale),
+    }
 
 
-def resolve_representations(
-    adata: ad.AnnData, requested: list[str] | None
-) -> list[str]:
-    if requested:
-        representations = parse_representations(requested)
+def build_features(
+    adata: ad.AnnData,
+    args: argparse.Namespace,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, dict[str, Any] | None]:
+    """Build dense float32 feature matrix from AnnData."""
+    # Base: one or more layers (concat), or X
+    if args.layers:
+        parts = []
+        for layer in args.layers:
+            if layer not in adata.layers:
+                raise KeyError(f"layer '{layer}' not found in AnnData")
+            parts.append(to_dense_float32(adata.layers[layer]))
+        X = np.concatenate(parts, axis=1).astype(np.float32, copy=False)
     else:
-        representations = enabled_representations()
+        X = to_dense_float32(adata.X)
 
-    needs_x = {
-        "raw_umi",
-        "raw_umi_plus_total",
-        "log1p_normalized",
-        "log1p_normalized_plus_total",
-    }
-    needs_signal = {
-        "signal",
-        "signal_plus_total",
-        "signal_x_confidence",
-        "signal_x_confidence_plus_total",
-        "signal_confidence_concat",
-        "signal_confidence_concat_plus_total",
-        "signal_confidence_thresholded",
-    }
-    needs_confidence = {
-        "signal_x_confidence",
-        "signal_x_confidence_plus_total",
-        "signal_confidence_concat",
-        "signal_confidence_concat_plus_total",
-        "signal_confidence_thresholded",
-    }
+    np.nan_to_num(X, copy=False)
 
-    available = set(ALL_REPRESENTATIONS)
-    if adata.X is None:
-        available -= needs_x
-    if SIGNAL_LAYER not in adata.layers:
-        available -= needs_signal
-    if CONFIDENCE_LAYER not in adata.layers:
-        available -= needs_confidence
+    # Optional normalization + log1p
+    if args.normalize_total is not None:
+        totals = X.sum(axis=1, keepdims=True).clip(1e-9)
+        X = X / totals * args.normalize_total
+    if args.log1p:
+        np.log1p(X, out=X)
 
-    unavailable = [name for name in representations if name not in available]
-    if unavailable and requested:
-        raise KeyError(f"这些表示在当前 h5ad 中不可用: {unavailable}")
-    return [name for name in representations if name in available]
+    expr_dim = int(X.shape[1])
+
+    # Append scalar obs columns
+    extras = []
+    for key in args.append_obs_keys:
+        if key not in adata.obs:
+            raise KeyError(f"obs key '{key}' not found.")
+        extras.append(adata.obs[key].to_numpy(dtype=np.float32)[:, None])
+    if extras:
+        X = np.concatenate([X] + extras, axis=1)
+
+    align_info = None
+    if args.align_avg:
+        X, align_info = align_class_means(
+            X,
+            labels,
+            expr_dim=expr_dim,
+            eps=args.align_avg_eps,
+            min_scale=args.align_avg_min_scale,
+            max_scale=args.align_avg_max_scale,
+        )
+
+    return X, align_info
 
 
-def make_model(model_name: str, input_dim: int, num_classes: int) -> torch.nn.Module:
-    if model_name == "linear":
-        return LinearClassifier(input_dim=input_dim, num_classes=num_classes)
-    if model_name == "mlp":
+def rep_name(args: argparse.Namespace) -> str:
+    parts = list(args.layers) if args.layers else ["X"]
+    if args.normalize_total is not None:
+        parts.append(f"norm{int(args.normalize_total)}")
+    if args.log1p:
+        parts.append("log1p")
+    if args.align_avg:
+        parts.append("alignavg")
+    parts.extend(args.append_obs_keys)
+    return "+".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+
+def make_model(
+    name: str,
+    in_dim: int,
+    n_classes: int,
+    *,
+    mlp_hidden_dim: int,
+    deep_hidden_dims: tuple[int, ...],
+) -> torch.nn.Module:
+    if name == "linear":
+        return LinearClassifier(input_dim=in_dim, num_classes=n_classes)
+    if name == "mlp":
         return MLPClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dim=MLP_HIDDEN_DIM,
+            input_dim=in_dim, num_classes=n_classes, hidden_dim=mlp_hidden_dim
         )
-    if model_name == "deep-mlp":
-        return DeepMLPClassifier(
-            input_dim=input_dim,
-            num_classes=num_classes,
-            hidden_dims=DEEP_MLP_HIDDEN_DIMS,
-        )
-    raise ValueError(f"未知模型: {model_name!r}")
-
-
-def epochs_for_model(model_name: str) -> int:
-    if model_name == "linear":
-        return LINEAR_EPOCHS
-    if model_name == "mlp":
-        return MLP_EPOCHS
-    if model_name == "deep-mlp":
-        return DEEP_MLP_EPOCHS
-    raise ValueError(f"未知模型: {model_name!r}")
-
-
-def _to_dense_float32(matrix_slice) -> np.ndarray:
-    if sparse.issparse(matrix_slice):
-        array = matrix_slice.toarray()
-    else:
-        array = np.asarray(matrix_slice)
-    return np.asarray(array, dtype=np.float32)
-
-
-def _materialize_dense_matrix(
-    matrix,
-    *,
-    n_obs: int,
-    n_vars: int,
-    batch_size: int,
-    desc: str,
-) -> np.ndarray:
-    dense = np.empty((n_obs, n_vars), dtype=np.float32)
-    for start in tqdm(range(0, n_obs, batch_size), desc=desc, unit="batch"):
-        end = min(start + batch_size, n_obs)
-        batch_idx = np.arange(start, end, dtype=np.int64)
-        dense[start:end] = _to_dense_float32(matrix[batch_idx])
-    return dense
-
-
-def precompute_feature_cache(
-    adata: ad.AnnData,
-    totals: np.ndarray,
-    normalize_target: float,
-    representations: list[str],
-    *,
-    batch_size: int,
-    cache_dense_representations: bool,
-) -> FeatureCache:
-    need_raw_umi = any(
-        name in {"raw_umi", "raw_umi_plus_total"} for name in representations
-    )
-    need_log1p = any(
-        name in {"log1p_normalized", "log1p_normalized_plus_total"}
-        for name in representations
-    )
-    need_signal = any(
-        name
-        in {
-            "signal",
-            "signal_plus_total",
-            "signal_x_confidence",
-            "signal_x_confidence_plus_total",
-            "signal_confidence_concat",
-            "signal_confidence_concat_plus_total",
-            "signal_confidence_thresholded",
-        }
-        for name in representations
-    )
-    need_confidence = any(
-        name
-        in {
-            "signal_x_confidence",
-            "signal_x_confidence_plus_total",
-            "signal_confidence_concat",
-            "signal_confidence_concat_plus_total",
-            "signal_confidence_thresholded",
-        }
-        for name in representations
-    )
-    need_conf_threshold = "signal_confidence_thresholded" in representations
-    confidence_threshold: float | None = None
-    raw_umi: np.ndarray | None = None
-    signal: np.ndarray | None = None
-    confidence: np.ndarray | None = None
-
-    if need_confidence and cache_dense_representations:
-        confidence = np.asarray(adata.layers["confidence"], dtype=np.float32)
-        confidence = np.nan_to_num(confidence, copy=False)
-    if need_conf_threshold:
-        confidence_for_threshold = confidence
-        if confidence_for_threshold is None:
-            confidence_for_threshold = np.asarray(
-                adata.layers["confidence"], dtype=np.float32
-            )
-            confidence_for_threshold = np.nan_to_num(
-                confidence_for_threshold, copy=False
-            )
-        confidence_threshold = float(
-            np.quantile(
-                confidence_for_threshold.reshape(-1), CONFIDENCE_ZERO_THRESHOLD_QUANTILE
-            )
-        )
-
-    matrix = adata.X
-    if (need_raw_umi or need_log1p) and matrix is None:
-        raise ValueError("输入 h5ad 的 X 为空，无法预计算 log1p_normalized")
-
-    if need_raw_umi and cache_dense_representations:
-        raw_umi = _materialize_dense_matrix(
-            matrix,
-            n_obs=int(adata.n_obs),
-            n_vars=int(adata.n_vars),
-            batch_size=batch_size,
-            desc="precompute raw_umi",
-        )
-
-    if need_signal and cache_dense_representations:
-        signal = np.asarray(adata.layers[SIGNAL_LAYER], dtype=np.float32)
-        signal = np.nan_to_num(signal, copy=False)
-
-    if not need_log1p:
-        return FeatureCache(
-            raw_umi=raw_umi,
-            signal=signal,
-            confidence=confidence,
-            confidence_threshold=confidence_threshold,
-        )
-
-    log1p_matrix = np.empty((int(adata.n_obs), int(adata.n_vars)), dtype=np.float32)
-    batches = range(0, int(adata.n_obs), batch_size)
-    for start in tqdm(batches, desc="precompute log1p_normalized", unit="batch"):
-        end = min(start + batch_size, int(adata.n_obs))
-        batch_idx = np.arange(start, end, dtype=np.int64)
-        if raw_umi is not None:
-            counts = raw_umi[start:end]
-        else:
-            counts = _to_dense_float32(matrix[batch_idx])
-        features = log1p_normalize_total(
-            counts,
-            totals[batch_idx],
-            target=normalize_target,
-        )
-        log1p_matrix[start:end] = np.asarray(features, dtype=np.float32)
-
-    return FeatureCache(
-        raw_umi=raw_umi,
-        log1p_normalized=log1p_matrix,
-        signal=signal,
-        confidence=confidence,
-        confidence_threshold=confidence_threshold,
+    return DeepMLPClassifier(
+        input_dim=in_dim, num_classes=n_classes, hidden_dims=deep_hidden_dims
     )
 
 
-def get_features(
-    adata: ad.AnnData,
-    representation: str,
-    batch_idx: np.ndarray,
-    totals: np.ndarray,
-    *,
-    feature_cache: FeatureCache,
-    normalize_target: float,
-) -> np.ndarray:
-    if representation == "raw_umi":
-        if feature_cache.raw_umi is not None:
-            return feature_cache.raw_umi[batch_idx]
-        matrix = adata.X
-        if matrix is None:
-            raise ValueError("输入 h5ad 的 X 为空，无法提取 raw_umi")
-        return _to_dense_float32(matrix[batch_idx])
-    if representation == "raw_umi_plus_total":
-        if feature_cache.raw_umi is not None:
-            features = feature_cache.raw_umi[batch_idx]
-        else:
-            matrix = adata.X
-            if matrix is None:
-                raise ValueError("输入 h5ad 的 X 为空，无法提取 raw_umi_plus_total")
-            features = _to_dense_float32(matrix[batch_idx])
-        total_feature = totals[batch_idx].astype(np.float32, copy=False)[:, None]
-        return np.concatenate([features, total_feature], axis=1)
-    if representation == "log1p_normalized":
-        if feature_cache.log1p_normalized is None:
-            raise ValueError("缺少预计算的 log1p_normalized 特征缓存")
-        return feature_cache.log1p_normalized[batch_idx]
-    if representation == "log1p_normalized_plus_total":
-        if feature_cache.log1p_normalized is None:
-            raise ValueError("缺少预计算的 log1p_normalized 特征缓存")
-        features = feature_cache.log1p_normalized[batch_idx]
-        total_feature = totals[batch_idx].astype(np.float32, copy=False)[:, None]
-        return np.concatenate(
-            [np.asarray(features, dtype=np.float32), total_feature], axis=1
-        )
-    if representation == "signal":
-        if feature_cache.signal is not None:
-            features = feature_cache.signal[batch_idx]
-        else:
-            features = _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        return np.nan_to_num(features, copy=False)
-    if representation == "signal_plus_total":
-        if feature_cache.signal is not None:
-            features = feature_cache.signal[batch_idx]
-        else:
-            features = _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        total_feature = totals[batch_idx].astype(np.float32, copy=False)[:, None]
-        return np.concatenate(
-            [np.nan_to_num(features, copy=False), total_feature], axis=1
-        )
-    if representation == "signal_x_confidence":
-        signal = (
-            feature_cache.signal[batch_idx]
-            if feature_cache.signal is not None
-            else _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        )
-        confidence = (
-            feature_cache.confidence[batch_idx]
-            if feature_cache.confidence is not None
-            else _to_dense_float32(adata.layers["confidence"][batch_idx])
-        )
-        features = np.nan_to_num(signal, copy=False) * np.nan_to_num(
-            confidence, copy=False
-        )
-        return np.asarray(features, dtype=np.float32)
-    if representation == "signal_x_confidence_plus_total":
-        signal = (
-            feature_cache.signal[batch_idx]
-            if feature_cache.signal is not None
-            else _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        )
-        confidence = (
-            feature_cache.confidence[batch_idx]
-            if feature_cache.confidence is not None
-            else _to_dense_float32(adata.layers["confidence"][batch_idx])
-        )
-        features = np.nan_to_num(signal, copy=False) * np.nan_to_num(
-            confidence, copy=False
-        )
-        total_feature = totals[batch_idx].astype(np.float32, copy=False)[:, None]
-        return np.concatenate(
-            [np.asarray(features, dtype=np.float32), total_feature], axis=1
-        )
-    if representation == "signal_confidence_concat":
-        signal = (
-            feature_cache.signal[batch_idx]
-            if feature_cache.signal is not None
-            else _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        )
-        confidence = (
-            feature_cache.confidence[batch_idx]
-            if feature_cache.confidence is not None
-            else _to_dense_float32(adata.layers["confidence"][batch_idx])
-        )
-        return np.concatenate(
-            [np.nan_to_num(signal, copy=False), np.nan_to_num(confidence, copy=False)],
-            axis=1,
-        ).astype(np.float32, copy=False)
-    if representation == "signal_confidence_concat_plus_total":
-        signal = (
-            feature_cache.signal[batch_idx]
-            if feature_cache.signal is not None
-            else _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        )
-        confidence = (
-            feature_cache.confidence[batch_idx]
-            if feature_cache.confidence is not None
-            else _to_dense_float32(adata.layers["confidence"][batch_idx])
-        )
-        features = np.concatenate(
-            [np.nan_to_num(signal, copy=False), np.nan_to_num(confidence, copy=False)],
-            axis=1,
-        ).astype(np.float32, copy=False)
-        total_feature = totals[batch_idx].astype(np.float32, copy=False)[:, None]
-        return np.concatenate([features, total_feature], axis=1)
-    if representation == "signal_confidence_thresholded":
-        if feature_cache.confidence_threshold is None:
-            raise ValueError("缺少 confidence threshold 缓存")
-        signal = (
-            feature_cache.signal[batch_idx]
-            if feature_cache.signal is not None
-            else _to_dense_float32(adata.layers[SIGNAL_LAYER][batch_idx])
-        )
-        confidence = (
-            feature_cache.confidence[batch_idx]
-            if feature_cache.confidence is not None
-            else _to_dense_float32(adata.layers["confidence"][batch_idx])
-        )
-        signal = np.nan_to_num(signal, copy=False)
-        confidence = np.nan_to_num(confidence, copy=False)
-        signal[confidence < feature_cache.confidence_threshold] = 0.0
-        return signal.astype(np.float32, copy=False)
-    raise ValueError(f"未知表示: {representation!r}")
+# ---------------------------------------------------------------------------
+# Train / eval
+# ---------------------------------------------------------------------------
 
 
-def feature_dim(adata: ad.AnnData, representation: str) -> int:
-    base_dim = int(adata.n_vars)
-    if representation in {
-        "raw_umi",
-        "log1p_normalized",
-        "signal",
-        "signal_x_confidence",
-        "signal_confidence_thresholded",
-    }:
-        return base_dim
-    if representation in {
-        "raw_umi_plus_total",
-        "log1p_normalized_plus_total",
-        "signal_plus_total",
-        "signal_x_confidence_plus_total",
-    }:
-        return base_dim + 1
-    if representation == "signal_confidence_concat":
-        return base_dim * 2
-    if representation == "signal_confidence_concat_plus_total":
-        return base_dim * 2 + 1
-    raise ValueError(f"未知表示: {representation!r}")
-
-
-def iter_batches(
-    indices: np.ndarray, batch_size: int, *, shuffle: bool
-) -> Iterator[np.ndarray]:
-    order = indices.copy()
+def batches(idx: np.ndarray, bs: int, shuffle: bool):
+    order = idx.copy()
     if shuffle:
         np.random.shuffle(order)
-    for start in range(0, len(order), batch_size):
-        yield order[start : start + batch_size]
+    for i in range(0, len(order), bs):
+        yield order[i : i + bs]
 
 
 @torch.inference_mode()
-def evaluate_model(
-    *,
-    model: torch.nn.Module,
-    adata: ad.AnnData,
-    representation: str,
-    indices: np.ndarray,
-    labels: np.ndarray,
-    totals: np.ndarray,
-    feature_cache: FeatureCache,
-    normalize_target: float,
-    device: torch.device,
-    desc: str,
-    eval_batch_size: int,
-) -> tuple[float, np.ndarray, np.ndarray]:
+def evaluate(model, X, y, idx, device, bs=1024):
     model.eval()
-    y_true: list[np.ndarray] = []
-    y_pred: list[np.ndarray] = []
-    losses: list[float] = []
-    loss_fn = torch.nn.CrossEntropyLoss()
-    for batch_idx in tqdm(
-        iter_batches(indices, eval_batch_size, shuffle=False),
-        desc=desc,
-        leave=False,
-    ):
-        features = get_features(
-            adata,
-            representation,
-            batch_idx,
-            totals,
-            feature_cache=feature_cache,
-            normalize_target=normalize_target,
-        )
-        x = torch.from_numpy(features).to(device)
-        y = torch.from_numpy(labels[batch_idx]).to(device)
-        logits = model(x)
-        loss = loss_fn(logits, y)
-        pred = torch.argmax(logits, dim=1)
-        losses.append(float(loss.item()))
-        y_true.append(y.cpu().numpy())
-        y_pred.append(pred.cpu().numpy())
-    return (
-        float(np.mean(losses)) if losses else math.nan,
-        np.concatenate(y_true, axis=0),
-        np.concatenate(y_pred, axis=0),
-    )
+    preds = []
+    for batch in batches(idx, bs, shuffle=False):
+        x = torch.from_numpy(X[batch]).to(device)
+        preds.append(torch.argmax(model(x), 1).cpu().numpy())
+    pred = np.concatenate(preds)
+    true = y[idx]
+    return accuracy_score(true, pred), f1_score(true, pred, average="macro")
 
 
-def summarize_metrics(
-    name: str, y_true: np.ndarray, y_pred: np.ndarray
-) -> RepresentationResult:
-    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="macro"
-    )
-    precision_weighted, recall_weighted, f1_weighted, _ = (
-        precision_recall_fscore_support(y_true, y_pred, average="weighted")
-    )
-    return RepresentationResult(
-        name=name,
-        accuracy=float(accuracy_score(y_true, y_pred)),
-        precision_macro=float(precision_macro),
-        recall_macro=float(recall_macro),
-        f1_macro=float(f1_macro),
-        precision_weighted=float(precision_weighted),
-        recall_weighted=float(recall_weighted),
-        f1_weighted=float(f1_weighted),
-    )
-
-
-def train_representation(
+def train(
+    model,
+    X,
+    y,
+    train_idx,
+    val_idx,
+    device,
+    model_name,
     *,
-    adata: ad.AnnData,
-    representation: str,
-    model_name: str,
-    labels: np.ndarray,
-    totals: np.ndarray,
-    feature_cache: FeatureCache,
-    splits: SplitIndices,
-    num_classes: int,
-    device: torch.device,
-    run_cfg: RunConfig,
-) -> RepresentationResult:
-    input_dim = feature_dim(adata, representation)
-    epochs = epochs_for_model(model_name)
-    normalize_target = float(np.median(totals[splits.train]))
-    model = make_model(model_name, input_dim=input_dim, num_classes=num_classes).to(
-        device
-    )
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
+    batch_size: int,
+    learning_rate: float,
+    weight_decay: float,
+    epochs_override: int | None,
+    eval_batch_size: int,
+):
+    model.to(device)
+    opt = torch.optim.AdamW(
+        model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
     loss_fn = torch.nn.CrossEntropyLoss()
-    best_state = copy.deepcopy(model.state_dict())
-    best_val_acc = -1.0
+    epochs = EPOCHS[model_name] if epochs_override is None else int(epochs_override)
+    best_acc, best_state = 0.0, copy.deepcopy(model.state_dict())
 
-    train_batches_per_epoch = max(
-        math.ceil(len(splits.train) / run_cfg.train_batch_size), 1
-    )
-    total_train_steps = epochs * train_batches_per_epoch
-    step_bar = tqdm(
-        total=total_train_steps,
-        desc=f"train {representation}",
-        leave=True,
-        unit="step",
-    )
-    for epoch in range(epochs):
-        model.train()
-        batch_losses: list[float] = []
-        batch_correct = 0
-        batch_seen = 0
-        for step_in_epoch, batch_idx in enumerate(
-            iter_batches(splits.train, run_cfg.train_batch_size, shuffle=True),
-            start=1,
-        ):
-            features = get_features(
-                adata,
-                representation,
-                batch_idx,
-                totals,
-                feature_cache=feature_cache,
-                normalize_target=normalize_target,
-            )
-            x = torch.from_numpy(features).to(device, non_blocking=True)
-            y = torch.from_numpy(labels[batch_idx]).to(device, non_blocking=True)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("training", total=epochs)
+        for epoch in range(epochs):
+            model.train()
+            for batch in batches(train_idx, batch_size, shuffle=True):
+                x = torch.from_numpy(X[batch]).to(device)
+                t = torch.from_numpy(y[batch]).to(device)
+                opt.zero_grad(set_to_none=True)
+                loss_fn(model(x), t).backward()
+                opt.step()
 
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = loss_fn(logits, y)
-            loss.backward()
-            optimizer.step()
-
-            pred = torch.argmax(logits, dim=1)
-            batch_losses.append(float(loss.item()))
-            batch_correct += int((pred == y).sum().item())
-            batch_seen += int(y.shape[0])
-            step_bar.update(1)
-            step_bar.set_postfix(
-                epoch=f"{epoch + 1}/{epochs}",
-                step=f"{step_in_epoch}/{train_batches_per_epoch}",
-                loss=f"{loss.item():.4f}",
-            )
-
-        train_loss = float(np.mean(batch_losses)) if batch_losses else math.nan
-        train_acc = float(batch_correct / max(batch_seen, 1))
-        should_eval = (epoch + 1) % run_cfg.eval_every == 0 or epoch + 1 == epochs
-        if should_eval:
-            _, val_true, val_pred = evaluate_model(
-                model=model,
-                adata=adata,
-                representation=representation,
-                indices=splits.val,
-                labels=labels,
-                totals=totals,
-                feature_cache=feature_cache,
-                normalize_target=normalize_target,
-                device=device,
-                desc=f"val {representation}",
-                eval_batch_size=run_cfg.eval_batch_size,
-            )
-            val_acc = float(accuracy_score(val_true, val_pred))
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            val_acc, val_f1 = evaluate(model, X, y, val_idx, device, bs=eval_batch_size)
+            if val_acc > best_acc:
+                best_acc = val_acc
                 best_state = copy.deepcopy(model.state_dict())
-            step_bar.set_postfix(
-                epoch=f"{epoch + 1}/{epochs}",
-                train_loss=f"{train_loss:.4f}",
-                train_acc=f"{train_acc:.4f}",
-                val_acc=f"{val_acc:.4f}",
-                best_val=f"{best_val_acc:.4f}",
+            progress.update(
+                task_id,
+                advance=1,
+                description=(
+                    f"training epoch {epoch + 1}/{epochs} "
+                    f"val_acc={val_acc:.4f} best={best_acc:.4f} val_f1={val_f1:.4f}"
+                ),
             )
-        else:
-            step_bar.set_postfix(
-                epoch=f"{epoch + 1}/{epochs}",
-                train_loss=f"{train_loss:.4f}",
-                train_acc=f"{train_acc:.4f}",
-                best_val=f"{best_val_acc:.4f}" if best_val_acc >= 0 else "-",
-            )
-
-    step_bar.close()
 
     model.load_state_dict(best_state)
-    _, test_true, test_pred = evaluate_model(
-        model=model,
-        adata=adata,
-        representation=representation,
-        indices=splits.test,
-        labels=labels,
-        totals=totals,
-        feature_cache=feature_cache,
-        normalize_target=normalize_target,
-        device=device,
-        desc=f"test {representation}",
-        eval_batch_size=run_cfg.eval_batch_size,
+    return model
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Train baseline classifiers on AnnData features."
     )
-    return summarize_metrics(representation, test_true, test_pred)
-
-
-def print_dataset_summary(
-    *,
-    adata: ad.AnnData,
-    labels: np.ndarray,
-    class_names: list[str],
-    splits: SplitIndices,
-    model_name: str,
-    device: torch.device,
-    gene_list_spec: GeneListSpec | None,
-    label_filter_spec: LabelFilterSpec | None,
-    representations: list[str],
-    run_cfg: RunConfig,
-    label_column: str,
-    batch_key: str,
-) -> None:
-    unique, counts = np.unique(labels, return_counts=True)
-    print("=" * 80)
-    print(f"Dataset: {adata.n_obs} cells x {adata.n_vars} genes")
-    print(
-        f"Gene subset: {gene_list_spec.top_k if gene_list_spec is not None else 'all'}"
+    p.add_argument("h5ad", type=Path)
+    p.add_argument("--model", choices=("linear", "mlp", "deep-mlp"), required=True)
+    p.add_argument("--layer", dest="layers", action="append", default=[])
+    p.add_argument("--normalize-total", type=float, default=None)
+    p.add_argument("--log1p", action="store_true")
+    p.add_argument(
+        "--align-avg",
+        action="store_true",
+        help="Scale each class so per-gene means match the largest class after preprocessing.",
     )
-    if label_filter_spec is None:
-        print("Label filter: all labels")
-    else:
-        print(
-            f"Label filter: top-{label_filter_spec.top_k} labels by count ({label_filter_spec.filtered_n_obs}/{label_filter_spec.original_n_obs} cells kept)"
-        )
-    print(f"Model: {model_name}")
-    print(f"Device: {device}")
-    print(f"Representations: {', '.join(representations)}")
-    print(f"Label column: {label_column}")
-    print(f"Signal layer: {SIGNAL_LAYER} (present={SIGNAL_LAYER in adata.layers})")
-    print(
-        f"Confidence layer: {CONFIDENCE_LAYER} (present={CONFIDENCE_LAYER in adata.layers})"
+    p.add_argument(
+        "--align-avg-eps",
+        type=float,
+        default=1e-6,
+        help="Numerical floor used in align-avg scaling.",
     )
-    print(
-        f"Batch sizes: train={run_cfg.train_batch_size} eval={run_cfg.eval_batch_size} precompute={run_cfg.precompute_batch_size}"
+    p.add_argument(
+        "--align-avg-min-scale",
+        type=float,
+        default=0.1,
+        help="Lower bound for per-gene class scaling in align-avg.",
     )
-    print(f"Eval every: {run_cfg.eval_every} epoch(s)")
-    print(f"Cache dense representations: {run_cfg.cache_dense_representations}")
-    print(f"Split mode: {splits.split_mode}")
-    if splits.split_mode == "batch":
-        print(f"Batch key: {batch_key}")
-        print(
-            f"Split batches: train={len(splits.train_batch_values)} val={len(splits.val_batch_values)} test={len(splits.test_batch_values)}"
-        )
-        print(f"  train batches: {', '.join(splits.train_batch_values)}")
-        print(f"  val batches  : {', '.join(splits.val_batch_values)}")
-        print(f"  test batches : {', '.join(splits.test_batch_values)}")
-    print(
-        f"Split sizes: train={splits.train.size} val={splits.val.size} test={splits.test.size}"
+    p.add_argument(
+        "--align-avg-max-scale",
+        type=float,
+        default=10.0,
+        help="Upper bound for per-gene class scaling in align-avg.",
     )
-    print("Classes:")
-    for cls_idx, count in zip(unique, counts, strict=False):
-        print(f"  {cls_idx:>2d} | {class_names[int(cls_idx)]:<20} | n={int(count)}")
-    print("=" * 80)
+    p.add_argument(
+        "--append-obs-key", dest="append_obs_keys", action="append", default=[]
+    )
+    p.add_argument("--label-column", default="treatment")
+    p.add_argument(
+        "--gene-list",
+        type=Path,
+        default=None,
+        help="Optional gene list text file or gene-list JSON with gene_names.",
+    )
+    p.add_argument("--device", default="auto")
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--train-fraction", type=float, default=0.8)
+    p.add_argument("--val-fraction", type=float, default=0.1)
+    p.add_argument("--test-fraction", type=float, default=0.1)
+    p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--weight-decay", type=float, default=WD)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--eval-batch-size", type=int, default=1024)
+    p.add_argument("--mlp-hidden-dim", type=int, default=HIDDEN["mlp"][0])
+    p.add_argument(
+        "--deep-hidden-dims",
+        type=int,
+        nargs="+",
+        default=list(HIDDEN["deep-mlp"]),
+    )
+    return p.parse_args()
 
 
-def print_result(result: RepresentationResult) -> None:
-    print(f"\n[{result.name}]")
-    print(f"  accuracy          : {result.accuracy:.4f}")
-    print(f"  precision_macro   : {result.precision_macro:.4f}")
-    print(f"  recall_macro      : {result.recall_macro:.4f}")
-    print(f"  f1_macro          : {result.f1_macro:.4f}")
-    print(f"  precision_weighted: {result.precision_weighted:.4f}")
-    print(f"  recall_weighted   : {result.recall_weighted:.4f}")
-    print(f"  f1_weighted       : {result.f1_weighted:.4f}")
-
-
-def main() -> None:
+def main():
+    start_time = perf_counter()
     args = parse_args()
-    if args.train_batch_size < 1:
-        raise ValueError("--train-batch-size 必须 >= 1")
-    if args.eval_batch_size < 1:
-        raise ValueError("--eval-batch-size 必须 >= 1")
-    if args.precompute_batch_size < 1:
-        raise ValueError("--precompute-batch-size 必须 >= 1")
-    if args.eval_every < 1:
-        raise ValueError("--eval-every 必须 >= 1")
+    split_sum = args.train_fraction + args.val_fraction + args.test_fraction
+    if min(args.train_fraction, args.val_fraction, args.test_fraction) <= 0:
+        raise ValueError("split fractions must all be positive")
+    if not np.isclose(split_sum, 1.0):
+        raise ValueError("train/val/test fractions must sum to 1")
+    if args.lr <= 0:
+        raise ValueError("--lr must be positive")
+    if args.weight_decay < 0:
+        raise ValueError("--weight-decay must be non-negative")
+    if args.batch_size < 1 or args.eval_batch_size < 1:
+        raise ValueError("batch sizes must be positive")
+    if args.align_avg_eps <= 0:
+        raise ValueError("--align-avg-eps must be positive")
+    if args.align_avg_min_scale <= 0 or args.align_avg_max_scale <= 0:
+        raise ValueError("align-avg scale bounds must be positive")
+    if args.align_avg_min_scale > args.align_avg_max_scale:
+        raise ValueError("--align-avg-min-scale must be <= --align-avg-max-scale")
+    if args.epochs is not None and args.epochs < 1:
+        raise ValueError("--epochs must be positive when provided")
+    if args.mlp_hidden_dim < 1 or any(dim < 1 for dim in args.deep_hidden_dims):
+        raise ValueError("hidden dimensions must be positive")
 
-    run_cfg = RunConfig(
-        train_batch_size=int(args.train_batch_size),
-        eval_batch_size=int(args.eval_batch_size),
-        precompute_batch_size=int(args.precompute_batch_size),
-        eval_every=int(args.eval_every),
-        cache_dense_representations=bool(args.cache_dense_representations),
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    device = torch.device(
+        "cuda"
+        if (args.device == "auto" and torch.cuda.is_available())
+        else ("cpu" if args.device == "auto" else args.device)
     )
-    set_seed(RANDOM_SEED)
-    adata_full = read_adata(args.h5ad_path.expanduser().resolve())
-    representations = resolve_representations(adata_full, args.representations)
-    if not representations:
-        raise ValueError("当前 h5ad 不支持任何被启用的表示，请显式指定可用表示")
-    adata_labels, label_filter_spec = maybe_subset_top_labels(
-        adata_full,
-        label_column=args.label_column,
-        label_top_k=args.label_top_k,
+
+    intro = Table(show_header=False, box=None)
+    intro.add_row("Input", str(args.h5ad.expanduser().resolve()))
+    intro.add_row("Model", args.model)
+    intro.add_row("Label column", args.label_column)
+    intro.add_row("Layers", ", ".join(args.layers) if args.layers else "X")
+    intro.add_row(
+        "Gene list",
+        str(args.gene_list.expanduser().resolve()) if args.gene_list else "None",
     )
-    totals = compute_totals(adata_labels)
-    adata, gene_list_spec = maybe_subset_gene_list(adata_labels, args.gene_list_json)
-    labels, class_names = encode_labels(adata, args.label_column)
-    if args.split_mode == "batch":
-        batch_values = get_batch_values(adata, args.batch_key)
-        splits = build_batch_splits(
-            labels=labels,
-            class_names=class_names,
-            batch_values=batch_values,
-            val_batches=_parse_batch_selection(args.val_batches),
-            test_batches=_parse_batch_selection(args.test_batches),
+    intro.add_row("Align avg", str(bool(args.align_avg)))
+    intro.add_row("Device", str(device))
+    intro.add_row("Seed", str(args.seed))
+    console.print(Panel(intro, title="Train Baseline", border_style="cyan"))
+
+    with console.status("Loading AnnData and preparing labels..."):
+        adata = load(args.h5ad, args.label_column, args.gene_list)
+    labels, classes = (
+        lambda s: (s.cat.codes.to_numpy(np.int64), s.cat.categories.tolist())
+    )(adata.obs[args.label_column].astype("category"))
+    class_lookup = {idx: name for idx, name in enumerate(classes)}
+
+    with console.status("Building feature matrix and train/val/test split..."):
+        X, align_info = build_features(adata, args, labels)
+        train_idx, val_idx, test_idx = split(
+            labels,
+            seed=args.seed,
+            train_fraction=args.train_fraction,
+            val_fraction=args.val_fraction,
+            test_fraction=args.test_fraction,
         )
-    else:
-        splits = build_splits(labels)
-    device = resolve_device(args.device)
-    normalize_target = float(np.median(totals[splits.train]))
+    name = rep_name(args)
 
-    print_dataset_summary(
-        adata=adata,
-        labels=labels,
-        class_names=class_names,
-        splits=splits,
-        model_name=args.model,
-        device=device,
-        gene_list_spec=gene_list_spec,
-        label_filter_spec=label_filter_spec,
-        representations=representations,
-        run_cfg=run_cfg,
-        label_column=args.label_column,
-        batch_key=args.batch_key,
-    )
-
-    results: list[RepresentationResult] = []
-    feature_cache = precompute_feature_cache(
-        adata,
-        totals,
-        normalize_target,
-        representations,
-        batch_size=run_cfg.precompute_batch_size,
-        cache_dense_representations=run_cfg.cache_dense_representations,
-    )
-
-    for representation in representations:
-        print(f"\n>>> Training {args.model} on {representation}")
-        result = train_representation(
-            adata=adata,
-            representation=representation,
-            model_name=args.model,
-            labels=labels,
-            totals=totals,
-            feature_cache=feature_cache,
-            splits=splits,
-            num_classes=len(class_names),
-            device=device,
-            run_cfg=run_cfg,
+    data_summary = Table(title="Dataset Summary")
+    data_summary.add_column("Field")
+    data_summary.add_column("Value", overflow="fold")
+    data_summary.add_row("Cells", str(adata.n_obs))
+    data_summary.add_row("Genes", str(adata.n_vars))
+    data_summary.add_row("Classes", str(len(classes)))
+    data_summary.add_row("Representation", name)
+    data_summary.add_row("Feature dim", str(X.shape[1]))
+    if align_info is not None:
+        data_summary.add_row(
+            "Align avg ref class",
+            f"{class_lookup[align_info['reference_label']]} ({align_info['reference_size']})",
         )
-        results.append(result)
-        print_result(result)
+        data_summary.add_row(
+            "Align avg scale range",
+            f"{align_info['scale_min']:.4g} - {align_info['scale_max']:.4g}",
+        )
+        data_summary.add_row(
+            "Align avg scale bounds",
+            f"{align_info['min_scale']:.4g} - {align_info['max_scale']:.4g}",
+        )
+        data_summary.add_row(
+            "Aligned expr dims",
+            str(align_info["expr_dim"]),
+        )
+    data_summary.add_row(
+        "Split sizes",
+        f"train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}",
+    )
+    data_summary.add_row(
+        "Split fractions",
+        f"train={args.train_fraction:.2f} val={args.val_fraction:.2f} test={args.test_fraction:.2f}",
+    )
+    data_summary.add_row("LR / WD", f"{args.lr:g} / {args.weight_decay:g}")
+    data_summary.add_row("Batch size", str(args.batch_size))
+    data_summary.add_row("Eval batch size", str(args.eval_batch_size))
+    data_summary.add_row(
+        "Epochs",
+        str(EPOCHS[args.model] if args.epochs is None else args.epochs),
+    )
+    console.print(data_summary)
 
-    print("\n" + "=" * 80)
-    print("Final Summary")
-    print("=" * 80)
-    for result in results:
-        print_result(result)
+    model = make_model(
+        args.model,
+        X.shape[1],
+        len(classes),
+        mlp_hidden_dim=args.mlp_hidden_dim,
+        deep_hidden_dims=tuple(args.deep_hidden_dims),
+    )
+    model = train(
+        model,
+        X,
+        labels,
+        train_idx,
+        val_idx,
+        device,
+        args.model,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
+        epochs_override=args.epochs,
+        eval_batch_size=args.eval_batch_size,
+    )
+
+    acc, f1 = evaluate(model, X, labels, test_idx, device, bs=args.eval_batch_size)
+    summary = Table(title="Training Summary")
+    summary.add_column("Metric")
+    summary.add_column("Value")
+    summary.add_row("Test accuracy", f"{acc:.4f}")
+    summary.add_row("Test macro F1", f"{f1:.4f}")
+    summary.add_row("Elapsed", f"{perf_counter() - start_time:.2f}s")
+    console.print(summary)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        console.print(
+            Panel(str(exc), title="train_baseline failed", border_style="red")
+        )
+        raise SystemExit(1) from exc

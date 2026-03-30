@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import comb
 from pathlib import Path
 from typing import cast
 
@@ -155,3 +156,25 @@ def print_extract_summary(
     console.print(table)
     console.print(f"[bold green]Saved[/bold green] {output_path}")
     console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+
+
+def resolve_class_groups(adata: ad.AnnData, class_key: str) -> dict[str, np.ndarray]:
+    if class_key not in adata.obs.columns:
+        raise KeyError(f"obs column {class_key!r} does not exist")
+    labels = np.asarray(adata.obs[class_key].astype(str)).reshape(-1)
+    groups: dict[str, np.ndarray] = {}
+    for label in sorted(np.unique(labels).tolist()):
+        groups[label] = np.flatnonzero(labels == label).astype(np.int64)
+    return groups
+
+
+def strict_label_prior_names(checkpoint) -> set[str]:
+    return set(str(label) for label in checkpoint.label_priors)
+
+
+def n_choose_k(n: int, k: int) -> int:
+    if k < 0 or n < 0:
+        raise ValueError("n and k must be non-negative")
+    if k > n:
+        return 0
+    return int(comb(n, k))

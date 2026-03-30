@@ -8,6 +8,8 @@ from prism.model import load_checkpoint
 
 from .common import (
     console,
+    curve_sets_to_dataframe,
+    load_annotation_tables,
     load_gene_list_file,
     plot_fg_facet_figure,
     plot_fg_figure,
@@ -38,6 +40,23 @@ def plot_fg_command(
         help="Number of leading genes to use with --gene-list.",
     ),
     output_path: Path = typer.Option(..., "--output", "-o", help="Output figure path."),
+    output_csv_path: Path | None = typer.Option(
+        None,
+        "--output-csv",
+        help="Optional CSV path for exported curve coordinates and weights.",
+    ),
+    annot_csv_paths: list[Path] | None = typer.Option(
+        None,
+        "--annot-csv",
+        exists=True,
+        dir_okay=False,
+        help="Optional repeatable CSV files with columns gene,label,... for subplot annotations.",
+    ),
+    annot_names: list[str] | None = typer.Option(
+        None,
+        "--annot-name",
+        help="Optional repeatable names for annotation CSVs, aligned with --annot-csv.",
+    ),
     labels: list[str] | None = typer.Option(
         None,
         "--label",
@@ -59,6 +78,11 @@ def plot_fg_command(
         "overlay",
         help="Plot layout: overlay or facet. Gene-list mode defaults to facet.",
     ),
+    show_subplot_labels: bool = typer.Option(
+        False,
+        "--show-subplot-labels/--no-show-subplot-labels",
+        help="Render gene/source labels inside every subplot.",
+    ),
 ) -> int:
     if gene_list_path is not None and gene_names:
         raise ValueError("--gene and --gene-list are mutually exclusive")
@@ -73,6 +97,14 @@ def plot_fg_command(
         limit = len(all_genes) if top_n is None else min(top_n, len(all_genes))
         gene_names = all_genes[:limit]
         resolved_layout = "facet"
+    annotation_tables = None
+    if annot_csv_paths:
+        if resolved_layout != "facet":
+            raise ValueError("--annot-csv is only supported in facet layout")
+        annotation_tables = load_annotation_tables(
+            [path.expanduser().resolve() for path in annot_csv_paths],
+            None if not annot_names else annot_names,
+        )
 
     checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
     curve_sets = resolve_plot_curve_sets(
@@ -84,6 +116,8 @@ def plot_fg_command(
             curve_sets,
             x_axis=resolved_x_axis,
             mass_quantile=float(mass_quantile),
+            show_subplot_labels=show_subplot_labels,
+            annotation_tables=annotation_tables,
         )
         if resolved_layout == "facet"
         else plot_fg_figure(
@@ -97,6 +131,13 @@ def plot_fg_command(
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
     plt.close(fig)
     console.print(f"[bold green]Saved[/bold green] {output_path}")
+    if output_csv_path is not None:
+        output_csv_path = output_csv_path.expanduser().resolve()
+        output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        curve_sets_to_dataframe(curve_sets, x_axis=resolved_x_axis).to_csv(
+            output_csv_path, index=False
+        )
+        console.print(f"[bold green]Saved[/bold green] {output_csv_path}")
     return 0
 
 

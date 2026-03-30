@@ -18,3 +18,4 @@ outputs/
 .claude/
 .opencode/
 .ruff_cache/
+.agents/

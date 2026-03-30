@@ -284,3 +284,236 @@ $$\mathcal{L} = \lambda_{\mathrm{nll}}\mathcal{L}_{\mathrm{NLL}}+\lambda_{\mathr
 - 用离散分布表示单基因先验；
 - 用 Binomial 比例观测模型连接观测与潜变量；
 - 用“边际似然 + 后验生成分布自洽”共同约束 $F_g$。
+
+---
+
+## 3. 后验提取与 `prism extract signals` 接口
+
+本节不再沿用旧版文档中的 `Confidence / Surprisal / Sharpness` 术语体系，而是严格按照当前代码实现说明 `prism extract signals` 的实际输入、后验计算方式、导出通道和输出文件布局。这里讨论的是 `prism extract` 命令组中的 `signals` 子命令；同一命令组下的 `kbulk` 与 `kbulk-mean` 属于聚合接口，不在本节展开。
+
+### 3.1 命令边界与数据来源
+
+当前 CLI 入口为：
+
+```bash
+prism extract signals CHECKPOINT INPUT.h5ad --output OUTPUT.h5ad
+```
+
+其实现逻辑可概括为以下四步：
+
+1. 读取 checkpoint，获得：
+   - 已拟合基因集合 `checkpoint.gene_names`
+   - 全局先验 `checkpoint.priors` 或标签先验 `checkpoint.label_priors`
+   - 参考基因集合 `checkpoint.metadata["reference_gene_names"]`
+2. 读取输入 `h5ad`，从 `X` 或 `--layer` 指定矩阵中取观测计数。
+3. 用 checkpoint 中记录的参考基因集合在输入数据上重新计算每个细胞的参考总计数：
+
+$$N_c = \sum_{h \in \mathcal{G}^{\mathrm{ref}} \cap \mathcal{G}^{\mathrm{data}}} X_{hc}$$
+
+4. 对选定基因逐批执行后验提取，并将结果写回输出 `AnnData.layers`。
+
+这里有两个实现细节需要明确：
+
+- `prism extract signals` 的参考总计数并不是从“当前待提取基因”重新定义，而是始终由 checkpoint 中保存的 `reference_gene_names` 决定。
+- 如果 checkpoint 的参考基因与输入数据没有交集，命令会直接报错；如果只是部分重叠，则仅使用重叠部分重新计算 $N_c$。
+
+目标基因集合的选择规则同样是代码固定的：
+
+- 若未提供 `--genes`，默认尝试提取 `checkpoint.gene_names` 中所有同时存在于输入数据的基因；
+- 若提供 `--genes`，则在该文本文件、输入数据 `var_names`、以及 checkpoint 已拟合基因三者的交集中提取；
+- 若交集为空，命令报错而不是输出空文件。
+
+### 3.2 实际后验公式与有效 exposure
+
+当前实现并不直接把原始 $N_c$ 代入 Binomial likelihood，而是先构造有效 exposure：
+
+$$N_c^{\mathrm{eff}} = \frac{N_c}{\bar N} S, \qquad \bar N = \frac{1}{C}\sum_{c=1}^C N_c$$
+
+其中 $S$ 不是在提取时重新估计的，而是直接取自 checkpoint 内保存的 `PriorGrid.S`。因此，对给定基因 $g$ 的离散网格点 $p_{gj}$，代码真正计算的是
+
+$$\log \mathrm{lik}_{gcj} = \log \mathrm{Binomial}\!\left(X_{gc} \mid N_c^{\mathrm{eff}}, p_{gj}\right)$$
+
+对应的离散后验为
+
+$$p(p_{gj}\mid X_{gc}, N_c, \hat F_g) = \frac{\tilde w_{gj}\,\mathrm{Binomial}(X_{gc}\mid N_c^{\mathrm{eff}}, p_{gj})}{\sum_k \tilde w_{gk}\,\mathrm{Binomial}(X_{gc}\mid N_c^{\mathrm{eff}}, p_{gk})}$$
+
+若记 $\mu_{gj} = S p_{gj}$，则这与在 $\mu$ 轴上的后验完全等价，只是代码内部始终以 `p_grid` 为主、以 `mu_grid = S \cdot p_grid` 作为派生坐标。
+
+实现上还需要注意三件事：
+
+- `log_binomial_likelihood_grid()` 使用 `lgamma` 形式计算对数 Binomial 系数，因此 $N_c^{\mathrm{eff}}$ 不要求是整数，可以被解释为连续意义下的 effective sample size。
+- 旧版文档里提到“extract 阶段通常采用 cell chunking”，这已不符合当前实现。现在 `signals` 命令的外层分块单位是基因，参数名为 `--batch-size`，含义是“每批处理多少个基因”。
+- 当 `--prior-source label` 时，代码会在每个基因批次内部再按 `adata.obs[label_key]` 的标签对子细胞集分别运行后验提取；也就是说，当前工程分块是“gene batching + label-wise cell slicing”，而不是统一的 cell chunking。
+
+### 3.3 点估计与信息量
+
+当前 CLI 默认导出的不是旧版的 `Signal + Confidence + Surprisal (+ Sharpness)`，而是 `CORE_CHANNELS` 中定义的四个通道：
+
+- `signal`
+- `posterior_entropy`
+- `prior_entropy`
+- `mutual_information`
+
+此外，CLI 允许额外请求两个非默认通道：
+
+- `map_p`
+- `map_mu`
+
+因此，`prism extract signals` 当前总共只支持 6 个可写出通道。`posterior`、`support`、`prior_weights` 虽然在 Python API 中可获得，但并不属于 CLI 可选 `--channel` 的范围。
+
+下面按源码语义逐一说明。
+
+#### 3.3.1 `signal` / `map_mu`
+
+给定离散后验，代码首先取后验 MAP 索引：
+
+$$j_{gc}^{*} = \arg\max_j \; p(p_{gj}\mid X_{gc})$$
+
+然后定义
+
+$$\mathrm{map\_p}_{gc} = p_{g j_{gc}^{*}}, \qquad \mathrm{map\_mu}_{gc} = S \cdot \mathrm{map\_p}_{gc}$$
+
+其中 `signal` 在当前实现中只是 `map_mu` 的别名。也就是说：
+
+$$\mathrm{signal}_{gc} \equiv \mathrm{map\_mu}_{gc}$$
+
+这点在 `Posterior.extract()` 中是显式硬编码的，而不是近似关系。因此：
+
+- 若只请求 `signal`，输出的是 $\mu$ 轴上的 MAP 点估计；
+- 若同时请求 `signal` 和 `map_mu`，两层数据数值相同，只是名字不同；
+- 若需要比例空间上的 MAP，则应显式请求 `map_p`。
+
+`signal` 仍然是当前下游最直接的去噪主信号，但其精确定义是“$\mu$ 轴上的后验 MAP”，而不是更早文档中可能出现的 soft-argmax 或其他软决策形式。
+
+#### 3.3.2 `posterior_entropy`
+
+代码对每个细胞-基因对输出后验 Shannon 熵：
+
+$$H_{gc}^{\mathrm{post}} = -\sum_{j=1}^{M} p(p_{gj}\mid X_{gc}) \log p(p_{gj}\mid X_{gc})$$
+
+这对应实现中的 `posterior_entropy`。它的语义是：在看到当前观测之后，该细胞-基因对仍保留多少不确定性。
+
+与旧版 `Confidence` 的差别很重要：
+
+- `posterior_entropy` 越小，表示后验越集中、信息越确定；
+- 它的量纲是熵（自然对数底下为 nats），不是归一化到 $[0,1]$ 的分数；
+- 代码没有做 $\log M$ 归一化，因此不同网格大小、不同有效支持范围之间，数值解释应谨慎。
+
+如果下游仍想构造类似旧版 `Confidence` 的归一化指标，可以在导出后自行定义
+
+$$\mathrm{Conf}^{\mathrm{derived}}_{gc} = 1 - \frac{H_{gc}^{\mathrm{post}}}{\log M_g}$$
+
+但这只是从当前输出推导出的二次指标，不是源码中的内置通道。
+
+#### 3.3.3 `prior_entropy`
+
+对每个基因，代码还计算先验熵：
+
+$$H_g^{\mathrm{prior}} = -\sum_{j=1}^{M} \tilde w_{gj}\log \tilde w_{gj}$$
+
+在实现中，该值先按基因计算，再在所有细胞上广播，因此输出矩阵中的 `prior_entropy[:, g]` 对同一个 prior 来源是常数列。
+
+这里要区分两种情形：
+
+- 当 `--prior-source global` 时，同一基因在所有细胞上共享同一个先验，因此 `prior_entropy` 对该基因是全体细胞相同的常数。
+- 当 `--prior-source label` 时，不同标签使用不同的 label-specific prior，因此同一基因在不同标签细胞上可能呈现不同的 `prior_entropy` 常数块。
+
+`prior_entropy` 不是“某个细胞观测后得到的不确定性”，而是该基因群体先验本身的分散程度。
+
+#### 3.3.4 `mutual_information`
+
+当前代码中的 `mutual_information` 定义为
+
+$$\mathrm{MI}_{gc} = \max\!\left(H_g^{\mathrm{prior}} - H_{gc}^{\mathrm{post}},\; 0\right)$$
+
+它表达的是：给定当前观测 $(X_{gc}, N_c)$ 后，相对于先验不确定性，后验熵下降了多少。
+
+从语义上看，它更接近“单次观测带来的信息增益”或“熵减少量”：
+
+- 值越大，说明该观测对锁定潜在状态越有帮助；
+- 值越小，说明后验相对先验没有缩窄太多，当前观测提供的信息有限。
+
+严格地说，经典互信息通常是对观测分布再取期望后的总体量；而这里的实现是对每个具体观测实例直接计算 `prior_entropy - posterior_entropy`，再截断到非负。因此它是一个 observation-specific information gain 指标，名称沿用源码中的 `mutual_information`。
+
+#### 3.3.5 `map_p`
+
+`map_p` 是比例空间上的 MAP：
+
+$$\mathrm{map\_p}_{gc} = p_{g j_{gc}^{*}}$$
+
+它与 `signal = map_mu` 只差一个固定比例因子 $S$：
+
+$$\mathrm{signal}_{gc} = \mathrm{map\_mu}_{gc} = S \cdot \mathrm{map\_p}_{gc}$$
+
+如果下游方法希望直接在相对表达比率空间工作，或者需要避免不同 checkpoint 的 $S$ 对数值尺度的影响，应优先读取 `map_p` 而不是 `signal`。
+
+### 3.4 Python API 可访问但 CLI 不直接导出的载荷
+
+虽然 `prism extract signals` CLI 只支持上述 6 个二维通道，但 Python 层的 `Posterior` / `SignalExtractor` 还可以返回更完整的后验载荷。
+
+调用 `Posterior.extract(..., channels={...})` 时，若请求 `posterior`，当前实现会额外返回：
+
+- `posterior`：形状为 `(n_cells, n_genes, M)` 的完整离散后验；
+- `p_grid`：对应的比例网格；
+- `mu_grid`：对应的 $\mu$ 网格；
+- `support`：`mu_grid` 的别名；
+- `prior_weights`：每个基因的离散先验权重。
+
+这套载荷适合做以下事情：
+
+- 单基因后验曲线可视化；
+- 自定义置信度、稀有度或局部几何指标；
+- 与旧版文档中的 `Surprisal`、`Sharpness` 一类派生量做离线对照。
+
+但需要强调，CLI 当前故意不支持把这些三维或辅助数组直接写入 `h5ad` 层；`resolve_channels()` 允许的 `--channel` 只有 `signal`、`posterior_entropy`、`prior_entropy`、`mutual_information`、`map_p`、`map_mu` 六种。
+
+### 3.5 输出文件布局与层命名
+
+`prism extract signals` 的输出是一个新的 `AnnData` 文件，所有提取结果都写入 `output_adata.layers[channel_name]`。每个 layer 的数据类型由 `--dtype` 控制，目前仅支持：
+
+- `float32`
+- `float64`
+
+输出矩阵布局由 `--output-mode` 控制：
+
+#### 3.5.1 `fitted-only`
+
+这是默认模式。输出对象只保留被成功提取的目标基因，因此：
+
+- `output_adata.n_vars = n_selected_genes`
+- 每个输出 layer 的形状都是 `(n_cells, n_selected_genes)`
+- 列顺序与 `selected_genes` 一致，而不是原始输入矩阵的全部基因顺序
+
+如果只关心已拟合基因的 PRISM 信号，这是更紧凑、更直接的模式。
+
+#### 3.5.2 `full-matrix`
+
+该模式复制原始 `adata` 的完整基因轴：
+
+- `output_adata.n_vars = input_adata.n_vars`
+- 每个输出 layer 的形状都是 `(n_cells, n_dataset_genes)`
+- 只有被实际提取的基因位置会被填入数值
+- 未选中或未拟合的基因位置保持为 `NaN`
+
+这使得导出的 PRISM 层可以与原始矩阵在同一基因轴上逐列对齐，但代价是会产生大量 `NaN` 占位。
+
+### 3.6 `global` 与 `label` 两种先验来源
+
+当前命令通过 `--prior-source` 控制使用哪一类先验：
+
+- `global`：使用 `checkpoint.priors`
+- `label`：使用 `checkpoint.label_priors`
+
+当选择 `label` 时，必须同时提供 `--label-key`，且该列必须存在于 `adata.obs` 中。实现上，代码会：
+
+1. 读取每个细胞的标签值；
+2. 对每个标签单独挑出对应细胞；
+3. 用同名 label prior 对这部分细胞单独做后验提取；
+4. 再把结果回填到输出矩阵的对应行。
+
+因此，`label` 模式下的提取结果不是“先统一算完再按标签切片”，而是真正使用不同的先验对不同细胞子群分别推断。这一点会直接影响：
+
+- `signal / map_mu / map_p` 的点估计；
+- `posterior_entropy` 的集中程度；
+- `prior_entropy` 的常数块取值；
+- `mutual_information` 的信息增益幅度。

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 from typing import Any
 
 import matplotlib
 import numpy as np
+import pandas as pd
 from rich.console import Console
 from rich.table import Table
 
@@ -39,6 +40,67 @@ def load_gene_list_file(path: Path) -> list[str]:
     if not genes:
         raise ValueError(f"gene list is empty: {path}")
     return list(dict.fromkeys(genes))
+
+
+def _format_annotation_value(value: object) -> str:
+    if value is None:
+        return "NA"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        value_f = float(value)
+        if np.isnan(value_f):
+            return "NA"
+        return f"{value_f:.2f}"
+    text = str(value)
+    try:
+        return f"{float(text):.2f}"
+    except ValueError:
+        return text
+
+
+def load_annotation_tables(
+    csv_paths: list[Path], annot_names: list[str] | None
+) -> dict[str, dict[tuple[str, str], str]]:
+    if annot_names and len(annot_names) != len(csv_paths):
+        raise ValueError("--annot-name count must match --annot-csv count")
+    tables: dict[str, dict[tuple[str, str], str]] = {}
+    for idx, path in enumerate(csv_paths):
+        name = path.stem if not annot_names else annot_names[idx]
+        df = pd.read_csv(path)
+        if "gene" not in df.columns:
+            raise ValueError(f"annotation CSV missing required 'gene' column: {path}")
+        label_col = "label" if "label" in df.columns else None
+        value_cols = [col for col in df.columns if col not in {"gene", "label"}]
+        if not value_cols:
+            raise ValueError(f"annotation CSV has no value columns: {path}")
+        mapping: dict[tuple[str, str], str] = {}
+        for _, row in df.iterrows():
+            gene = str(row["gene"])
+            raw_label = None if label_col is None else row[label_col]
+            label_text = "" if raw_label is None else str(raw_label).strip()
+            label_is_na = False
+            if raw_label is not None:
+                na_value = pd.isna(raw_label)
+                label_is_na = (
+                    bool(na_value.item())
+                    if hasattr(na_value, "item")
+                    else bool(na_value)
+                )
+            if (
+                raw_label is None
+                or label_text in {"", "NA", "NaN", "nan"}
+                or label_is_na
+            ):
+                source = "global"
+            else:
+                source = f"label:{label_text}"
+            text = ", ".join(
+                f"{col}={_format_annotation_value(row[col])}" for col in value_cols
+            )
+            mapping[(gene, source)] = text
+        tables[name] = mapping
+    return tables
 
 
 def checkpoint_gene_names(
@@ -277,6 +339,8 @@ def plot_fg_facet_figure(
     *,
     x_axis: str,
     mass_quantile: float,
+    show_subplot_labels: bool = False,
+    annotation_tables: dict[str, dict[tuple[str, str], str]] | None = None,
 ):
     genes = list(curve_sets)
     if not genes:
@@ -338,5 +402,65 @@ def plot_fg_facet_figure(
             )
             ax.set_xlim(0.0, row_display_max)
             ax.grid(alpha=0.18)
+            if show_subplot_labels:
+                ax.text(
+                    0.98,
+                    0.98,
+                    f"{gene_name}\n{column_label}",
+                    transform=ax.transAxes,
+                    ha="right",
+                    va="top",
+                    fontsize=8,
+                    bbox={
+                        "facecolor": "white",
+                        "alpha": 0.75,
+                        "edgecolor": "none",
+                        "pad": 1.5,
+                    },
+                )
+            if annotation_tables:
+                lines = [
+                    f"{table_name}: {mapping[(gene_name, column_label)]}"
+                    for table_name, mapping in annotation_tables.items()
+                    if (gene_name, column_label) in mapping
+                ]
+                if lines:
+                    ax.text(
+                        0.5,
+                        -0.24,
+                        "\n".join(lines),
+                        transform=ax.transAxes,
+                        ha="center",
+                        va="top",
+                        fontsize=7,
+                    )
     fig.tight_layout()
     return fig
+
+
+def curve_sets_to_dataframe(
+    curve_sets: dict[str, list[tuple[str, np.ndarray, np.ndarray]]],
+    *,
+    x_axis: str,
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for gene_name, curves in curve_sets.items():
+        for source_label, mu_values, weights in curves:
+            mu_np = np.asarray(mu_values, dtype=np.float64).reshape(-1)
+            weight_np = np.asarray(weights, dtype=np.float64).reshape(-1)
+            x_values = mu_to_p(mu_np) if x_axis == "p" else mu_np
+            for idx, (mu_value, x_value, weight_value) in enumerate(
+                zip(mu_np, x_values, weight_np, strict=True), start=1
+            ):
+                rows.append(
+                    {
+                        "gene": gene_name,
+                        "source": source_label,
+                        "point_index": idx,
+                        "mu": float(mu_value),
+                        "x": float(x_value),
+                        "weight": float(weight_value),
+                        "x_axis": x_axis,
+                    }
+                )
+    return pd.DataFrame(rows)

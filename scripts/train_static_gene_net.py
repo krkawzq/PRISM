@@ -7,13 +7,17 @@ import math
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from time import perf_counter
 from typing import Any, cast
 
 import anndata as ad
 import numpy as np
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.traceback import install as install_rich_traceback
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
@@ -40,6 +44,7 @@ from train_gene_mae import (
     encode_labels,
     get_weight_batch,
     infer_support_size,
+    iter_with_progress,
     iter_batches,
     load_resume_checkpoint,
     masked_regression_loss,
@@ -53,6 +58,10 @@ from train_gene_mae import (
     subset_adata_by_gene_list,
     write_json,
 )
+
+console = Console()
+
+install_rich_traceback(show_locals=False)
 
 
 def get_static_input_batch(
@@ -292,9 +301,9 @@ def train_pretrain(args: argparse.Namespace) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_losses: list[float] = []
-        for batch_idx in tqdm(
-            iter_batches(splits.train, args.batch_size, shuffle=True),
-            desc=f"pretrain epoch {epoch}/{args.epochs}",
+        train_batches = iter_batches(splits.train, args.batch_size, shuffle=True)
+        for batch_idx in iter_with_progress(
+            train_batches, description=f"pretrain epoch {epoch}/{args.epochs}"
         ):
             inputs_np = get_static_input_batch(
                 adata,
@@ -550,8 +559,9 @@ def evaluate_pretrain(
 ) -> float:
     model.eval()
     losses: list[float] = []
-    for batch_idx in tqdm(
-        iter_batches(indices, batch_size, shuffle=False), desc="eval", leave=False
+    eval_batches = iter_batches(indices, batch_size, shuffle=False)
+    for batch_idx in iter_with_progress(
+        eval_batches, description="evaluating pretrain"
     ):
         inputs_np = get_static_input_batch(
             adata,
@@ -732,9 +742,9 @@ def train_downstream(args: argparse.Namespace) -> None:
         train_losses: list[float] = []
         train_true: list[np.ndarray] = []
         train_pred: list[np.ndarray] = []
-        for batch_idx in tqdm(
-            iter_batches(splits.train, args.batch_size, shuffle=True),
-            desc=f"downstream epoch {epoch}/{args.epochs}",
+        train_batches = iter_batches(splits.train, args.batch_size, shuffle=True)
+        for batch_idx in iter_with_progress(
+            train_batches, description=f"downstream epoch {epoch}/{args.epochs}"
         ):
             features = get_static_input_batch(
                 adata,
@@ -971,8 +981,9 @@ def evaluate_downstream(
     losses: list[float] = []
     y_true: list[np.ndarray] = []
     y_pred: list[np.ndarray] = []
-    for batch_idx in tqdm(
-        iter_batches(indices, batch_size, shuffle=False), desc="eval", leave=False
+    eval_batches = iter_batches(indices, batch_size, shuffle=False)
+    for batch_idx in iter_with_progress(
+        eval_batches, description="evaluating downstream"
     ):
         features = get_static_input_batch(
             adata,
@@ -1040,31 +1051,36 @@ def print_pretrain_summary(
     amp_dtype: torch.dtype | None,
     gene_list_spec: GeneListSpec | None,
 ) -> None:
-    print("=" * 80)
-    print("StaticGeneNet Pretrain")
-    print(f"Dataset           : {adata.n_obs} cells x {adata.n_vars} genes")
-    print(
-        f"Gene subset       : {gene_list_spec.top_k if gene_list_spec is not None else 'all'}"
+    table = Table(title="StaticGeneNet Pretrain")
+    table.add_column("Field")
+    table.add_column("Value", overflow="fold")
+    table.add_row("Dataset", f"{adata.n_obs} cells x {adata.n_vars} genes")
+    table.add_row(
+        "Gene subset",
+        f"{gene_list_spec.top_k} ({gene_list_spec.method})"
+        if gene_list_spec is not None
+        else "all",
     )
-    print(f"Input             : {args.input_representation}")
-    print(f"Loss weighting    : {args.loss_weighting}")
-    print(f"Mask selection    : {args.mask_selection}")
+    table.add_row("Input", str(args.input_representation))
+    table.add_row("Loss weighting", str(args.loss_weighting))
+    table.add_row("Mask selection", str(args.mask_selection))
     if args.mask_selection == "confidence_top_p":
-        print(f"Mask top-p        : {args.mask_confidence_top_p}")
-    print(f"Support size      : {support_size}")
-    print(f"Weight mean       : {weight_mean}")
-    print(f"Share layers      : {args.share_layer_params}")
-    print(f"AMP               : {amp_enabled} ({amp_dtype})")
-    print(f"Normalize target  : {normalize_target:.4f}")
-    print(f"Device            : {device}")
-    print(f"Resume            : {args.resume}")
-    print(f"Save every epochs : {args.save_every_epochs}")
-    print(f"Log every epochs  : {args.log_every_epochs}")
-    print(
-        f"Split sizes       : train={splits.train.size} val={splits.val.size} test={splits.test.size}"
+        table.add_row("Mask top-p", str(args.mask_confidence_top_p))
+    table.add_row("Support size", str(support_size))
+    table.add_row("Weight mean", str(weight_mean))
+    table.add_row("Share layers", str(args.share_layer_params))
+    table.add_row("AMP", f"{amp_enabled} ({amp_dtype})")
+    table.add_row("Normalize target", f"{normalize_target:.4f}")
+    table.add_row("Device", str(device))
+    table.add_row("Resume", str(args.resume))
+    table.add_row("Save every epochs", str(args.save_every_epochs))
+    table.add_row("Log every epochs", str(args.log_every_epochs))
+    table.add_row(
+        "Split sizes",
+        f"train={splits.train.size} val={splits.val.size} test={splits.test.size}",
     )
-    print(f"Output dir        : {args.output_dir}")
-    print("=" * 80)
+    table.add_row("Output dir", str(args.output_dir))
+    console.print(table)
 
 
 def print_downstream_summary(
@@ -1080,54 +1096,71 @@ def print_downstream_summary(
     amp_dtype: torch.dtype | None,
     gene_list_spec: GeneListSpec | None,
 ) -> None:
-    print("=" * 80)
-    print("StaticGeneNet Downstream")
-    print(f"Dataset           : {adata.n_obs} cells x {adata.n_vars} genes")
-    print(
-        f"Gene subset       : {gene_list_spec.top_k if gene_list_spec is not None else 'all'}"
+    table = Table(title="StaticGeneNet Downstream")
+    table.add_column("Field")
+    table.add_column("Value", overflow="fold")
+    table.add_row("Dataset", f"{adata.n_obs} cells x {adata.n_vars} genes")
+    table.add_row(
+        "Gene subset",
+        f"{gene_list_spec.top_k} ({gene_list_spec.method})"
+        if gene_list_spec is not None
+        else "all",
     )
-    print(f"Input             : {args.input_representation}")
-    print(f"Task mode         : {args.task_mode}")
-    print("Head              : linear")
-    print(f"Freeze attention  : {freeze_static}")
-    print(f"Share layers      : {args.share_layer_params}")
-    print(f"AMP               : {amp_enabled} ({amp_dtype})")
-    print(f"Normalize target  : {normalize_target:.4f}")
-    print(f"Classes           : {len(class_names)} -> {class_names}")
-    print(f"Checkpoint        : {args.checkpoint}")
-    print(f"Resume            : {args.resume}")
-    print(f"Label column      : {args.label_column}")
-    print(f"Device            : {device}")
-    print(f"Save every epochs : {args.save_every_epochs}")
-    print(f"Log every epochs  : {args.log_every_epochs}")
-    print(
-        f"Split sizes       : train={splits.train.size} val={splits.val.size} test={splits.test.size}"
+    table.add_row("Input", str(args.input_representation))
+    table.add_row("Task mode", str(args.task_mode))
+    table.add_row("Head", "linear")
+    table.add_row("Freeze attention", str(freeze_static))
+    table.add_row("Share layers", str(args.share_layer_params))
+    table.add_row("AMP", f"{amp_enabled} ({amp_dtype})")
+    table.add_row("Normalize target", f"{normalize_target:.4f}")
+    table.add_row("Classes", f"{len(class_names)} -> {class_names}")
+    table.add_row("Checkpoint", str(args.checkpoint))
+    table.add_row("Resume", str(args.resume))
+    table.add_row("Label column", str(args.label_column))
+    table.add_row("Device", str(device))
+    table.add_row("Save every epochs", str(args.save_every_epochs))
+    table.add_row("Log every epochs", str(args.log_every_epochs))
+    table.add_row(
+        "Split sizes",
+        f"train={splits.train.size} val={splits.val.size} test={splits.test.size}",
     )
-    print(f"Output dir        : {args.output_dir}")
-    print("=" * 80)
+    table.add_row("Output dir", str(args.output_dir))
+    console.print(table)
 
 
 def print_classification_result(result: ClassificationResult) -> None:
-    print("Test Metrics")
-    print(f"  accuracy          : {result.accuracy:.4f}")
-    print(f"  precision_macro   : {result.precision_macro:.4f}")
-    print(f"  recall_macro      : {result.recall_macro:.4f}")
-    print(f"  f1_macro          : {result.f1_macro:.4f}")
-    print(f"  precision_weighted: {result.precision_weighted:.4f}")
-    print(f"  recall_weighted   : {result.recall_weighted:.4f}")
-    print(f"  f1_weighted       : {result.f1_weighted:.4f}")
+    table = Table(title="Test Metrics")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("accuracy", f"{result.accuracy:.4f}")
+    table.add_row("precision_macro", f"{result.precision_macro:.4f}")
+    table.add_row("recall_macro", f"{result.recall_macro:.4f}")
+    table.add_row("f1_macro", f"{result.f1_macro:.4f}")
+    table.add_row("precision_weighted", f"{result.precision_weighted:.4f}")
+    table.add_row("recall_weighted", f"{result.recall_weighted:.4f}")
+    table.add_row("f1_weighted", f"{result.f1_weighted:.4f}")
+    console.print(table)
 
 
 def main() -> None:
+    start_time = perf_counter()
     args = parse_args()
     if args.command == "pretrain":
         train_pretrain(args)
-        return
-    if args.command == "downstream":
+    elif args.command == "downstream":
         train_downstream(args)
-        return
-    raise ValueError(f"未知 command: {args.command!r}")
+    else:
+        raise ValueError(f"未知 command: {args.command!r}")
+    console.print(
+        f"[bold green]Elapsed[/bold green] {perf_counter() - start_time:.2f}s"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        console.print(
+            Panel(str(exc), title="train_static_gene_net failed", border_style="red")
+        )
+        raise SystemExit(1) from exc

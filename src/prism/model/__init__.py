@@ -33,7 +33,14 @@ from .estimator import (
 from .exposure import effective_exposure, mean_reference_count, ratio_observation_mean
 from .fit import fit_gene_priors, fit_gene_priors_em
 from .infer import ALL_CHANNELS, CORE_CHANNELS, SignalChannel, infer_posteriors
-from .kbulk import KBulkAggregator, KBulkBatch, KBulkResult, infer_kbulk
+from .kbulk import (
+    KBulkAggregator,
+    KBulkBatch,
+    KBulkResult,
+    infer_kbulk,
+    infer_kbulk_samples,
+    infer_kbulk_samples_with_priors,
+)
 from .posterior import (
     Posterior,
     PosteriorBatchReport,
@@ -98,6 +105,8 @@ __all__ = [
     "fit_pool_scale_report",
     "infer_posteriors",
     "infer_kbulk",
+    "infer_kbulk_samples",
+    "infer_kbulk_samples_with_priors",
     "load_checkpoint",
     "mean_reference_count",
     "ratio_observation_mean",
