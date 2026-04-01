@@ -9,6 +9,7 @@ from rich.console import Console
 from prism.cli.common import ensure_mutually_exclusive
 from prism.io import read_gene_list, read_string_list
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 from prism.plotting import (
     compute_overlap_dataframe,
     SUPPORTED_OVERLAP_METRICS,
@@ -181,6 +182,12 @@ def plot_overlap_command(
     resolved_gene_order_mode = resolve_order_mode(gene_order, name="--gene-order")
     resolved_label_order_mode = resolve_order_mode(label_order, name="--label-order")
     checkpoint = load_checkpoint(checkpoint_path)
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism plot overlap",
+        require_label_priors=True,
+        require_grid_domains={"p"},
+    )
     resolved_genes = _resolve_gene_names(
         checkpoint=checkpoint,
         gene_names=gene_names,
@@ -242,14 +249,12 @@ def plot_overlap_command(
     )
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
     if output_csv_path is not None:
         output_csv_path = output_csv_path.expanduser().resolve()
         output_csv_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(output_csv_path, index=False)
-        console.print(f"[bold green]Saved[/bold green] {output_csv_path}")
     return 0
 
 

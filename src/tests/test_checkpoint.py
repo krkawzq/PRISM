@@ -37,7 +37,13 @@ class TestCheckpointSchema:
             priors=priors,
             scale=ScaleMetadata(S=10.0, mean_reference_count=10.0),
             fit_config={"grid_size": 512, "n_iter": 100},
-            metadata={"schema_version": 2, "source": "test"},
+            metadata={
+                "schema_version": 2,
+                "source": "test",
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
             label_priors={
                 "ctrl": _make_prior_grid(["GeneA"]),
                 "stim": _make_prior_grid(["GeneA"]),
@@ -64,7 +70,12 @@ class TestCheckpointSchema:
             priors=None,
             scale=ScaleMetadata(S=10.0, mean_reference_count=10.0),
             fit_config={},
-            metadata={"schema_version": 2},
+            metadata={
+                "schema_version": 2,
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
             label_priors={},
             label_scales={},
         )
@@ -81,7 +92,12 @@ class TestCheckpointSchema:
             priors=priors,
             scale=None,
             fit_config={},
-            metadata={"schema_version": 2},
+            metadata={
+                "schema_version": 2,
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
             label_priors={},
             label_scales={},
         )
@@ -118,7 +134,10 @@ class TestCheckpointSchema:
         assert loaded.scale is not None
         assert loaded.scale.S == 10.0
         assert loaded.fit_config == {"grid_size": 256}
-        assert loaded.metadata == {"source": "legacy"}
+        assert loaded.metadata["source"] == "legacy"
+        assert loaded.metadata["fit_distribution"] == "binomial"
+        assert loaded.metadata["posterior_distribution"] == "binomial"
+        assert loaded.metadata["grid_domain"] == "p"
         assert loaded.label_priors == {}
         assert loaded.label_scales == {}
 
@@ -151,7 +170,13 @@ class TestCheckpointSchema:
             priors=priors,
             scale=ScaleMetadata(S=5.0, mean_reference_count=5.0),
             fit_config={"n_iter": 50, "sigma_bins": 2.0},
-            metadata={"schema_version": 2, "note": "idempotent test"},
+            metadata={
+                "schema_version": 2,
+                "note": "idempotent test",
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
             label_priors={
                 "treated": _make_prior_grid(["GeneX"]),
             },

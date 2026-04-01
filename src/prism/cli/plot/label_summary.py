@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 from prism.cli.common import print_elapsed, print_saved_path
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from rich.console import Console
 
@@ -44,13 +45,18 @@ def plot_label_summary_command(
     output_path = output_path.expanduser().resolve()
 
     checkpoint = load_checkpoint(checkpoint_path)
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism plot label-summary",
+        require_label_priors=True,
+        require_grid_domains={"p"},
+    )
     if not checkpoint.label_priors:
         raise ValueError("checkpoint does not contain label-specific priors")
 
     labels = sorted(checkpoint.label_priors)
     n_labels = len(labels)
 
-    # Find common genes across all label priors
     common_genes: set[str] | None = None
     for label in labels:
         prior = checkpoint.label_priors[label]
@@ -71,7 +77,6 @@ def plot_label_summary_command(
     if not selected:
         raise ValueError("no genes to plot after filtering")
 
-    # Compute pairwise similarity matrix
     similarity = np.zeros((n_labels, n_labels), dtype=np.float64)
     for i, label_i in enumerate(labels):
         prior_i = checkpoint.label_priors[label_i].subset(selected).batched()

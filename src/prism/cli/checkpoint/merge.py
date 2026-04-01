@@ -11,6 +11,7 @@ from prism.model import (
     load_checkpoint,
     save_checkpoint,
 )
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from .common import (
     checkpoint_gene_names,
@@ -38,6 +39,11 @@ def merge_checkpoints_command(
     checkpoints = [
         load_checkpoint(path.expanduser().resolve()) for path in checkpoint_paths
     ]
+    for checkpoint in checkpoints:
+        resolve_cli_checkpoint_distribution(
+            checkpoint,
+            command_name="prism checkpoint merge",
+        )
     merged = _merge_checkpoints(
         checkpoints,
         [path.expanduser().resolve() for path in checkpoint_paths],

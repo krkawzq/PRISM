@@ -6,6 +6,7 @@ import typer
 from rich.table import Table
 
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from .common import console, safe_string_list
 
@@ -26,27 +27,32 @@ def inspect_checkpoint_command(
     ),
 ) -> int:
     checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
-    metadata = checkpoint.metadata
+    metadata = resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism checkpoint inspect",
+    )
     table = Table(title="Checkpoint")
     table.add_column("Field")
     table.add_column("Value")
     table.add_row("genes", str(len(checkpoint.gene_names)))
     table.add_row("global_priors", str(checkpoint.priors is not None))
     table.add_row("label_priors", str(len(checkpoint.label_priors)))
-    table.add_row("fit_distribution", str(metadata.get("fit_distribution", "binomial")))
+    table.add_row("fit_distribution", str(metadata["fit_distribution"]))
     table.add_row(
         "posterior_distribution",
-        str(
-            metadata.get(
-                "posterior_distribution", metadata.get("fit_distribution", "binomial")
-            )
-        ),
+        str(metadata["posterior_distribution"]),
     )
     table.add_row(
         "grid_domain",
-        str(
-            metadata.get("grid_domain", getattr(checkpoint.priors, "grid_domain", "p"))
-        ),
+        str(metadata["grid_domain"]),
+    )
+    table.add_row(
+        "distribution_resolution",
+        str(metadata.get("distribution_resolution", "")),
+    )
+    table.add_row(
+        "legacy_compatibility",
+        str(bool(metadata.get("legacy_compatibility", False))),
     )
     table.add_row("S", "-" if checkpoint.scale is None else f"{checkpoint.scale.S:.4f}")
     table.add_row(

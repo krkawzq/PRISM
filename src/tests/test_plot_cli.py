@@ -11,6 +11,7 @@ from prism.cli.analyze.overlap_de import (
     overlap_de_command as analyze_overlap_de_command,
 )
 from prism.cli.plot.batch_grid import plot_batch_grid_command
+from prism.cli.plot.label_summary import plot_label_summary_command
 from prism.cli.plot.overlap import plot_overlap_command
 from prism.cli.plot.priors import plot_priors_command
 from prism.cli.checkpoint.overlap_de import overlap_de_command
@@ -69,7 +70,11 @@ class PlotCliTests(unittest.TestCase):
             ),
             scale=None,
             fit_config={},
-            metadata={},
+            metadata={
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
             label_priors={
                 "batch1_ctrl": _batched_prior(
                     gene_names=["GeneA"],
@@ -94,6 +99,42 @@ class PlotCliTests(unittest.TestCase):
                     p_grid_rows=[[0.35, 0.7]],
                     weights_rows=[[0.2, 0.8]],
                     S=5.0,
+                ),
+            },
+            label_scales={},
+        )
+        save_checkpoint(checkpoint, checkpoint_path)
+        return checkpoint_path
+
+    def _write_poisson_label_checkpoint(self) -> Path:
+        checkpoint_path = self.root / "poisson_label_checkpoint.pkl"
+        checkpoint = ModelCheckpoint(
+            gene_names=["GeneA"],
+            priors=_batched_rate_prior(
+                gene_names=["GeneA"],
+                rate_grid_rows=[[1.0, 2.0, 4.0]],
+                weights_rows=[[0.2, 0.5, 0.3]],
+                S=4.0,
+            ),
+            scale=None,
+            fit_config={"likelihood": "poisson"},
+            metadata={
+                "fit_distribution": "poisson",
+                "posterior_distribution": "poisson",
+                "grid_domain": "rate",
+            },
+            label_priors={
+                "ctrl": _batched_rate_prior(
+                    gene_names=["GeneA"],
+                    rate_grid_rows=[[1.0, 2.0, 4.0]],
+                    weights_rows=[[0.5, 0.3, 0.2]],
+                    S=4.0,
+                ),
+                "stim": _batched_rate_prior(
+                    gene_names=["GeneA"],
+                    rate_grid_rows=[[0.8, 1.6, 3.2]],
+                    weights_rows=[[0.2, 0.5, 0.3]],
+                    S=4.0,
                 ),
             },
             label_scales={},
@@ -186,6 +227,48 @@ class PlotCliTests(unittest.TestCase):
         self.assertEqual(df.shape[0], 8)
         self.assertEqual(sorted(summary_df["gene"].unique().tolist()), ["GeneA"])
         self.assertIn("mean_p", summary_df.columns)
+
+    def test_plot_batch_grid_accepts_poisson_rate_grid_checkpoint(self) -> None:
+        checkpoint_path = self._write_poisson_label_checkpoint()
+        output_dir = self.root / "batch_grid_poisson"
+        output_csv = self.root / "batch_grid_poisson.csv"
+        summary_csv = self.root / "batch_grid_poisson_summary.csv"
+        mapping_csv = self.root / "poisson_label_grid.csv"
+        mapping_csv.write_text(
+            (
+                "label,batch,perturbation\n"
+                "ctrl,batch1,ctrl\n"
+                "stim,batch1,stim\n"
+            ),
+            encoding="utf-8",
+        )
+
+        plot_batch_grid_command(
+            checkpoint_path=checkpoint_path,
+            gene_names=["GeneA"],
+            genes_path=None,
+            top_n=None,
+            labels=None,
+            labels_path=None,
+            label_grid_csv_path=mapping_csv,
+            output_dir=output_dir,
+            output_csv_path=output_csv,
+            summary_csv_path=summary_csv,
+            x_axis="rate",
+            mass_quantile=1.0,
+            image_format="svg",
+            dpi=120,
+            curve_mode="density",
+            stat_fields=["mean_mu"],
+            show_axis_ticks=False,
+        )
+
+        self.assertTrue((output_dir / "GeneA.svg").exists())
+        df = pd.read_csv(output_csv)
+        self.assertTrue(np.allclose(df["x"].to_numpy(), [1.0, 2.0, 4.0, 0.8, 1.6, 3.2]))
+        self.assertEqual(sorted(df["label"].dropna().unique().tolist()), ["ctrl", "stim"])
+        summary_df = pd.read_csv(summary_csv)
+        self.assertIn("mean_mu", summary_df.columns)
 
     def test_plot_priors_supports_summary_stats_and_cdf_mode(self) -> None:
         checkpoint_path = self._write_checkpoint()
@@ -360,6 +443,63 @@ class PlotCliTests(unittest.TestCase):
         self.assertEqual(df.shape[0], 1)
         self.assertEqual(df.iloc[0]["gene"], "GeneA")
         self.assertEqual(df.iloc[0]["label"], "batch1_stim")
+
+    def test_plot_overlap_rejects_poisson_rate_grid_checkpoint(self) -> None:
+        checkpoint_path = self._write_poisson_label_checkpoint()
+        with self.assertRaisesRegex(ValueError, "does not support checkpoint grid_domain 'rate'"):
+            plot_overlap_command(
+                checkpoint_path=checkpoint_path,
+                output_path=self.root / "overlap_poisson.svg",
+                output_csv_path=self.root / "overlap_poisson.csv",
+                control_label="ctrl",
+                gene_names=["GeneA"],
+                genes_path=None,
+                top_k=None,
+                labels=["stim"],
+                labels_path=None,
+                metric="overlap",
+                gene_order="input",
+                label_order="input",
+                scale_min=0.5,
+                scale_max=2.0,
+                scale_grid_size=31,
+                interp_points=256,
+                annotate_cells=False,
+                cmap=None,
+                panel_width=1.0,
+                panel_height=0.8,
+            )
+
+    def test_plot_label_summary_rejects_poisson_rate_grid_checkpoint(self) -> None:
+        checkpoint_path = self._write_poisson_label_checkpoint()
+        with self.assertRaisesRegex(ValueError, "does not support checkpoint grid_domain 'rate'"):
+            plot_label_summary_command(
+                checkpoint_path=checkpoint_path,
+                output_path=self.root / "label_summary_poisson.svg",
+                gene_names=["GeneA"],
+                max_genes=10,
+                metric="jsd",
+                figsize_w=6.0,
+                figsize_h=6.0,
+                palette=None,
+            )
+
+    def test_analyze_overlap_de_rejects_poisson_rate_grid_checkpoint(self) -> None:
+        checkpoint_path = self._write_poisson_label_checkpoint()
+        with self.assertRaisesRegex(ValueError, "does not support checkpoint grid_domain 'rate'"):
+            analyze_overlap_de_command(
+                checkpoint_path=checkpoint_path,
+                output_csv_path=self.root / "overlap_de_poisson.csv",
+                control_label="ctrl",
+                gene_names=["GeneA"],
+                gene_list_path=None,
+                labels=["stim"],
+                label_list_path=None,
+                scale_min=0.5,
+                scale_max=2.0,
+                scale_grid_size=31,
+                interp_points=256,
+            )
 
 
 if __name__ == "__main__":

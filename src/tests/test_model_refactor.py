@@ -357,6 +357,8 @@ def test_poisson_likelihood() -> None:
     assert result.priors.weights.shape == (1, 8)
     p_grid = np.asarray(result.priors.p_grid, dtype=np.float64)
     assert np.all(p_grid >= 0.0)
+    assert result.priors.distribution == "poisson"
+    assert result.priors.grid_domain == "rate"
 
 
 def test_poisson_likelihood_em() -> None:
@@ -386,3 +388,43 @@ def test_poisson_priors_are_not_silently_used_by_binomial_inference() -> None:
     )
     with pytest.raises(ValueError, match="posterior distribution mismatch"):
         infer_posteriors(batch, result.priors, posterior_distribution="binomial")
+
+
+def test_fit_roundtrip_preserves_distribution_metadata() -> None:
+    batch = _small_batch()
+    for likelihood, expected_grid_domain in [
+        ("binomial", "p"),
+        ("negative_binomial", "p"),
+        ("poisson", "rate"),
+    ]:
+        result = fit_gene_priors(
+            batch,
+            S=10.0,
+            config=PriorFitConfig(
+                grid_size=8,
+                n_iter=2,
+                likelihood=likelihood,
+            ),
+        )
+        assert result.priors.distribution == likelihood
+        assert result.priors.grid_domain == expected_grid_domain
+
+
+def test_poisson_priors_are_not_silently_used_by_negative_binomial_inference() -> None:
+    batch = _small_batch()
+    result = fit_gene_priors(
+        batch,
+        S=10.0,
+        config=PriorFitConfig(
+            grid_size=8,
+            n_iter=3,
+            likelihood="poisson",
+        ),
+    )
+    with pytest.raises(ValueError, match="posterior distribution mismatch"):
+        infer_posteriors(
+            batch,
+            result.priors,
+            posterior_distribution="negative_binomial",
+            nb_overdispersion=0.1,
+        )

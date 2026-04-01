@@ -22,6 +22,7 @@ from rich.progress import (
 
 from prism.io import write_h5ad_atomic
 from prism.model import KBulkAggregator, load_checkpoint
+from prism.model.checkpoint import resolve_checkpoint_distribution
 
 from .common import (
     compute_reference_counts,
@@ -305,6 +306,24 @@ def extract_kbulk_command(
     )
 
     checkpoint = load_checkpoint(checkpoint_path)
+    resolved_checkpoint_metadata, _ = resolve_checkpoint_distribution(
+        schema_version=int(checkpoint.metadata.get("schema_version", 2)),
+        metadata=checkpoint.metadata,
+        priors=checkpoint.priors,
+        label_priors=checkpoint.label_priors,
+        checkpoint_path=checkpoint_path,
+    )
+    checkpoint_distribution = str(
+        resolved_checkpoint_metadata["posterior_distribution"]
+    )
+    checkpoint_grid_domain = str(resolved_checkpoint_metadata["grid_domain"])
+    if checkpoint_distribution == "poisson" or checkpoint_grid_domain == "rate":
+        raise ValueError(
+            "prism extract kbulk does not support poisson/rate-grid checkpoints yet: "
+            "the CLI currently does not export poisson-specific map_rate outputs, so "
+            "using this checkpoint would silently lose distribution semantics. "
+            f"Got posterior_distribution={checkpoint_distribution!r}, grid_domain={checkpoint_grid_domain!r}."
+        )
     prior_source_resolved = resolve_prior_source(prior_source)
     output_dtype = resolve_dtype(dtype)
     S_source_resolved = S_source.strip().lower()

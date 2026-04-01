@@ -16,6 +16,7 @@ from rich.progress import (
 )
 
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from .common import (
     compute_reference_counts,
@@ -82,6 +83,11 @@ def extract_signals_command(
     genes_path = None if genes_path is None else genes_path.expanduser().resolve()
 
     checkpoint = load_checkpoint(checkpoint_path)
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism extract signals",
+        allow_distributions={"binomial", "negative_binomial", "poisson"},
+    )
     reference_gene_names = require_reference_genes(checkpoint.metadata)
     selected_channels = resolve_channels(channels)
     output_dtype = resolve_dtype(dtype)

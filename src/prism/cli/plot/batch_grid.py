@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from prism.cli.common import ensure_mutually_exclusive
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 from prism.io import read_gene_list, read_string_list
 from prism.model import load_checkpoint
 from prism.plotting import (
@@ -217,6 +218,12 @@ def plot_batch_grid_command(
         label_grid_csv_path=label_grid_csv_path,
     )
     checkpoint = load_checkpoint(checkpoint_path)
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism plot batch-grid",
+        allow_distributions={"binomial", "negative_binomial", "poisson"},
+        require_label_priors=True,
+    )
     curve_sets, batches, perturbations = resolve_batch_grid_curve_sets(
         checkpoint,
         gene_names=resolved_genes,

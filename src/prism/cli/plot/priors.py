@@ -8,6 +8,7 @@ from rich.console import Console
 from prism.cli.common import ensure_mutually_exclusive
 from prism.io import read_gene_list, read_string_list
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 from prism.plotting import (
     curve_sets_to_dataframe,
     curve_sets_summary_dataframe,
@@ -222,6 +223,10 @@ def plot_priors_command(
         )
 
     checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism plot priors",
+    )
     curve_sets = resolve_prior_curve_sets(
         checkpoint,
         gene_names=resolved_genes,
@@ -261,21 +266,19 @@ def plot_priors_command(
     )
     output_path = output_path.expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
+
     if output_csv_path is not None:
         output_csv_path = output_csv_path.expanduser().resolve()
+        df = curve_sets_to_dataframe(curve_sets, x_axis=resolved_x_axis)
         output_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        curve_sets_to_dataframe(curve_sets, x_axis=resolved_x_axis).to_csv(
-            output_csv_path, index=False
-        )
-        console.print(f"[bold green]Saved[/bold green] {output_csv_path}")
+        df.to_csv(output_csv_path, index=False)
     if summary_csv_path is not None:
         summary_csv_path = summary_csv_path.expanduser().resolve()
+        summary_df = curve_sets_summary_dataframe(curve_sets)
         summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        curve_sets_summary_dataframe(curve_sets).to_csv(summary_csv_path, index=False)
-        console.print(f"[bold green]Saved[/bold green] {summary_csv_path}")
+        summary_df.to_csv(summary_csv_path, index=False)
     return 0
 
 

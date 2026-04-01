@@ -8,6 +8,7 @@ from rich.console import Console
 from prism.cli.common import ensure_mutually_exclusive, print_key_value_table, print_saved_path
 from prism.io import read_gene_list, read_string_list
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 from prism.plotting import compute_overlap_dataframe
 
 console = Console()
@@ -73,6 +74,12 @@ def overlap_de_command(
     ensure_mutually_exclusive(("--gene", gene_names), ("--gene-list", gene_list_path))
     ensure_mutually_exclusive(("--label", labels), ("--label-list", label_list_path))
     checkpoint = load_checkpoint(checkpoint_path.expanduser().resolve())
+    resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism analyze overlap-de",
+        require_label_priors=True,
+        require_grid_domains={"p"},
+    )
     if not checkpoint.label_priors:
         raise ValueError("checkpoint has no label priors")
     if control_label not in checkpoint.label_priors:

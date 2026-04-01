@@ -22,6 +22,7 @@ from prism.io import (
     slice_gene_matrix as slice_gene_matrix_shared,
 )
 from prism.model import CORE_CHANNELS, ObservationBatch, Posterior, SignalChannel
+from prism.model.checkpoint import resolve_checkpoint_distribution
 
 console = Console()
 
@@ -48,13 +49,13 @@ def resolve_channels(channels: list[str] | None) -> list[str]:
 
 
 def resolve_posterior_distribution(metadata: dict[str, object]) -> str:
-    value = metadata.get("posterior_distribution")
-    if not isinstance(value, str) or not value:
-        fit_value = metadata.get("fit_distribution")
-        if isinstance(fit_value, str) and fit_value:
-            return fit_value
-        return "binomial"
-    return value
+    resolved, _ = resolve_checkpoint_distribution(
+        schema_version=int(metadata.get("schema_version", 2)),
+        metadata=dict(metadata),
+        priors=None,
+        label_priors={},
+    )
+    return str(resolved["posterior_distribution"])
 
 
 def resolve_nb_overdispersion(

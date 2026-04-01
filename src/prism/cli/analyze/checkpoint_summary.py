@@ -10,6 +10,7 @@ import numpy as np
 import typer
 
 from prism.model import load_checkpoint
+from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from .common import console, print_analysis_plan, print_analysis_summary
 
@@ -33,7 +34,10 @@ def checkpoint_summary_command(
         output_json_path = output_json_path.expanduser().resolve()
 
     checkpoint = load_checkpoint(checkpoint_path)
-    metadata = checkpoint.metadata
+    metadata = resolve_cli_checkpoint_distribution(
+        checkpoint,
+        command_name="prism analyze checkpoint-summary",
+    )
 
     n_genes = len(checkpoint.gene_names)
     has_global_priors = checkpoint.priors is not None
@@ -51,6 +55,10 @@ def checkpoint_summary_command(
         n_genes=n_genes,
         has_global_priors=has_global_priors,
         n_label_priors=n_label_priors,
+        fit_distribution=metadata["fit_distribution"],
+        posterior_distribution=metadata["posterior_distribution"],
+        grid_domain=metadata["grid_domain"],
+        distribution_resolution=metadata.get("distribution_resolution", ""),
         S=S,
         mean_reference_count=mean_ref,
         S_source=metadata.get("S_source", ""),
