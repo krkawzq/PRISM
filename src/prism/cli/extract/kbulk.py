@@ -4,7 +4,6 @@ from itertools import combinations
 import json
 import math
 from pathlib import Path
-import os
 from time import perf_counter
 from typing import Any, TypeVar
 
@@ -21,6 +20,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from prism.io import write_h5ad_atomic
 from prism.model import KBulkAggregator, load_checkpoint
 
 from .common import (
@@ -32,6 +32,8 @@ from .common import (
     require_reference_genes,
     resolve_class_groups,
     resolve_dtype,
+    resolve_nb_overdispersion,
+    resolve_posterior_distribution,
     resolve_prior_source,
     select_matrix,
     slice_gene_counts,
@@ -160,15 +162,6 @@ def _estimate_total_realized(per_class_plan: list[dict[str, Any]]) -> int:
     return int(sum(_entry_int(entry, "realized_samples") for entry in per_class_plan))
 
 
-def _write_h5ad_atomic(adata: ad.AnnData, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.with_name(f".{output_path.name}.tmp-{os.getpid()}")
-    if temp_path.exists():
-        temp_path.unlink()
-    adata.write_h5ad(temp_path)
-    temp_path.replace(output_path)
-
-
 def _iter_chunks(values: list[T], chunk_size: int) -> list[list[T]]:
     return [
         values[start : start + chunk_size]
@@ -282,7 +275,9 @@ def extract_kbulk_command(
         0, min=0, help="Random seed for kBulk combination sampling."
     ),
     sample_batch_size: int = typer.Option(
-        256, min=1, help="Number of kBulk samples to infer per GPU batch."
+        256,
+        min=1,
+        help="Number of kBulk samples to infer per batch. Controls GPU memory usage.",
     ),
     S_source: str = typer.Option(
         "checkpoint",
@@ -522,6 +517,12 @@ def extract_kbulk_command(
                     priors,
                     device=device,
                     torch_dtype="float32",
+                    posterior_distribution=resolve_posterior_distribution(
+                        checkpoint.metadata
+                    ),
+                    nb_overdispersion=resolve_nb_overdispersion(
+                        checkpoint.metadata, checkpoint.fit_config
+                    ),
                 )
                 priors_cache[cache_key] = aggregator
             indices_i64 = np.asarray(indices, dtype=np.int64)
@@ -654,7 +655,7 @@ def extract_kbulk_command(
             "per_class_plan_json": json.dumps(per_class_plan),
         },
     )
-    _write_h5ad_atomic(output, output_path)
+    write_h5ad_atomic(output, output_path)
     for entry in per_class_plan:
         console.print(
             f"{entry['label']}: cells={entry['n_cells']}, combos={_format_comb_count(float(entry['n_combinations']))}, target={entry['target_samples']}, realized={entry['realized_samples']}"

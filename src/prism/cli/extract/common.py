@@ -7,9 +7,20 @@ from typing import cast
 import anndata as ad
 import numpy as np
 from rich.console import Console
-from rich.table import Table
-from scipy import sparse
 
+from prism.cli.common import (
+    print_elapsed,
+    print_key_value_table,
+    print_saved_path,
+    resolve_numpy_dtype,
+    resolve_prior_source as resolve_prior_source_shared,
+)
+from prism.io import (
+    compute_reference_counts as compute_reference_counts_shared,
+    read_gene_list as read_gene_list_shared,
+    select_matrix as select_matrix_shared,
+    slice_gene_matrix as slice_gene_matrix_shared,
+)
 from prism.model import CORE_CHANNELS, ObservationBatch, Posterior, SignalChannel
 
 console = Console()
@@ -23,60 +34,59 @@ def require_reference_genes(metadata: dict[str, object]) -> list[str]:
 
 
 def resolve_prior_source(value: str) -> str:
-    resolved = value.strip().lower()
-    if resolved not in {"global", "label"}:
-        raise ValueError("prior_source must be either 'global' or 'label'")
-    return resolved
+    return resolve_prior_source_shared(value)
 
 
 def resolve_channels(channels: list[str] | None) -> list[str]:
     if not channels:
         return sorted(CORE_CHANNELS)
-    valid = set(CORE_CHANNELS) | {"map_p", "map_mu"}
+    valid = set(CORE_CHANNELS) | {"map_p", "map_mu", "map_rate"}
     unknown = [channel for channel in channels if channel not in valid]
     if unknown:
         raise ValueError(f"unknown channels: {unknown}")
     return list(dict.fromkeys(channels))
 
 
+def resolve_posterior_distribution(metadata: dict[str, object]) -> str:
+    value = metadata.get("posterior_distribution")
+    if not isinstance(value, str) or not value:
+        fit_value = metadata.get("fit_distribution")
+        if isinstance(fit_value, str) and fit_value:
+            return fit_value
+        return "binomial"
+    return value
+
+
+def resolve_nb_overdispersion(
+    metadata: dict[str, object], fit_config: dict[str, object]
+) -> float:
+    value = fit_config.get("nb_overdispersion", metadata.get("nb_overdispersion", 0.01))
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return 0.01
+
+
 def resolve_dtype(value: str) -> np.dtype:
-    if value == "float32":
-        return np.dtype(np.float32)
-    if value == "float64":
-        return np.dtype(np.float64)
-    raise ValueError(f"unsupported dtype: {value}")
+    return resolve_numpy_dtype(value)
 
 
 def read_gene_list(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    return read_gene_list_shared(path)
 
 
 def select_matrix(adata: ad.AnnData, layer: str | None):
-    if layer is None:
-        return adata.X
-    if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} does not exist")
-    return adata.layers[layer]
+    return select_matrix_shared(adata, layer)
 
 
 def slice_gene_counts(matrix, positions: list[int]) -> np.ndarray:
-    subset = matrix[:, positions]
-    if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=np.float64)
-    return np.asarray(subset, dtype=np.float64)
+    return slice_gene_matrix_shared(matrix, positions, dtype=np.float64)
 
 
 def compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
-    subset = matrix[:, positions]
-    if sparse.issparse(subset):
-        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
-    else:
-        totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
-    return np.asarray(totals, dtype=np.float64).reshape(-1)
+    return compute_reference_counts_shared(matrix, positions, dtype=np.float64)
 
 
 def extract_batch(
@@ -89,13 +99,23 @@ def extract_batch(
     prior_source: str,
     label_key: str | None,
     device: str,
+    torch_dtype: str,
     selected_channels: list[str],
 ) -> dict[str, np.ndarray]:
     requested_channels = cast(set[SignalChannel], set(selected_channels))
+    posterior_distribution = resolve_posterior_distribution(checkpoint.metadata)
+    nb_overdispersion = resolve_nb_overdispersion(
+        checkpoint.metadata, checkpoint.fit_config
+    )
     if prior_source == "global":
         assert checkpoint.priors is not None
         posterior = Posterior(
-            batch_names, checkpoint.priors.subset(batch_names), device=device
+            batch_names,
+            checkpoint.priors.subset(batch_names),
+            device=device,
+            torch_dtype=torch_dtype,
+            posterior_distribution=posterior_distribution,
+            nb_overdispersion=nb_overdispersion,
         )
         return posterior.extract(
             ObservationBatch(
@@ -121,7 +141,14 @@ def extract_batch(
             raise ValueError(f"checkpoint does not contain priors for label {label!r}")
         cell_indices = np.flatnonzero(labels == label)
         priors = checkpoint.label_priors[label].subset(batch_names)
-        posterior = Posterior(batch_names, priors, device=device)
+        posterior = Posterior(
+            batch_names,
+            priors,
+            device=device,
+            torch_dtype=torch_dtype,
+            posterior_distribution=posterior_distribution,
+            nb_overdispersion=nb_overdispersion,
+        )
         extracted = posterior.extract(
             ObservationBatch(
                 gene_names=batch_names,
@@ -138,24 +165,19 @@ def extract_batch(
 
 
 def print_extract_plan(**values: object) -> None:
-    table = Table(title="Extract Plan")
-    table.add_column("Field")
-    table.add_column("Value")
-    for key, value in values.items():
-        table.add_row(key, str(value))
-    console.print(table)
+    print_key_value_table(console, title="Extract Plan", values=values)
 
 
 def print_extract_summary(
     *, output_path: Path, elapsed_sec: float, n_genes: int, channels: list[str]
 ) -> None:
-    table = Table(title="Extract Summary")
-    table.add_column("Genes", justify="right")
-    table.add_column("Channels")
-    table.add_row(str(n_genes), ", ".join(channels))
-    console.print(table)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
-    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+    print_key_value_table(
+        console,
+        title="Extract Summary",
+        values={"Genes": n_genes, "Channels": ", ".join(channels)},
+    )
+    print_saved_path(console, output_path)
+    print_elapsed(console, elapsed_sec)
 
 
 def resolve_class_groups(adata: ad.AnnData, class_key: str) -> dict[str, np.ndarray]:

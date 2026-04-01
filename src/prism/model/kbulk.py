@@ -1,21 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
 
-from .constants import DTYPE_NP, EPS
-from .numeric import entropy, log_binomial_likelihood_grid
+from .constants import DTYPE_NP, EPS, resolve_torch_dtype
+from .numeric import (
+    entropy,
+    log_binomial_likelihood_grid,
+    log_negative_binomial_likelihood_grid,
+    log_poisson_likelihood_grid,
+)
 from .types import InferenceResult, PriorGrid
-
-
-def _resolve_torch_dtype(name: str) -> torch.dtype:
-    if name == "float32":
-        return torch.float32
-    if name == "float64":
-        return torch.float64
-    raise ValueError(f"unsupported torch dtype: {name}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +57,14 @@ class KBulkBatch:
 @dataclass(frozen=True, slots=True)
 class KBulkResult:
     gene_names: list[str]
+    grid_domain: str
     p_grid: np.ndarray
     mu_grid: np.ndarray
     prior_weights: np.ndarray
     posterior_weights: np.ndarray | None
     map_p: np.ndarray
     map_mu: np.ndarray
+    map_rate: np.ndarray | None
     posterior_entropy: np.ndarray
     prior_entropy: np.ndarray
     mutual_information: np.ndarray
@@ -74,6 +74,8 @@ def _validate_sample_inputs(
     gene_names: list[str],
     aggregated_counts: np.ndarray,
     effective_exposure: np.ndarray,
+    *,
+    posterior_distribution: str,
 ) -> tuple[np.ndarray, np.ndarray]:
     counts_np = np.asarray(aggregated_counts, dtype=np.float32)
     exposure_np = np.asarray(effective_exposure, dtype=np.float32).reshape(-1)
@@ -90,10 +92,13 @@ def _validate_sample_inputs(
         )
     if np.any(~np.isfinite(counts_np)) or np.any(counts_np < 0):
         raise ValueError("aggregated_counts must be finite and non-negative")
-    if np.any(~np.isfinite(exposure_np)) or np.any(exposure_np <= 0):
-        raise ValueError("effective_exposure must be finite and positive")
-    if np.any(counts_np > exposure_np[:, None] + 1e-6):
-        raise ValueError("aggregated_counts must satisfy counts <= effective_exposure")
+    if posterior_distribution != "poisson":
+        if np.any(~np.isfinite(exposure_np)) or np.any(exposure_np <= 0):
+            raise ValueError("effective_exposure must be finite and positive")
+        if np.any(counts_np > exposure_np[:, None] + 1e-6):
+            raise ValueError(
+                "aggregated_counts must satisfy counts <= effective_exposure"
+            )
     return counts_np, exposure_np
 
 
@@ -105,12 +110,15 @@ def _run_kbulk_inference(
     p_grid_np: np.ndarray,
     weights_np: np.ndarray,
     S: float,
+    grid_domain: Literal["p", "rate"],
     device: str | torch.device,
     torch_dtype: str,
     include_posterior: bool,
+    posterior_distribution: str = "binomial",
+    nb_overdispersion: float = 0.01,
 ) -> InferenceResult:
     device_obj = torch.device(device)
-    dtype_obj = _resolve_torch_dtype(torch_dtype)
+    dtype_obj = resolve_torch_dtype(torch_dtype)
     counts_t = torch.as_tensor(counts_np.T, dtype=dtype_obj, device=device_obj)
     n_eff_t = (
         torch.as_tensor(exposure_np, dtype=dtype_obj, device=device_obj)
@@ -126,10 +134,17 @@ def _run_kbulk_inference(
         p_grid_t=p_grid_t,
         weights_t=weights_t,
         p_grid_np=np.asarray(p_grid_np, dtype=DTYPE_NP),
-        mu_grid_np=np.asarray(p_grid_np, dtype=DTYPE_NP) * float(S),
+        mu_grid_np=(
+            np.asarray(p_grid_np, dtype=DTYPE_NP)
+            if grid_domain == "rate"
+            else np.asarray(p_grid_np, dtype=DTYPE_NP) * float(S)
+        ),
         prior_weights_np=np.asarray(weights_np, dtype=DTYPE_NP),
         S=float(S),
+        grid_domain=cast(Any, grid_domain),
         include_posterior=include_posterior,
+        posterior_distribution=posterior_distribution,
+        nb_overdispersion=nb_overdispersion,
     )
 
 
@@ -144,9 +159,19 @@ def _run_kbulk_inference_tensors(
     mu_grid_np: np.ndarray,
     prior_weights_np: np.ndarray,
     S: float,
+    grid_domain: Literal["p", "rate"],
     include_posterior: bool,
+    posterior_distribution: str,
+    nb_overdispersion: float,
 ) -> InferenceResult:
-    log_lik_t = log_binomial_likelihood_grid(counts_t, n_eff_t, p_grid_t)
+    if posterior_distribution == "poisson":
+        log_lik_t = log_poisson_likelihood_grid(counts_t, p_grid_t)
+    elif posterior_distribution == "negative_binomial":
+        log_lik_t = log_negative_binomial_likelihood_grid(
+            counts_t, n_eff_t, p_grid_t, overdispersion=nb_overdispersion
+        )
+    else:
+        log_lik_t = log_binomial_likelihood_grid(counts_t, n_eff_t, p_grid_t)
     joint_log_post_t = log_lik_t + torch.log(weights_t.clamp_min(EPS)).unsqueeze(-2)
     joint_log_post_t = joint_log_post_t - torch.logsumexp(
         joint_log_post_t, dim=-1, keepdim=True
@@ -154,18 +179,31 @@ def _run_kbulk_inference_tensors(
     posterior_t = torch.exp(joint_log_post_t)
     map_idx_t = torch.argmax(posterior_t, dim=-1)
     p_support_t = p_grid_t[:, None, :].expand(-1, counts_t.shape[1], -1)
-    map_p_t = torch.gather(p_support_t, 2, map_idx_t.unsqueeze(-1)).squeeze(-1)
-    map_mu_t = map_p_t * float(S)
+    support_t = torch.gather(p_support_t, 2, map_idx_t.unsqueeze(-1)).squeeze(-1)
+    if posterior_distribution == "poisson":
+        map_rate_t = support_t
+        map_p_t = torch.full_like(map_rate_t, torch.nan)
+        map_mu_t = map_rate_t
+    else:
+        map_rate_t = None
+        map_p_t = support_t
+        map_mu_t = map_p_t * float(S)
     posterior_entropy_t = entropy(posterior_t)
     prior_entropy_t = entropy(weights_t)[:, None].expand(-1, counts_t.shape[1])
     mutual_information_t = torch.clamp(prior_entropy_t - posterior_entropy_t, min=0.0)
     return InferenceResult(
         gene_names=list(gene_names),
+        grid_domain=cast(Any, grid_domain),
         p_grid=p_grid_np,
         mu_grid=mu_grid_np,
         prior_weights=prior_weights_np,
         map_p=map_p_t.detach().cpu().numpy().T.astype(DTYPE_NP, copy=False),
         map_mu=map_mu_t.detach().cpu().numpy().T.astype(DTYPE_NP, copy=False),
+        map_rate=(
+            None
+            if map_rate_t is None
+            else map_rate_t.detach().cpu().numpy().T.astype(DTYPE_NP, copy=False)
+        ),
         posterior_entropy=posterior_entropy_t.detach()
         .cpu()
         .numpy()
@@ -197,9 +235,18 @@ def infer_kbulk_samples(
     device: str | torch.device = "cpu",
     include_posterior: bool = False,
     torch_dtype: str = "float32",
+    posterior_distribution: str | None = None,
+    nb_overdispersion: float = 0.01,
 ) -> InferenceResult:
     counts_np, exposure_np = _validate_sample_inputs(
-        gene_names, aggregated_counts, effective_exposure
+        gene_names,
+        aggregated_counts,
+        effective_exposure,
+        posterior_distribution=(
+            priors.distribution
+            if posterior_distribution is None
+            else posterior_distribution
+        ),
     )
     priors = priors.subset(gene_names).batched()
     priors.check_shape()
@@ -210,9 +257,16 @@ def infer_kbulk_samples(
         p_grid_np=np.asarray(priors.p_grid, dtype=np.float32),
         weights_np=np.asarray(priors.weights, dtype=np.float32),
         S=float(priors.S),
+        grid_domain=priors.grid_domain,
         device=device,
         torch_dtype=torch_dtype,
         include_posterior=include_posterior,
+        posterior_distribution=(
+            priors.distribution
+            if posterior_distribution is None
+            else posterior_distribution
+        ),
+        nb_overdispersion=nb_overdispersion,
     )
 
 
@@ -225,9 +279,18 @@ def infer_kbulk_samples_with_priors(
     device: str | torch.device = "cpu",
     include_posterior: bool = False,
     torch_dtype: str = "float32",
+    posterior_distribution: str | None = None,
+    nb_overdispersion: float = 0.01,
 ) -> InferenceResult:
     counts_np, exposure_np = _validate_sample_inputs(
-        gene_names, aggregated_counts, effective_exposure
+        gene_names,
+        aggregated_counts,
+        effective_exposure,
+        posterior_distribution=(
+            priors.distribution
+            if posterior_distribution is None
+            else posterior_distribution
+        ),
     )
     priors.check_shape()
     return _run_kbulk_inference(
@@ -237,9 +300,16 @@ def infer_kbulk_samples_with_priors(
         p_grid_np=np.asarray(priors.p_grid, dtype=np.float32),
         weights_np=np.asarray(priors.weights, dtype=np.float32),
         S=float(priors.S),
+        grid_domain=priors.grid_domain,
         device=device,
         torch_dtype=torch_dtype,
         include_posterior=include_posterior,
+        posterior_distribution=(
+            priors.distribution
+            if posterior_distribution is None
+            else posterior_distribution
+        ),
+        nb_overdispersion=nb_overdispersion,
     )
 
 
@@ -250,6 +320,8 @@ def infer_kbulk(
     device: str | torch.device = "cpu",
     include_posterior: bool = False,
     torch_dtype: str = "float32",
+    posterior_distribution: str | None = None,
+    nb_overdispersion: float = 0.01,
 ) -> KBulkResult:
     batch.check_shape()
     aggregated_counts = np.asarray(batch.counts, dtype=np.float32).sum(
@@ -266,9 +338,12 @@ def infer_kbulk(
         device=device,
         include_posterior=include_posterior,
         torch_dtype=torch_dtype,
+        posterior_distribution=posterior_distribution,
+        nb_overdispersion=nb_overdispersion,
     )
     return KBulkResult(
         gene_names=list(result.gene_names),
+        grid_domain=result.grid_domain,
         p_grid=result.p_grid,
         mu_grid=result.mu_grid,
         prior_weights=result.prior_weights,
@@ -277,6 +352,9 @@ def infer_kbulk(
         else np.asarray(result.posterior[0], dtype=DTYPE_NP),
         map_p=np.asarray(result.map_p[0], dtype=DTYPE_NP),
         map_mu=np.asarray(result.map_mu[0], dtype=DTYPE_NP),
+        map_rate=None
+        if result.map_rate is None
+        else np.asarray(result.map_rate[0], dtype=DTYPE_NP),
         posterior_entropy=np.asarray(result.posterior_entropy[0], dtype=DTYPE_NP),
         prior_entropy=np.asarray(result.prior_entropy[0], dtype=DTYPE_NP),
         mutual_information=np.asarray(result.mutual_information[0], dtype=DTYPE_NP),
@@ -291,6 +369,8 @@ class KBulkAggregator:
         *,
         device: str | torch.device = "cpu",
         torch_dtype: str = "float32",
+        posterior_distribution: str | None = None,
+        nb_overdispersion: float = 0.01,
     ) -> None:
         if not gene_names:
             raise ValueError("gene_names cannot be empty")
@@ -299,7 +379,13 @@ class KBulkAggregator:
         self.priors.check_shape()
         self.device = torch.device(device)
         self.torch_dtype = torch_dtype
-        self.dtype_obj = _resolve_torch_dtype(torch_dtype)
+        self.posterior_distribution = (
+            self.priors.distribution
+            if posterior_distribution is None
+            else posterior_distribution
+        )
+        self.nb_overdispersion = nb_overdispersion
+        self.dtype_obj = resolve_torch_dtype(torch_dtype)
         self.p_grid_np = np.asarray(self.priors.p_grid, dtype=np.float32)
         self.weights_np = np.asarray(self.priors.weights, dtype=np.float32)
         self.mu_grid_np = np.asarray(self.priors.mu_grid, dtype=DTYPE_NP)
@@ -323,6 +409,8 @@ class KBulkAggregator:
             device=self.device,
             include_posterior=include_posterior,
             torch_dtype=self.torch_dtype,
+            posterior_distribution=self.posterior_distribution,
+            nb_overdispersion=self.nb_overdispersion,
         )
 
     def query(
@@ -347,7 +435,10 @@ class KBulkAggregator:
         include_posterior: bool = False,
     ) -> InferenceResult:
         counts_np, exposure_np = _validate_sample_inputs(
-            self.gene_names, aggregated_counts, effective_exposure
+            self.gene_names,
+            aggregated_counts,
+            effective_exposure,
+            posterior_distribution=self.posterior_distribution,
         )
         counts_t = torch.as_tensor(
             counts_np.T, dtype=self.dtype_obj, device=self.device
@@ -367,5 +458,8 @@ class KBulkAggregator:
             mu_grid_np=self.mu_grid_np,
             prior_weights_np=self.prior_weights_np,
             S=float(self.priors.S),
+            grid_domain=self.priors.grid_domain,
             include_posterior=include_posterior,
+            posterior_distribution=self.posterior_distribution,
+            nb_overdispersion=self.nb_overdispersion,
         )

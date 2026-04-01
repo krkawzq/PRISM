@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-import sys
 from time import perf_counter
 
 import anndata as ad
@@ -16,12 +14,15 @@ from rich.table import Table
 from rich.traceback import install as install_rich_traceback
 from scipy import sparse
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-HPDEX_ROOT = Path("/zhoujingbo/wzq/Projects/hpdex")
-if str(HPDEX_ROOT) not in sys.path:
-    sys.path.insert(0, str(HPDEX_ROOT))
-
-from hpdex import parallel_differential_expression
+try:
+    from hpdex import parallel_differential_expression
+    from prism.io import read_gene_list
+except ImportError as exc:
+    raise ImportError(
+        "scripts/analysis/calc_degs.py requires both `hpdex` and the installed "
+        "`prism` package in the active environment. Install dependencies instead "
+        "of relying on a hard-coded local path."
+    ) from exc
 
 console = Console()
 install_rich_traceback(show_locals=False)
@@ -91,24 +92,6 @@ def rename_deg_columns(df: pd.DataFrame) -> pd.DataFrame:
 def to_plot_fg_format(df: pd.DataFrame) -> pd.DataFrame:
     renamed = df.rename(columns={"target": "label", "feature": "gene"}).copy()
     return pd.DataFrame(renamed[["gene", "label", "log2_fold_change", "fdr"]].copy())
-
-
-def read_gene_list(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        gene_names = payload.get("gene_names")
-        if not isinstance(gene_names, list) or not all(
-            isinstance(gene, str) and gene for gene in gene_names
-        ):
-            raise ValueError(f"invalid gene_names in {path}")
-        return list(dict.fromkeys(gene_names))
-    genes = [line.strip() for line in text.splitlines() if line.strip()]
-    if not genes:
-        raise ValueError(f"gene list is empty: {path}")
-    return list(dict.fromkeys(genes))
-
-
 def subset_genes(adata: ad.AnnData, gene_list_path: Path | None) -> ad.AnnData:
     if gene_list_path is None:
         return adata

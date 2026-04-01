@@ -18,6 +18,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from prism.io import write_h5ad_atomic
 from .common import (
     compute_reference_counts,
     console,
@@ -37,7 +38,6 @@ from .kbulk import (
     _resolve_target_samples,
     _sample_unique_combinations,
     _serialize_per_class_plan,
-    _write_h5ad_atomic,
 )
 
 
@@ -108,7 +108,9 @@ def extract_kbulk_mean_command(
         0, min=0, help="Random seed for kBulk combination sampling."
     ),
     sample_batch_size: int = typer.Option(
-        1024, min=1, help="Number of sampled combinations to aggregate per batch."
+        1024,
+        min=1,
+        help="Number of sampled combinations to aggregate per batch. Controls memory usage.",
     ),
     dtype: str = typer.Option("float32", help="Output dtype: float32 or float64."),
     dry_run: bool = typer.Option(
@@ -358,7 +360,7 @@ def extract_kbulk_mean_command(
     output.layers["mean_counts"] = np.asarray(mean_rows, dtype=output_dtype)
     output.layers["sum_counts"] = np.asarray(sum_rows, dtype=output_dtype)
     output.layers["zero_fraction"] = np.asarray(zero_rows, dtype=output_dtype)
-    _write_h5ad_atomic(output, output_path)
+    write_h5ad_atomic(output, output_path)
 
     for entry in per_class_plan:
         console.print(

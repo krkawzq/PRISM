@@ -88,3 +88,68 @@ def jsd(p: TorchTensor, q: TorchTensor) -> TorchTensor:
 def entropy(weights: TorchTensor) -> TorchTensor:
     values = -(weights * torch.log(weights.clamp_min(EPS))).sum(dim=-1)
     return torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def kl_divergence(p: TorchTensor, q: TorchTensor) -> TorchTensor:
+    """KL(p || q), per-gene."""
+    return (p * torch.log((p + EPS) / (q + EPS))).sum(dim=-1)
+
+
+def weighted_jsd(
+    q_hat: TorchTensor,
+    prior: TorchTensor,
+    posterior_entropy: TorchTensor,
+) -> TorchTensor:
+    """JSD weighted by inverse posterior entropy (high-confidence cells contribute more)."""
+    max_ent = math.log(prior.shape[-1]) + EPS
+    confidence = 1.0 - (posterior_entropy / max_ent).clamp(0.0, 1.0)
+    raw_jsd = jsd(q_hat, prior)
+    return (raw_jsd * confidence).mean(dim=-1) if confidence.ndim > 0 else raw_jsd
+
+
+def log_negative_binomial_likelihood_grid(
+    counts: TorchTensor,
+    effective_exposure: TorchTensor,
+    p_grid: TorchTensor,
+    overdispersion: float = 0.01,
+) -> TorchTensor:
+    """Negative binomial log-likelihood on a p-grid.
+
+    Parameterised as NB(x | mu, r) where mu = n_eff * p_grid and
+    r = 1/overdispersion.
+    """
+    if counts.shape != effective_exposure.shape:
+        raise ValueError(
+            f"counts and effective_exposure must match, "
+            f"got {tuple(counts.shape)} != {tuple(effective_exposure.shape)}"
+        )
+    x = counts.unsqueeze(-1)
+    n = effective_exposure.unsqueeze(-1)
+    p = p_grid.unsqueeze(-2).clamp(EPS, 1.0 - EPS)
+    mu = n * p
+    r = 1.0 / overdispersion
+    r_tensor = torch.tensor(r, dtype=x.dtype, device=x.device)
+    log_lik = (
+        torch.lgamma(x + r)
+        - torch.lgamma(x + 1.0)
+        - torch.lgamma(r_tensor)
+        + r * torch.log(r_tensor)
+        - r * torch.log(r_tensor + mu)
+        + x * torch.log(mu + EPS)
+        - x * torch.log(r_tensor + mu)
+    )
+    return log_lik
+
+
+def log_poisson_likelihood_grid(
+    counts: TorchTensor,
+    rate_grid: TorchTensor,
+) -> TorchTensor:
+    """Poisson log-likelihood on a rate grid.
+
+    Uses un-normalised form: log P(x | lambda) = x * log(lambda) - lambda.
+    No use of N_eff or effective_exposure.
+    """
+    x = counts.unsqueeze(-1)
+    lam = rate_grid.unsqueeze(-2).clamp(min=EPS)
+    return x * torch.log(lam) - lam

@@ -6,6 +6,11 @@ from typing import Any
 import numpy as np
 from scipy import sparse
 
+from prism.io import (
+    compute_reference_counts as compute_reference_counts_shared,
+    select_matrix as select_matrix_shared,
+    slice_gene_matrix as slice_gene_matrix_shared,
+)
 from prism.model import DTYPE_NP
 
 
@@ -27,11 +32,7 @@ class GeneCandidate:
 
 
 def select_matrix(adata: Any, layer: str | None):
-    if layer is None:
-        return adata.X
-    if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} does not exist")
-    return adata.layers[layer]
+    return select_matrix_shared(adata, layer)
 
 
 def compute_totals(matrix: Any) -> np.ndarray:
@@ -138,25 +139,23 @@ def slice_gene_counts(matrix: Any, gene_index: int) -> np.ndarray:
 def slice_gene_matrix(
     matrix: Any, gene_positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
-    subset = matrix[:, gene_positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=DTYPE_NP)
-    return np.asarray(subset, dtype=DTYPE_NP)
+    return slice_gene_matrix_shared(
+        matrix,
+        gene_positions,
+        cell_indices=cell_indices,
+        dtype=DTYPE_NP,
+    )
 
 
 def compute_reference_counts(
     matrix: Any, gene_positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
-    subset = matrix[:, gene_positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
-    else:
-        totals = np.asarray(subset, dtype=DTYPE_NP).sum(axis=1)
-    return np.asarray(totals, dtype=DTYPE_NP).reshape(-1)
+    return compute_reference_counts_shared(
+        matrix,
+        gene_positions,
+        cell_indices=cell_indices,
+        dtype=DTYPE_NP,
+    )
 
 
 def resolve_gene_positions(

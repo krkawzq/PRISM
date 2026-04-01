@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +7,9 @@ import matplotlib
 import numpy as np
 import pandas as pd
 from rich.console import Console
-from rich.table import Table
 
+from prism.cli.common import print_key_value_table, print_saved_path
+from prism.io import read_gene_list as read_gene_list_shared
 from prism.model import ModelCheckpoint, PriorGrid, ScaleMetadata
 
 matplotlib.use("Agg")
@@ -25,21 +25,7 @@ def safe_string_list(value: object) -> list[str]:
 
 
 def load_gene_list_file(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        gene_names = payload.get("gene_names")
-        if not isinstance(gene_names, list) or not all(
-            isinstance(item, str) and item for item in gene_names
-        ):
-            raise ValueError(
-                f"gene-list JSON is missing a valid gene_names field: {path}"
-            )
-        return list(dict.fromkeys(gene_names))
-    genes = [line.strip() for line in text.splitlines() if line.strip()]
-    if not genes:
-        raise ValueError(f"gene list is empty: {path}")
-    return list(dict.fromkeys(genes))
+    return read_gene_list_shared(path)
 
 
 def _format_annotation_value(value: object) -> str:
@@ -129,6 +115,9 @@ def validate_shared_metadata(
             "requested_fit_gene_names",
             "fit_mode",
             "label_key",
+            "fit_distribution",
+            "posterior_distribution",
+            "grid_domain",
         ):
             if checkpoint.metadata.get(key) != first.metadata.get(key):
                 raise ValueError(f"{path} has different metadata for {key!r}")
@@ -156,6 +145,14 @@ def merge_prior_scope(
         batched = priors.batched()
         if priors.S != first_priors.S:
             raise ValueError(f"{scope_name} has inconsistent S across checkpoints")
+        if priors.grid_domain != first_priors.grid_domain:
+            raise ValueError(
+                f"{scope_name} has inconsistent grid_domain across checkpoints"
+            )
+        if priors.distribution != first_priors.distribution:
+            raise ValueError(
+                f"{scope_name} has inconsistent distribution across checkpoints"
+            )
         for idx, gene_name in enumerate(batched.gene_names):
             if gene_name in rows:
                 raise ValueError(
@@ -183,23 +180,26 @@ def merge_prior_scope(
         p_grid=p_grid,
         weights=weights,
         S=float(first_priors.S),
+        grid_domain=first_priors.grid_domain,
+        distribution=first_priors.distribution,
     ), first_scale
 
 
 def print_merge_summary(
     output_path: Path, checkpoints: list[ModelCheckpoint], merged: ModelCheckpoint
 ) -> None:
-    table = Table(title="Merged Checkpoint")
-    table.add_column("Input genes", justify="right")
-    table.add_column("Merged genes", justify="right")
-    table.add_column("Label priors", justify="right")
-    table.add_row(
-        str(sum(len(checkpoint.gene_names) for checkpoint in checkpoints)),
-        str(len(merged.gene_names)),
-        str(len(merged.label_priors)),
+    print_key_value_table(
+        console,
+        title="Merged Checkpoint",
+        values={
+            "Input genes": sum(
+                len(checkpoint.gene_names) for checkpoint in checkpoints
+            ),
+            "Merged genes": len(merged.gene_names),
+            "Label priors": len(merged.label_priors),
+        },
     )
-    console.print(table)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
+    print_saved_path(console, output_path)
 
 
 def resolve_x_axis(value: str) -> str:

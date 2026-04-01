@@ -78,9 +78,18 @@ def plot_prior_fit(analysis: GeneAnalysis) -> str:
     axes[1].set_title("Observed proxy vs inferred signal")
     axes[1].set_xlabel("mu-scale")
     axes[1].legend(frameon=False)
-    axes[2].plot(analysis.support_p, analysis.prior_weights, color="#0f766e", lw=2.0)
-    axes[2].set_title("Prior mass over p grid")
-    axes[2].set_xlabel("p")
+    if np.any(np.isfinite(analysis.support_p)):
+        axes[2].plot(
+            analysis.support_p, analysis.prior_weights, color="#0f766e", lw=2.0
+        )
+        axes[2].set_title("Prior mass over p grid")
+        axes[2].set_xlabel("p")
+    else:
+        axes[2].plot(
+            analysis.support_mu, analysis.prior_weights, color="#0f766e", lw=2.0
+        )
+        axes[2].set_title("Prior mass over rate grid")
+        axes[2].set_xlabel("rate")
     fig.tight_layout()
     return fig_to_uri(fig)
 

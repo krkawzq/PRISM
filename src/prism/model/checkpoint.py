@@ -26,12 +26,25 @@ def checkpoint_from_fit_result(
     *,
     metadata: dict[str, Any] | None = None,
 ) -> ModelCheckpoint:
+    resolved_metadata = {} if metadata is None else dict(metadata)
+    resolved_metadata.setdefault(
+        "fit_distribution", str(result.config.get("likelihood", "binomial"))
+    )
+    resolved_metadata.setdefault(
+        "posterior_distribution",
+        str(resolved_metadata.get("fit_distribution", "binomial")),
+    )
+    resolved_metadata.setdefault("grid_domain", result.priors.grid_domain)
+    if "nb_overdispersion" in result.config:
+        resolved_metadata.setdefault(
+            "nb_overdispersion", result.config.get("nb_overdispersion")
+        )
     return ModelCheckpoint(
         gene_names=list(result.gene_names),
         priors=result.priors,
         scale=result.scale,
         fit_config=dict(result.config),
-        metadata={} if metadata is None else dict(metadata),
+        metadata=resolved_metadata,
         label_priors={},
         label_scales={},
     )
@@ -44,6 +57,7 @@ def _serialize_prior_grid(priors: PriorGrid) -> dict[str, Any]:
         "weights": np.asarray(priors.weights),
         "S": float(priors.S),
         "grid_domain": priors.grid_domain,
+        "distribution": priors.distribution,
     }
 
 
@@ -54,10 +68,29 @@ def _deserialize_prior_grid(payload: dict[str, Any]) -> PriorGrid:
         weights=np.asarray(payload["weights"], dtype=np.float64),
         S=float(payload["S"]),
         grid_domain=cast(Any, str(payload.get("grid_domain", "p"))),
+        distribution=cast(Any, str(payload.get("distribution", "binomial"))),
     )
 
 
 def save_checkpoint(checkpoint: ModelCheckpoint, path: str | Path) -> None:
+    metadata = dict(checkpoint.metadata)
+    if checkpoint.priors is not None:
+        metadata.setdefault("grid_domain", checkpoint.priors.grid_domain)
+    metadata.setdefault(
+        "fit_distribution", str(checkpoint.fit_config.get("likelihood", "binomial"))
+    )
+    metadata.setdefault(
+        "posterior_distribution",
+        str(
+            metadata.get(
+                "fit_distribution", checkpoint.fit_config.get("likelihood", "binomial")
+            )
+        ),
+    )
+    if "nb_overdispersion" in checkpoint.fit_config:
+        metadata.setdefault(
+            "nb_overdispersion", checkpoint.fit_config.get("nb_overdispersion")
+        )
     payload = {
         "schema_version": 2,
         "gene_names": checkpoint.gene_names,
@@ -66,7 +99,7 @@ def save_checkpoint(checkpoint: ModelCheckpoint, path: str | Path) -> None:
         else _serialize_prior_grid(checkpoint.priors),
         "scale": None if checkpoint.scale is None else asdict(checkpoint.scale),
         "fit_config": dict(checkpoint.fit_config),
-        "metadata": dict(checkpoint.metadata),
+        "metadata": metadata,
         "label_priors": {
             str(label): _serialize_prior_grid(priors)
             for label, priors in checkpoint.label_priors.items()

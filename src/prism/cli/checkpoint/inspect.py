@@ -33,6 +33,21 @@ def inspect_checkpoint_command(
     table.add_row("genes", str(len(checkpoint.gene_names)))
     table.add_row("global_priors", str(checkpoint.priors is not None))
     table.add_row("label_priors", str(len(checkpoint.label_priors)))
+    table.add_row("fit_distribution", str(metadata.get("fit_distribution", "binomial")))
+    table.add_row(
+        "posterior_distribution",
+        str(
+            metadata.get(
+                "posterior_distribution", metadata.get("fit_distribution", "binomial")
+            )
+        ),
+    )
+    table.add_row(
+        "grid_domain",
+        str(
+            metadata.get("grid_domain", getattr(checkpoint.priors, "grid_domain", "p"))
+        ),
+    )
     table.add_row("S", "-" if checkpoint.scale is None else f"{checkpoint.scale.S:.4f}")
     table.add_row(
         "mean_reference_count",

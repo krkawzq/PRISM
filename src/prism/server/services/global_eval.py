@@ -174,8 +174,28 @@ def _extract_signal_matrix(
     reference_counts: np.ndarray,
     batch_size: int,
 ) -> np.ndarray:
-    priors = checkpoint.checkpoint.priors.subset(gene_names)
-    posterior = Posterior(gene_names, priors)
+    checkpoint_priors = checkpoint.checkpoint.priors
+    if checkpoint_priors is None:
+        raise ValueError("global evaluation requires global priors")
+    priors = checkpoint_priors.subset(gene_names)
+    metadata = checkpoint.checkpoint.metadata
+    posterior_distribution = str(
+        metadata.get(
+            "posterior_distribution", metadata.get("fit_distribution", "binomial")
+        )
+    )
+    nb_overdispersion = float(
+        checkpoint.checkpoint.fit_config.get(
+            "nb_overdispersion", metadata.get("nb_overdispersion", 0.01)
+        )
+    )
+    posterior = Posterior(
+        gene_names,
+        priors,
+        torch_dtype="float32",
+        posterior_distribution=posterior_distribution,
+        nb_overdispersion=nb_overdispersion,
+    )
     signal = np.zeros_like(counts, dtype=np.float32)
     requested = cast(set[SignalChannel], {"signal"})
     for offset in range(0, len(gene_names), batch_size):
@@ -229,7 +249,10 @@ def _top_entropy_genes(loaded: LoadedState, *, limit: int) -> list[tuple[str, fl
     checkpoint = loaded.checkpoint
     if checkpoint is None:
         raise ValueError("global evaluation requires a loaded checkpoint")
-    priors = checkpoint.checkpoint.priors.batched()
+    checkpoint_priors = checkpoint.checkpoint.priors
+    if checkpoint_priors is None:
+        raise ValueError("global evaluation requires global priors")
+    priors = checkpoint_priors.batched()
     weights = np.asarray(priors.weights, dtype=np.float64)
     entropy = -(weights * np.log(np.clip(weights, 1e-12, None))).sum(axis=-1)
     order = np.argsort(entropy)[::-1][:limit]

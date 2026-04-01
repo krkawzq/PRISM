@@ -7,9 +7,15 @@ from typing import Any
 import anndata as ad
 import numpy as np
 from rich.console import Console
-from rich.table import Table
-from scipy import sparse
 
+from prism.cli.common import normalize_choice, print_elapsed, print_key_value_table, print_saved_path
+from prism.io import (
+    compute_reference_counts as compute_reference_counts_shared,
+    ensure_dense_matrix as ensure_dense_matrix_shared,
+    read_gene_list as read_gene_list_shared,
+    select_matrix as select_matrix_shared,
+    slice_gene_matrix as slice_gene_matrix_shared,
+)
 from prism.model import ModelCheckpoint, PriorGrid
 
 console = Console()
@@ -35,10 +41,11 @@ def parse_shard(value: str) -> tuple[int, int]:
 
 
 def resolve_fit_mode(value: str) -> str:
-    resolved = value.strip().lower()
-    if resolved not in {"global", "by-label", "both"}:
-        raise ValueError("fit_mode must be one of: global, by-label, both")
-    return resolved
+    return normalize_choice(
+        value,
+        supported=("global", "by-label", "both"),
+        option_name="--fit-mode",
+    )
 
 
 def resolve_label_groups(
@@ -121,11 +128,7 @@ def checkpoint_gene_names(
 
 
 def read_gene_list(path: Path) -> list[str]:
-    return [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
+    return read_gene_list_shared(path)
 
 
 def resolve_gene_list(
@@ -161,50 +164,37 @@ def shard_gene_names(gene_names: list[str], *, rank: int, world_size: int) -> li
 
 
 def select_matrix(adata: ad.AnnData, layer: str | None):
-    if layer is None:
-        return adata.X
-    if layer not in adata.layers:
-        raise KeyError(f"layer {layer!r} does not exist")
-    return adata.layers[layer]
+    return select_matrix_shared(adata, layer)
 
 
 def ensure_dense_matrix(matrix) -> np.ndarray:
-    if sparse.issparse(matrix):
-        return np.asarray(matrix.toarray(), dtype=np.float32)
-    return np.asarray(matrix, dtype=np.float32)
+    return ensure_dense_matrix_shared(matrix, dtype=np.float32)
 
 
 def slice_gene_counts(
     matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
-    subset = matrix[:, positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        return np.asarray(subset.toarray(), dtype=np.float64)
-    return np.asarray(subset, dtype=np.float64)
+    return slice_gene_matrix_shared(
+        matrix,
+        positions,
+        cell_indices=cell_indices,
+        dtype=np.float64,
+    )
 
 
 def compute_reference_counts(
     matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
-    subset = matrix[:, positions]
-    if cell_indices is not None:
-        subset = subset[cell_indices, :]
-    if sparse.issparse(subset):
-        totals = np.asarray(subset.sum(axis=1)).reshape(-1)
-    else:
-        totals = np.asarray(subset, dtype=np.float64).sum(axis=1)
-    return np.asarray(totals, dtype=np.float64).reshape(-1)
+    return compute_reference_counts_shared(
+        matrix,
+        positions,
+        cell_indices=cell_indices,
+        dtype=np.float64,
+    )
 
 
 def print_fit_plan(**values: Any) -> None:
-    table = Table(title="Fit Plan")
-    table.add_column("Field")
-    table.add_column("Value")
-    for key, value in values.items():
-        table.add_row(key, str(value))
-    console.print(table)
+    print_key_value_table(console, title="Fit Plan", values=values)
 
 
 def print_fit_summary(
@@ -216,11 +206,14 @@ def print_fit_summary(
         if checkpoint.scale is None
         else f"{checkpoint.scale.mean_reference_count:.4f}"
     )
-    table = Table(title="Fit Summary")
-    table.add_column("Genes", justify="right")
-    table.add_column("S", justify="right")
-    table.add_column("Mean ref count", justify="right")
-    table.add_row(str(len(checkpoint.gene_names)), s_value, mean_ref)
-    console.print(table)
-    console.print(f"[bold green]Saved[/bold green] {output_path}")
-    console.print(f"[bold green]Elapsed[/bold green] {elapsed_sec:.2f}s")
+    print_key_value_table(
+        console,
+        title="Fit Summary",
+        values={
+            "Genes": len(checkpoint.gene_names),
+            "S": s_value,
+            "Mean ref count": mean_ref,
+        },
+    )
+    print_saved_path(console, output_path)
+    print_elapsed(console, elapsed_sec)

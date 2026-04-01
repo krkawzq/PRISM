@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-import sys
 from time import perf_counter
 from typing import Any
 
@@ -20,18 +18,20 @@ from scipy import sparse
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from prism.model import (
-    ObservationBatch,
-    PriorFitConfig,
-    fit_gene_priors,
-    fit_gene_priors_em,
-    mean_reference_count,
-)
+try:
+    from prism.io import read_gene_list
+    from prism.model import (
+        ObservationBatch,
+        PriorFitConfig,
+        fit_gene_priors,
+        fit_gene_priors_em,
+        mean_reference_count,
+    )
+except ImportError as exc:
+    raise ImportError(
+        "PRISM is not installed in the active environment. Run `pip install -e .` "
+        "from the repository root before executing scripts/dev/test_em.py."
+    ) from exc
 
 console = Console()
 install_rich_traceback(show_locals=False)
@@ -74,21 +74,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", type=str, default="cpu")
     return parser.parse_args()
-
-
-def read_gene_list(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        gene_names = payload.get("gene_names")
-        if not isinstance(gene_names, list) or not all(
-            isinstance(x, str) for x in gene_names
-        ):
-            raise ValueError(f"invalid gene_names in {path}")
-        return [gene for gene in gene_names if gene]
-    return [line.strip() for line in text.splitlines() if line.strip()]
-
-
 def resolve_selected_genes(args: argparse.Namespace) -> list[str]:
     if args.gene and args.gene_list is not None:
         raise ValueError("--gene and --gene-list are mutually exclusive")

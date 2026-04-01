@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
-import sys
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -30,10 +28,14 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-
-from prism.baseline import DeepMLPClassifier, LinearClassifier, MLPClassifier
+try:
+    from prism.baseline import DeepMLPClassifier, LinearClassifier, MLPClassifier
+    from prism.io import read_gene_list
+except ImportError as exc:
+    raise ImportError(
+        "PRISM is not installed in the active environment. Run `pip install -e .` "
+        "from the repository root before executing scripts/experiments/train_baseline.py."
+    ) from exc
 
 console = Console()
 install_rich_traceback(show_locals=False)
@@ -47,26 +49,6 @@ LR = 1e-3
 WD = 1e-4
 EPOCHS = {"linear": 30, "mlp": 50, "deep-mlp": 100}
 HIDDEN = {"mlp": (1024,), "deep-mlp": (1024, 512, 256)}
-
-
-def read_gene_list(path: Path) -> list[str]:
-    text = path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        gene_names = payload.get("gene_names")
-        if not isinstance(gene_names, list) or not all(
-            isinstance(gene, str) and gene for gene in gene_names
-        ):
-            raise ValueError(
-                f"gene-list JSON is missing a valid gene_names field: {path}"
-            )
-        return list(dict.fromkeys(gene_names))
-    genes = [line.strip() for line in text.splitlines() if line.strip()]
-    if not genes:
-        raise ValueError(f"gene list is empty: {path}")
-    return list(dict.fromkeys(genes))
-
-
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------

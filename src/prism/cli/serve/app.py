@@ -11,7 +11,9 @@ def serve(
     browse_page_size: int = typer.Option(25, min=1, help="Gene browser page size."),
     top_gene_limit: int = typer.Option(32, min=1, help="Default search result limit."),
     inference_batch_size: int = typer.Option(
-        128, min=1, help="Batch size for checkpoint-backed signal extraction."
+        128,
+        min=1,
+        help="Number of genes per inference batch for checkpoint-backed signal extraction.",
     ),
 ) -> int:
     run_server(

@@ -18,6 +18,7 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from prism.io import read_string_list
 from prism.model import (
     ModelCheckpoint,
     ObservationBatch,
@@ -26,6 +27,7 @@ from prism.model import (
     ScaleMetadata,
     fit_gene_priors,
     fit_gene_priors_em,
+    load_checkpoint,
     save_checkpoint,
 )
 
@@ -85,7 +87,7 @@ def fit_priors_command(
         "--label-list",
         exists=True,
         dir_okay=False,
-        help="Optional text file with one label value per line.",
+        help="Optional text/JSON file with label values.",
     ),
     fit_mode: str = typer.Option(
         "global", help="Fit scope: global, by-label, or both."
@@ -103,7 +105,9 @@ def fit_priors_command(
     ),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
     gene_batch_size: int = typer.Option(
-        64, min=1, help="Number of genes per fit batch."
+        64,
+        min=1,
+        help="Number of genes to fit per batch. Controls memory usage during prior fitting.",
     ),
     shard: str = typer.Option(
         "0/1", help="Shard specification as rank/world, e.g. 0/4."
@@ -115,6 +119,9 @@ def fit_priors_command(
     align_loss_weight: float = typer.Option(
         1.0, min=0.0, help="Posterior-prior alignment weight."
     ),
+    align_every: int = typer.Option(
+        1, min=1, help="Recompute the alignment term every N optimization steps."
+    ),
     lr: float = typer.Option(0.05, min=1e-12, help="Optimizer learning rate."),
     n_iter: int = typer.Option(100, min=1, help="Optimization iterations."),
     lr_min_ratio: float = typer.Option(
@@ -123,15 +130,115 @@ def fit_priors_command(
     grad_clip: float | None = typer.Option(
         None, min=0.0, help="Optional gradient clipping threshold."
     ),
+    early_stop_tol: float | None = typer.Option(
+        None,
+        min=0.0,
+        help="Optional minimum loss improvement required to reset early stopping.",
+    ),
+    early_stop_patience: int | None = typer.Option(
+        None,
+        min=1,
+        help="Optional number of non-improving steps allowed before stopping early.",
+    ),
+    init_method: str = typer.Option(
+        "posterior_mean",
+        help="Initialization method: posterior_mean, uniform, or random.",
+    ),
+    init_seed: int = typer.Option(
+        0, min=0, help="Random seed used by random initialization."
+    ),
     init_temperature: float = typer.Option(
         1.0, min=1e-12, help="Initialization temperature."
     ),
     cell_chunk_size: int = typer.Option(
-        512, min=1, help="Likelihood chunk size over cells."
+        512,
+        min=1,
+        help="Number of cells per likelihood computation chunk. Controls GPU memory usage.",
     ),
     optimizer: str = typer.Option("adamw", help="Optimizer name."),
     scheduler: str = typer.Option("cosine", help="Scheduler name."),
     torch_dtype: str = typer.Option("float64", help="Torch dtype: float64 or float32."),
+    grid_max_method: str = typer.Option(
+        "observed_max",
+        help="Grid max bound method: observed_max or quantile.",
+    ),
+    grid_strategy: str = typer.Option(
+        "linear",
+        help="Grid spacing strategy: linear or sqrt.",
+    ),
+    sigma_anneal_start: float | None = typer.Option(
+        None,
+        min=0.0,
+        help="Optional sigma_bins value at the start of training (annealing from large to small).",
+    ),
+    sigma_anneal_end: float | None = typer.Option(
+        None,
+        min=0.0,
+        help="Optional sigma_bins value at the end of training.",
+    ),
+    adaptive_grid: bool = typer.Option(
+        False,
+        help="Enable two-phase adaptive grid refinement.",
+    ),
+    adaptive_grid_fraction: float = typer.Option(
+        0.3,
+        min=0.01,
+        max=1.0,
+        help="Fraction of grid points concentrated in high-mass region during adaptive refinement.",
+    ),
+    adaptive_grid_quantile_lo: float = typer.Option(
+        0.01,
+        min=0.0,
+        max=0.999999,
+        help="Lower posterior mass quantile used to define the adaptive-grid focus region.",
+    ),
+    adaptive_grid_quantile_hi: float = typer.Option(
+        0.99,
+        min=0.000001,
+        max=1.0,
+        help="Upper posterior mass quantile used to define the adaptive-grid focus region.",
+    ),
+    cell_sample_fraction: float = typer.Option(
+        1.0,
+        min=0.01,
+        max=1.0,
+        help="Fraction of cell chunks to sample per step (mini-batch SGD). 1.0 = use all.",
+    ),
+    cell_sample_seed: int = typer.Option(
+        0,
+        min=0,
+        help="Random seed for cell chunk sampling.",
+    ),
+    align_mode: str = typer.Option(
+        "jsd",
+        help="Alignment loss mode: jsd, kl, or weighted_jsd.",
+    ),
+    shrinkage_weight: float = typer.Option(
+        0.0,
+        min=0.0,
+        max=1.0,
+        help="Weight for shrinking per-gene priors toward the batch mean. 0 = no shrinkage.",
+    ),
+    ensemble_restarts: int = typer.Option(
+        1,
+        min=1,
+        help="Number of random restarts; best result is kept.",
+    ),
+    likelihood: str = typer.Option(
+        "binomial",
+        help="Ablation fit distribution: binomial, negative_binomial, or poisson.",
+    ),
+    nb_overdispersion: float = typer.Option(
+        0.01,
+        min=1e-6,
+        help="Overdispersion parameter for negative binomial likelihood (1/r).",
+    ),
+    warm_start_checkpoint: Path | None = typer.Option(
+        None,
+        exists=True,
+        dir_okay=False,
+        help="Optional checkpoint used to initialize prior weights when matching genes are available.",
+    ),
     fit_method: str = typer.Option(
         "gradient",
         help="Prior fitting method: gradient or em.",
@@ -159,24 +266,68 @@ def fit_priors_command(
     label_list_path = (
         None if label_list_path is None else label_list_path.expanduser().resolve()
     )
+    warm_start_checkpoint = (
+        None
+        if warm_start_checkpoint is None
+        else warm_start_checkpoint.expanduser().resolve()
+    )
 
     rank, world_size = parse_shard(shard)
     fit_method_resolved = fit_method.strip().lower()
     if fit_method_resolved not in {"gradient", "em"}:
         raise ValueError("fit_method must be one of: gradient, em")
+    grid_max_method_resolved = grid_max_method.strip().lower()
+    if grid_max_method_resolved not in {"observed_max", "quantile"}:
+        raise ValueError("grid_max_method must be one of: observed_max, quantile")
+    grid_strategy_resolved = grid_strategy.strip().lower()
+    if grid_strategy_resolved not in {"linear", "sqrt"}:
+        raise ValueError("grid_strategy must be one of: linear, sqrt")
+    align_mode_resolved = align_mode.strip().lower()
+    if align_mode_resolved not in {"jsd", "kl", "weighted_jsd"}:
+        raise ValueError("align_mode must be one of: jsd, kl, weighted_jsd")
+    likelihood_resolved = likelihood.strip().lower()
+    if likelihood_resolved not in {"binomial", "negative_binomial", "poisson"}:
+        raise ValueError(
+            "likelihood must be one of: binomial, negative_binomial, poisson"
+        )
     fit_config = PriorFitConfig(
         grid_size=grid_size,
         sigma_bins=sigma_bins,
         align_loss_weight=align_loss_weight,
+        align_every=align_every,
         lr=lr,
         n_iter=n_iter,
         lr_min_ratio=lr_min_ratio,
         grad_clip=grad_clip,
+        early_stop_tol=early_stop_tol,
+        early_stop_patience=early_stop_patience,
+        init_method=cast(Any, init_method),
+        init_seed=init_seed,
         init_temperature=init_temperature,
         cell_chunk_size=cell_chunk_size,
         optimizer=cast(Any, optimizer),
         scheduler=cast(Any, scheduler),
         torch_dtype=cast(Any, torch_dtype),
+        grid_max_method=cast(Any, grid_max_method_resolved),
+        grid_strategy=cast(Any, grid_strategy_resolved),
+        sigma_anneal_start=sigma_anneal_start,
+        sigma_anneal_end=sigma_anneal_end,
+        adaptive_grid=adaptive_grid,
+        adaptive_grid_fraction=adaptive_grid_fraction,
+        adaptive_grid_quantile_lo=adaptive_grid_quantile_lo,
+        adaptive_grid_quantile_hi=adaptive_grid_quantile_hi,
+        cell_sample_fraction=cell_sample_fraction,
+        cell_sample_seed=cell_sample_seed,
+        align_mode=cast(Any, align_mode_resolved),
+        shrinkage_weight=shrinkage_weight,
+        ensemble_restarts=ensemble_restarts,
+        likelihood=cast(Any, likelihood_resolved),
+        nb_overdispersion=nb_overdispersion,
+    )
+    warm_start = (
+        None
+        if warm_start_checkpoint is None
+        else load_checkpoint(warm_start_checkpoint)
     )
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
@@ -220,7 +371,7 @@ def fit_priors_command(
         if label_values:
             merged_labels.extend(label_values)
         if label_list_path is not None:
-            merged_labels.extend(read_gene_list(label_list_path))
+            merged_labels.extend(read_string_list(label_list_path))
         resolved_label_values = list(dict.fromkeys(merged_labels))
     label_groups = resolve_label_groups(
         adata=adata,
@@ -251,6 +402,14 @@ def fit_priors_command(
         device=device,
         fit_method=fit_method_resolved,
         em_tol=em_tol,
+        align_every=align_every,
+        early_stop_tol=early_stop_tol,
+        early_stop_patience=early_stop_patience,
+        init_method=init_method,
+        init_seed=init_seed,
+        warm_start_checkpoint=warm_start_checkpoint,
+        grid_max_method=grid_max_method_resolved,
+        grid_strategy=grid_strategy_resolved,
         gene_batch_size=gene_batch_size,
         shard=f"{rank}/{world_size}",
         output_path=output_path,
@@ -326,12 +485,35 @@ def fit_priors_command(
                     counts=batch_counts,
                     reference_counts=task_reference_counts,
                 )
+                init_prior_weights = None
+                init_source = None
+                if warm_start is not None:
+                    warm_priors = None
+                    if (
+                        task.label_value is not None
+                        and task.label_value in warm_start.label_priors
+                    ):
+                        warm_priors = warm_start.label_priors[task.label_value]
+                        init_source = f"label:{task.label_value}"
+                    elif warm_start.priors is not None:
+                        warm_priors = warm_start.priors
+                        init_source = "global"
+                    if warm_priors is not None and set(names).issubset(
+                        set(warm_priors.gene_names)
+                    ):
+                        init_prior_weights = np.asarray(
+                            warm_priors.subset(list(names)).batched().weights,
+                            dtype=np.float64,
+                        )
+                    else:
+                        init_source = None
                 if fit_method_resolved == "gradient":
                     result = fit_gene_priors(
                         observation_batch,
                         S=resolved_S,
                         config=fit_config,
                         device=device,
+                        init_prior_weights=init_prior_weights,
                     )
                 else:
                     result = fit_gene_priors_em(
@@ -339,6 +521,7 @@ def fit_priors_command(
                         S=resolved_S,
                         config=fit_config,
                         device=device,
+                        init_prior_weights=init_prior_weights,
                         tol=em_tol,
                     )
                 priors = result.priors.batched()
@@ -351,6 +534,7 @@ def fit_priors_command(
                         "final_loss": float(result.final_loss),
                         "best_loss": float(result.best_loss),
                         "n_iter_run": int(len(result.loss_history)),
+                        "init_source": init_source,
                     }
                 )
             merged_priors = PriorGrid(
@@ -358,6 +542,8 @@ def fit_priors_command(
                 p_grid=np.concatenate(fitted_p_grids, axis=0),
                 weights=np.concatenate(fitted_weights, axis=0),
                 S=resolved_S,
+                grid_domain="rate" if fit_config.likelihood == "poisson" else "p",
+                distribution=fit_config.likelihood,
             )
             task_scale = ScaleMetadata(
                 S=resolved_S, mean_reference_count=float(np.mean(task_reference_counts))
@@ -408,7 +594,16 @@ def fit_priors_command(
             "shard_world_size": int(world_size),
             "fit_mode": fit_mode_resolved,
             "fit_method": fit_method_resolved,
+            "fit_distribution": fit_config.likelihood,
+            "posterior_distribution": fit_config.likelihood,
+            "grid_domain": "rate" if fit_config.likelihood == "poisson" else "p",
             "em_tol": float(em_tol),
+            "nb_overdispersion": float(nb_overdispersion),
+            "warm_start_checkpoint": None
+            if warm_start_checkpoint is None
+            else str(warm_start_checkpoint),
+            "grid_max_method": grid_max_method_resolved,
+            "grid_strategy": grid_strategy_resolved,
             "label_key": label_key,
             "label_values": [
                 task.label_value for task in fit_tasks if task.label_value is not None

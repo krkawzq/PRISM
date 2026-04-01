@@ -30,7 +30,7 @@ def script_dir() -> Path:
 
 
 def project_root() -> Path:
-    return script_dir().parent
+    return Path(__file__).resolve().parents[2]
 
 
 def default_data_dir() -> Path:

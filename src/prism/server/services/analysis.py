@@ -189,6 +189,13 @@ def build_dataset_summary(state: AppState) -> dict[str, object]:
     if cached is not None:
         return cast(dict[str, object], cached)
     checkpoint = loaded.checkpoint
+    checkpoint_scale = None if checkpoint is None else checkpoint.checkpoint.scale
+    checkpoint_S = None if checkpoint_scale is None else float(checkpoint_scale.S)
+    checkpoint_mean_reference_count = (
+        None
+        if checkpoint_scale is None
+        else float(checkpoint_scale.mean_reference_count)
+    )
     summary = {
         "n_cells": loaded.n_cells,
         "n_genes": loaded.n_genes,
@@ -196,13 +203,11 @@ def build_dataset_summary(state: AppState) -> dict[str, object]:
         "layer": loaded.dataset.layer or "X",
         "h5ad_path": str(loaded.dataset.h5ad_path),
         "ckpt_path": "" if checkpoint is None else str(checkpoint.ckpt_path),
-        "S": None if checkpoint is None else float(checkpoint.checkpoint.scale.S),
+        "S": checkpoint_S,
         "S_source": None
         if checkpoint is None
         else str(checkpoint.checkpoint.metadata.get("S_source", "checkpoint")),
-        "mean_reference_count": None
-        if checkpoint is None
-        else float(checkpoint.checkpoint.scale.mean_reference_count),
+        "mean_reference_count": checkpoint_mean_reference_count,
         "reference_genes": 0
         if checkpoint is None
         else len(checkpoint.reference_gene_names),
@@ -367,10 +372,16 @@ def _analyze_gene_uncached(
         and loaded.checkpoint is not None
         and gene_name in set(loaded.fitted_gene_names)
     ):
-        priors = loaded.checkpoint.checkpoint.priors.subset(gene_name)
+        checkpoint_priors = loaded.checkpoint.checkpoint.priors
+        checkpoint_scale = loaded.checkpoint.checkpoint.scale
+        if checkpoint_priors is None:
+            raise ValueError("checkpoint-backed analysis requires global priors")
+        if checkpoint_scale is None:
+            raise ValueError("checkpoint-backed analysis requires scale metadata")
+        priors = checkpoint_priors.subset(gene_name)
         reference_names = list(loaded.checkpoint.reference_gene_names)
         reference_mode = "checkpoint"
-        S = float(loaded.checkpoint.checkpoint.scale.S)
+        S = float(checkpoint_scale.S)
         S_source = str(
             loaded.checkpoint.checkpoint.metadata.get("S_source", "checkpoint")
         )
@@ -426,7 +437,19 @@ def _analyze_gene_uncached(
     reference_counts = compute_reference_counts(
         loaded.dataset.matrix, reference_positions
     )
-    posterior = Posterior([gene_name], priors, device="cpu")
+    checkpoint_metadata = (
+        {} if loaded.checkpoint is None else loaded.checkpoint.checkpoint.metadata
+    )
+    posterior = Posterior(
+        [gene_name],
+        priors,
+        device="cpu",
+        torch_dtype="float32",
+        posterior_distribution=_resolve_posterior_distribution(
+            checkpoint_metadata, fit_payload
+        ),
+        nb_overdispersion=_resolve_nb_overdispersion(checkpoint_metadata, fit_payload),
+    )
     summary = posterior.summarize(
         ObservationBatch(
             gene_names=[gene_name],
@@ -528,6 +551,38 @@ def _representative_indices(values: np.ndarray, n: int) -> np.ndarray:
     return np.unique(order[anchors])
 
 
+def _resolve_posterior_distribution(
+    metadata: dict[str, object], fit_config: dict[str, object] | None = None
+) -> str:
+    if fit_config is not None:
+        value = fit_config.get("likelihood")
+        if isinstance(value, str) and value:
+            return value
+    value = metadata.get("posterior_distribution")
+    if isinstance(value, str) and value:
+        return value
+    fit_value = metadata.get("fit_distribution")
+    if isinstance(fit_value, str) and fit_value:
+        return fit_value
+    return "binomial"
+
+
+def _resolve_nb_overdispersion(
+    metadata: dict[str, object], fit_config: dict[str, object] | None = None
+) -> float:
+    if fit_config is not None:
+        value = fit_config.get("nb_overdispersion")
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            return float(value)
+    value = metadata.get("nb_overdispersion", 0.01)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return 0.01
+
+
 def _safe_corr(x: np.ndarray, y: np.ndarray) -> float:
     if np.std(x) < 1e-12 or np.std(y) < 1e-12:
         return 0.0
@@ -624,6 +679,10 @@ def _compute_kbulk_comparison(
                 ),
                 priors,
                 include_posterior=False,
+                posterior_distribution=_resolve_posterior_distribution(
+                    {}, fit_result.config
+                ),
+                nb_overdispersion=_resolve_nb_overdispersion({}, fit_result.config),
             )
             sampled_mu.append(float(kbulk.map_mu[0]))
             sampled_p.append(float(kbulk.map_p[0]))

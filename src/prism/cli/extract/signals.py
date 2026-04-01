@@ -56,8 +56,15 @@ def extract_signals_command(
     label_key: str | None = typer.Option(
         None, help="Obs column used when --prior-source label."
     ),
-    batch_size: int = typer.Option(128, min=1, help="Genes per extraction batch."),
+    batch_size: int = typer.Option(
+        128,
+        min=1,
+        help="Number of genes per extraction batch. Controls memory usage during signal extraction.",
+    ),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
+    torch_dtype: str = typer.Option(
+        "float32", help="Torch dtype for inference: float32 or float64."
+    ),
     dtype: str = typer.Option("float32", help="Output dtype: float32 or float64."),
     channels: list[str] | None = typer.Option(
         None,
@@ -168,14 +175,15 @@ def extract_signals_command(
                 prior_source=prior_source_resolved,
                 label_key=label_key,
                 device=device,
+                torch_dtype=torch_dtype,
                 selected_channels=selected_channels,
             )
+            batch_positions = np.asarray(
+                [output_positions[name] for name in batch_names], dtype=np.int64
+            )
             for channel in selected_channels:
-                values = np.asarray(extracted[channel], dtype=np.float64)
-                for local_idx, gene_name in enumerate(batch_names):
-                    layer_arrays[channel][:, output_positions[gene_name]] = values[
-                        :, local_idx
-                    ].astype(output_dtype, copy=False)
+                values = np.asarray(extracted[channel], dtype=output_dtype)
+                layer_arrays[channel][:, batch_positions] = values
             progress.update(
                 task_id,
                 advance=1,

@@ -70,7 +70,8 @@ class PriorGrid:
     p_grid: np.ndarray  # (G, M) or (M,)
     weights: np.ndarray  # (G, M) or (M,)
     S: float
-    grid_domain: Literal["p"] = "p"
+    grid_domain: Literal["p", "rate"] = "p"
+    distribution: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
 
     @property
     def M(self) -> int:
@@ -86,7 +87,10 @@ class PriorGrid:
 
     @property
     def mu_grid(self) -> np.ndarray:
-        return np.asarray(self.p_grid, dtype=DTYPE_NP) * float(self.S)
+        grid = np.asarray(self.p_grid, dtype=DTYPE_NP)
+        if self.grid_domain == "rate":
+            return grid
+        return grid * float(self.S)
 
     def check_shape(self) -> None:
         if not self.gene_names:
@@ -113,8 +117,16 @@ class PriorGrid:
             raise ValueError("unbatched PriorGrid requires exactly one gene")
         if np.any(~np.isfinite(p_grid)) or np.any(~np.isfinite(weights)):
             raise ValueError("p_grid and weights must be finite")
-        if np.any(p_grid < 0) or np.any(p_grid > 1):
-            raise ValueError("p_grid must lie in [0, 1]")
+        if self.grid_domain == "p":
+            if np.any(p_grid < 0) or np.any(p_grid > 1):
+                raise ValueError("p_grid must lie in [0, 1] for grid_domain='p'")
+        elif self.grid_domain == "rate":
+            if np.any(p_grid < 0):
+                raise ValueError("p_grid must be >= 0 for grid_domain='rate'")
+        else:
+            raise ValueError(f"unsupported grid_domain: {self.grid_domain}")
+        if self.distribution not in {"binomial", "negative_binomial", "poisson"}:
+            raise ValueError(f"unsupported distribution: {self.distribution}")
         sums = weights.sum(axis=-1)
         if np.any(weights < 0):
             raise ValueError("weights must be non-negative")
@@ -131,6 +143,7 @@ class PriorGrid:
             weights=np.asarray(self.weights, dtype=DTYPE_NP)[None, :],
             S=float(self.S),
             grid_domain=self.grid_domain,
+            distribution=self.distribution,
         )
 
     def subset(self, gene_names: str | list[str]) -> PriorGrid:
@@ -147,6 +160,7 @@ class PriorGrid:
                 weights=weights[0],
                 S=float(batched.S),
                 grid_domain=batched.grid_domain,
+                distribution=batched.distribution,
             )
         return PriorGrid(
             gene_names=names,
@@ -154,6 +168,7 @@ class PriorGrid:
             weights=weights,
             S=float(batched.S),
             grid_domain=batched.grid_domain,
+            distribution=batched.distribution,
         )
 
 
@@ -168,15 +183,36 @@ class PriorFitConfig:
     grid_size: int = 512
     sigma_bins: float = 1.0
     align_loss_weight: float = 1.0
+    align_every: int = 1
     lr: float = 0.05
     n_iter: int = 100
     lr_min_ratio: float = 0.1
     grad_clip: float | None = None
+    early_stop_tol: float | None = None
+    early_stop_patience: int | None = None
+    init_method: Literal["posterior_mean", "uniform", "random"] = "posterior_mean"
+    init_seed: int = 0
     init_temperature: float = 1.0
     cell_chunk_size: int = 512
     optimizer: OptimizerName = "adamw"
     scheduler: SchedulerName = "cosine"
     torch_dtype: Literal["float64", "float32"] = "float64"
+    grid_max_method: Literal["observed_max", "quantile"] = "observed_max"
+    grid_strategy: Literal["linear", "sqrt"] = "linear"
+    # --- algorithm enhancements (all optional, defaults preserve old behaviour) ---
+    sigma_anneal_start: float | None = None
+    sigma_anneal_end: float | None = None
+    adaptive_grid: bool = False
+    adaptive_grid_fraction: float = 0.3
+    adaptive_grid_quantile_lo: float = 0.01
+    adaptive_grid_quantile_hi: float = 0.99
+    cell_sample_fraction: float = 1.0
+    cell_sample_seed: int = 0
+    align_mode: Literal["jsd", "kl", "weighted_jsd"] = "jsd"
+    shrinkage_weight: float = 0.0
+    ensemble_restarts: int = 1
+    likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
+    nb_overdispersion: float = 0.01
 
     def __post_init__(self) -> None:
         if self.grid_size < 2:
@@ -185,6 +221,8 @@ class PriorFitConfig:
             raise ValueError("sigma_bins must be >= 0")
         if self.align_loss_weight < 0:
             raise ValueError("align_loss_weight must be >= 0")
+        if self.align_every < 1:
+            raise ValueError("align_every must be >= 1")
         if self.lr <= 0:
             raise ValueError("lr must be > 0")
         if self.n_iter < 1:
@@ -193,6 +231,14 @@ class PriorFitConfig:
             raise ValueError("lr_min_ratio must be >= 0")
         if self.grad_clip is not None and self.grad_clip < 0:
             raise ValueError("grad_clip must be >= 0")
+        if self.early_stop_tol is not None and self.early_stop_tol < 0:
+            raise ValueError("early_stop_tol must be >= 0")
+        if self.early_stop_patience is not None and self.early_stop_patience < 1:
+            raise ValueError("early_stop_patience must be >= 1")
+        if self.init_method not in {"posterior_mean", "uniform", "random"}:
+            raise ValueError(f"unsupported init_method: {self.init_method}")
+        if self.init_seed < 0:
+            raise ValueError("init_seed must be >= 0")
         if self.init_temperature <= 0:
             raise ValueError("init_temperature must be > 0")
         if self.cell_chunk_size < 1:
@@ -203,6 +249,36 @@ class PriorFitConfig:
             raise ValueError(f"unsupported scheduler: {self.scheduler}")
         if self.torch_dtype not in {"float64", "float32"}:
             raise ValueError(f"unsupported torch_dtype: {self.torch_dtype}")
+        if self.grid_max_method not in {"observed_max", "quantile"}:
+            raise ValueError(f"unsupported grid_max_method: {self.grid_max_method}")
+        if self.grid_strategy not in {"linear", "sqrt"}:
+            raise ValueError(f"unsupported grid_strategy: {self.grid_strategy}")
+        if self.sigma_anneal_start is not None and self.sigma_anneal_start < 0:
+            raise ValueError("sigma_anneal_start must be >= 0")
+        if self.sigma_anneal_end is not None and self.sigma_anneal_end < 0:
+            raise ValueError("sigma_anneal_end must be >= 0")
+        if self.adaptive_grid_fraction <= 0 or self.adaptive_grid_fraction > 1:
+            raise ValueError("adaptive_grid_fraction must be in (0, 1]")
+        if not (0.0 <= self.adaptive_grid_quantile_lo < 1.0):
+            raise ValueError("adaptive_grid_quantile_lo must be in [0, 1)")
+        if not (0.0 < self.adaptive_grid_quantile_hi <= 1.0):
+            raise ValueError("adaptive_grid_quantile_hi must be in (0, 1]")
+        if self.adaptive_grid_quantile_lo >= self.adaptive_grid_quantile_hi:
+            raise ValueError(
+                "adaptive_grid_quantile_lo must be < adaptive_grid_quantile_hi"
+            )
+        if self.cell_sample_fraction <= 0 or self.cell_sample_fraction > 1:
+            raise ValueError("cell_sample_fraction must be in (0, 1]")
+        if self.align_mode not in {"jsd", "kl", "weighted_jsd"}:
+            raise ValueError(f"unsupported align_mode: {self.align_mode}")
+        if self.shrinkage_weight < 0 or self.shrinkage_weight > 1:
+            raise ValueError("shrinkage_weight must be in [0, 1]")
+        if self.ensemble_restarts < 1:
+            raise ValueError("ensemble_restarts must be >= 1")
+        if self.likelihood not in {"binomial", "negative_binomial", "poisson"}:
+            raise ValueError(f"unsupported likelihood: {self.likelihood}")
+        if self.nb_overdispersion <= 0:
+            raise ValueError("nb_overdispersion must be > 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +300,13 @@ class PriorFitResult:
 @dataclass(frozen=True, slots=True)
 class InferenceResult:
     gene_names: list[str]
+    grid_domain: Literal["p", "rate"]
     p_grid: np.ndarray
     mu_grid: np.ndarray
     prior_weights: np.ndarray
     map_p: np.ndarray
     map_mu: np.ndarray
+    map_rate: np.ndarray | None
     posterior_entropy: np.ndarray
     prior_entropy: np.ndarray
     mutual_information: np.ndarray
@@ -294,7 +372,7 @@ class GridDistribution(PriorGrid):
         p_grid: np.ndarray | None = None,
         weights: np.ndarray,
         S: float = 1.0,
-        grid_domain: Literal["p"] = "p",
+        grid_domain: Literal["p", "rate"] = "p",
         grid_min: float | np.ndarray | None = None,
         grid_max: float | np.ndarray | None = None,
     ) -> None:

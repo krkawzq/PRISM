@@ -4,8 +4,7 @@ from __future__ import annotations
 import argparse
 import copy
 import math
-import sys
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -19,22 +18,19 @@ from rich.traceback import install as install_rich_traceback
 import torch
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from prism.baseline.gene_jepa import (
-    GeneJEPA,
-    GeneJEPAConfig,
-    cosine_ema_schedule,
-)
-from prism.baseline.gene_mae import GeneMAEConfig
+try:
+    from prism.baseline.static_gene_net import StaticGeneNet, StaticGeneNetConfig
+except ImportError as exc:
+    raise ImportError(
+        "PRISM is not installed in the active environment. Run `pip install -e .` "
+        "from the repository root before executing scripts/experiments/train_static_gene_net.py."
+    ) from exc
 
 from train_gene_mae import (
     ClassificationEpochRecord,
     ClassificationResult,
     GeneListSpec,
+    PretrainEpochRecord,
     SplitIndices,
     add_mask_selection_args,
     add_shared_data_args,
@@ -43,15 +39,15 @@ from train_gene_mae import (
     build_cosine_scheduler,
     build_splits,
     create_pretrain_mask,
-    compute_weight_mean,
     compute_totals,
+    compute_weight_mean,
     encode_labels,
     get_weight_batch,
-    get_input_batch,
     infer_support_size,
     iter_with_progress,
     iter_batches,
     load_resume_checkpoint,
+    masked_regression_loss,
     maybe_save_epoch_checkpoint,
     maybe_subset_gene_list,
     read_adata,
@@ -63,77 +59,64 @@ from train_gene_mae import (
     write_json,
 )
 
-RANDOM_SEED = 42
 console = Console()
 
 install_rich_traceback(show_locals=False)
 
 
-def weighted_latent_loss(
-    predictions: torch.Tensor,
-    targets: torch.Tensor,
-    weights: torch.Tensor | None,
+def get_static_input_batch(
+    adata: ad.AnnData,
     *,
-    loss_type: str,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    if predictions.shape != targets.shape:
-        raise ValueError(
-            f"predictions shape 必须等于 targets shape，收到 {tuple(predictions.shape)} 和 {tuple(targets.shape)}"
+    representation: str,
+    batch_idx: np.ndarray,
+    totals: np.ndarray,
+    normalize_target: float,
+) -> np.ndarray:
+    if representation == "raw_umi":
+        matrix = adata.X
+        if matrix is None:
+            raise ValueError("输入 h5ad 的 X 为空")
+        batch = matrix[batch_idx]
+        if hasattr(batch, "toarray"):
+            batch = cast(Any, batch).toarray()
+        return np.asarray(
+            batch,
+            dtype=np.float32,
         )
-    if loss_type == "l2":
-        per_item = (predictions - targets).pow(2).mean(dim=-1)
-    elif loss_type == "smooth_l1":
-        per_item = torch.nn.functional.smooth_l1_loss(
-            predictions,
-            targets,
-            reduction="none",
-        ).mean(dim=-1)
-    else:
-        raise ValueError(f"未知 loss_type: {loss_type!r}")
-    if weights is None:
-        return per_item.mean()
-    if weights.shape != per_item.shape:
-        raise ValueError(
-            f"weights shape 必须等于逐位置 loss shape，收到 {tuple(weights.shape)} 和 {tuple(per_item.shape)}"
-        )
-    return (per_item * weights).sum() / (weights.sum() + eps)
+    from train_gene_mae import get_input_batch as mae_get_input_batch
 
-
-@dataclass(frozen=True, slots=True)
-class JEPAPretrainEpochRecord:
-    epoch: int
-    train_loss: float
-    train_cls_loss: float
-    train_token_loss: float
-    val_loss: float
-    val_cls_loss: float
-    val_token_loss: float
+    return mae_get_input_batch(
+        adata,
+        representation=representation,
+        batch_idx=batch_idx,
+        totals=totals,
+        normalize_target=normalize_target,
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train GeneJEPA for pretraining or downstream classification."
+        description="Train StaticGeneNet for pretraining or downstream classification."
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     pretrain = subparsers.add_parser(
-        "pretrain", help="Run self-supervised JEPA pretraining."
+        "pretrain", help="Run self-supervised StaticGeneNet pretraining."
     )
     add_shared_data_args(pretrain)
     add_model_args(pretrain)
     pretrain.add_argument("--output-dir", type=Path, required=True)
     pretrain.add_argument(
         "--input-representation",
-        choices=("signal", "lognormal"),
+        choices=("signal", "log_signal", "lognormal", "raw_umi"),
         required=True,
-        help="Input representation used for JEPA pretraining.",
+        help="Input/target representation for masked reconstruction.",
     )
     pretrain.add_argument(
         "--loss-weighting",
         choices=("none", "posterior_confidence"),
         default="none",
-        help="Apply w_gc = 1 - H(post_gc)/log(M), then normalize to mean 1 for token loss.",
+        help="Apply w_gc = 1 - H(post_gc)/log(M), then normalize to mean 1.",
     )
     pretrain.add_argument(
         "--support-size",
@@ -151,28 +134,25 @@ def parse_args() -> argparse.Namespace:
 
     downstream = subparsers.add_parser(
         "downstream",
-        help="Run downstream classification with pretrained or random JEPA backbone.",
+        help="Run downstream classification with pretrained or random backbone.",
     )
     add_shared_data_args(downstream)
     add_model_args(downstream)
     downstream.add_argument("--output-dir", type=Path, required=True)
     downstream.add_argument(
         "--input-representation",
-        choices=("signal", "lognormal"),
+        choices=("signal", "log_signal", "lognormal", "raw_umi"),
         required=True,
         help="Feature representation used for downstream classification.",
     )
     downstream.add_argument(
         "--task-mode",
-        choices=("zeroshot", "full"),
+        choices=("freeze_static", "full"),
         required=True,
-        help="zeroshot: freeze backbone and train head only; full: train backbone + head.",
-    )
-    downstream.add_argument(
-        "--head",
-        choices=("linear", "mlp"),
-        default="linear",
-        help="Classification head type. full mode forces linear regardless of this flag.",
+        help=(
+            "freeze_static: freeze the whole attention branch and train FFN + embeddings + head; "
+            "full: train the whole network."
+        ),
     )
     downstream.add_argument("--label-column", type=str, default="treatment")
     downstream.add_argument("--checkpoint", type=Path, default=None)
@@ -190,77 +170,48 @@ def add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--d-gene-id", type=int, default=16)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=6)
-    parser.add_argument("--head-expand", type=float, default=1.0)
+    parser.add_argument("--static-qk-dim", type=int, default=16)
     parser.add_argument("--ffn-expand", type=float, default=4.0)
-    parser.add_argument("--attn-dropout", type=float, default=0.0)
     parser.add_argument("--ffn-dropout", type=float, default=0.1)
     parser.add_argument("--embed-dropout", type=float, default=0.1)
     parser.add_argument("--path-dropout", type=float, default=0.0)
+    parser.add_argument("--attention-dropout", type=float, default=0.0)
     parser.add_argument("--signal-bins", type=int, default=16)
     parser.add_argument("--mask-ratio", type=float, default=0.2)
-    parser.add_argument("--predictor-d-model", type=int, default=32)
-    parser.add_argument("--predictor-n-heads", type=int, default=4)
-    parser.add_argument("--predictor-n-layers", type=int, default=2)
-    parser.add_argument("--predictor-dropout", type=float, default=0.1)
-    parser.add_argument("--ema-momentum", type=float, default=0.996)
-    parser.add_argument("--ema-momentum-end", type=float, default=1.0)
     parser.add_argument(
-        "--loss-type",
-        choices=("l2", "smooth_l1"),
-        default="l2",
-        help="Latent alignment loss used for CLS and masked token prediction.",
+        "--share-layer-params",
+        action="store_true",
+        help="Share one StaticGeneNet block across all layers.",
+    )
+    parser.add_argument(
+        "--use-gene-id",
+        action="store_true",
+        help="Inject learned gene identity features into token input and FFN.",
     )
 
 
-def build_encoder_config(
-    args: argparse.Namespace, *, n_genes: int, n_classes: int, classification_head: str
-) -> GeneMAEConfig:
-    return GeneMAEConfig(
+def build_model_config(
+    args: argparse.Namespace, *, n_genes: int, n_classes: int
+) -> StaticGeneNetConfig:
+    return StaticGeneNetConfig(
         n_genes=n_genes,
         n_classes=n_classes,
         d_model=args.d_model,
         d_gene_id=args.d_gene_id,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        head_expand=args.head_expand,
+        static_qk_dim=args.static_qk_dim,
         ffn_expand=args.ffn_expand,
-        attn_dropout=args.attn_dropout,
         ffn_dropout=args.ffn_dropout,
-        signal_bins=args.signal_bins,
-        mask_ratio=args.mask_ratio,
-        classification_head=cast(Any, classification_head),
         embed_dropout=args.embed_dropout,
         path_dropout=args.path_dropout,
+        signal_bins=args.signal_bins,
+        mask_ratio=args.mask_ratio,
+        classification_head="linear",
+        share_layer_params=bool(args.share_layer_params),
+        attention_dropout=args.attention_dropout,
+        use_gene_id=bool(args.use_gene_id),
     )
-
-
-def build_model_config(
-    args: argparse.Namespace, *, n_genes: int, n_classes: int, classification_head: str
-) -> GeneJEPAConfig:
-    encoder = build_encoder_config(
-        args,
-        n_genes=n_genes,
-        n_classes=n_classes,
-        classification_head=classification_head,
-    )
-    return GeneJEPAConfig(
-        encoder=encoder,
-        predictor_d_model=args.predictor_d_model,
-        predictor_n_heads=args.predictor_n_heads,
-        predictor_n_layers=args.predictor_n_layers,
-        predictor_dropout=args.predictor_dropout,
-        ema_momentum=args.ema_momentum,
-        ema_momentum_end=args.ema_momentum_end,
-        loss_type=cast(Any, args.loss_type),
-        classification_head=cast(Any, classification_head),
-    )
-
-
-def load_model_config(payload: dict[str, Any]) -> GeneJEPAConfig:
-    model_config = dict(payload)
-    encoder_payload = dict(model_config["encoder"])
-    model_config["encoder"] = GeneMAEConfig(**encoder_payload)
-    return GeneJEPAConfig(**model_config)
 
 
 def train_pretrain(args: argparse.Namespace) -> None:
@@ -271,7 +222,6 @@ def train_pretrain(args: argparse.Namespace) -> None:
     scaler = cast(Any, torch.amp).GradScaler(
         "cuda", enabled=amp_enabled and amp_dtype == torch.float16
     )
-
     adata_full = read_adata(args.h5ad_path)
     totals = compute_totals(adata_full)
     adata, gene_list_spec = maybe_subset_gene_list(adata_full, args.gene_list_json)
@@ -291,21 +241,15 @@ def train_pretrain(args: argparse.Namespace) -> None:
             batch_size=args.batch_size,
         )
 
-    config = build_model_config(
-        args,
-        n_genes=int(adata.n_vars),
-        n_classes=1,
-        classification_head="linear",
-    )
-    model = GeneJEPA(config).to(device)
+    config = build_model_config(args, n_genes=int(adata.n_vars), n_classes=1)
+    model = StaticGeneNet(config).to(device)
     optimizer = torch.optim.AdamW(
-        model.get_pretrain_parameters(), lr=args.lr, weight_decay=args.weight_decay
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
     train_batches = iter_batches(splits.train, args.batch_size, shuffle=False)
-    total_train_steps = max(len(train_batches) * args.epochs, 1)
     scheduler = build_cosine_scheduler(
         optimizer,
-        total_steps=total_train_steps,
+        total_steps=max(len(train_batches) * args.epochs, 1),
         lr_min_ratio=args.lr_min_ratio,
     )
 
@@ -318,11 +262,10 @@ def train_pretrain(args: argparse.Namespace) -> None:
     args_path = output_dir / "args.json"
     write_json(args_path, {"args": vars(args)})
 
-    history: list[JEPAPretrainEpochRecord] = []
+    history: list[PretrainEpochRecord] = []
     best_val_loss = float("inf")
     best_state = copy.deepcopy(model.state_dict())
     global_step = 0
-    ema_momentum = float(model.config.ema_momentum)
     start_epoch = 1
 
     if args.resume is not None:
@@ -349,7 +292,6 @@ def train_pretrain(args: argparse.Namespace) -> None:
         splits=splits,
         normalize_target=normalize_target,
         support_size=support_size,
-        loss_weighting=args.loss_weighting,
         weight_mean=weight_mean,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
@@ -359,28 +301,16 @@ def train_pretrain(args: argparse.Namespace) -> None:
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         train_losses: list[float] = []
-        train_cls_losses: list[float] = []
-        train_token_losses: list[float] = []
         train_batches = iter_batches(splits.train, args.batch_size, shuffle=True)
         for batch_idx in iter_with_progress(
             train_batches, description=f"pretrain epoch {epoch}/{args.epochs}"
         ):
-            inputs_np = get_input_batch(
+            inputs_np = get_static_input_batch(
                 adata,
                 representation=args.input_representation,
                 batch_idx=batch_idx,
                 totals=totals,
                 normalize_target=normalize_target,
-            )
-            inputs = torch.from_numpy(inputs_np).to(device)
-            mask = create_pretrain_mask(
-                model=model.context_encoder,
-                adata=adata,
-                batch_idx=batch_idx,
-                support_size=support_size,
-                mask_selection=args.mask_selection,
-                mask_confidence_top_p=args.mask_confidence_top_p,
-                device=device,
             )
             weight_np = None
             if args.loss_weighting != "none":
@@ -391,13 +321,20 @@ def train_pretrain(args: argparse.Namespace) -> None:
                     mean_weight=float(weight_mean if weight_mean is not None else 1.0),
                 )
 
-            ema_momentum = cosine_ema_schedule(
-                model.config.ema_momentum,
-                model.config.ema_momentum_end,
-                global_step,
-                total_train_steps,
+            inputs = torch.from_numpy(inputs_np).to(device)
+            weights = (
+                None if weight_np is None else torch.from_numpy(weight_np).to(device)
             )
-            model.set_ema_momentum(ema_momentum)
+            mask = create_pretrain_mask(
+                model=model,
+                adata=adata,
+                batch_idx=batch_idx,
+                support_size=support_size,
+                mask_selection=args.mask_selection,
+                mask_confidence_top_p=args.mask_confidence_top_p,
+                device=device,
+            )
+
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(enabled=amp_enabled, device=device, dtype=amp_dtype):
                 output = model.forward_pretrain(
@@ -405,45 +342,25 @@ def train_pretrain(args: argparse.Namespace) -> None:
                     mask=mask,
                     return_token_embeddings=False,
                 )
-                if (
-                    output.loss is None
-                    or output.cls_loss is None
-                    or output.token_loss is None
-                    or output.mask is None
-                    or output.predicted_latents is None
-                    or output.target_latents is None
-                ):
+                if output.mask is None or output.masked_predictions is None:
                     raise RuntimeError(
-                        "JEPA 预训练输出缺少 loss / cls_loss / token_loss / mask / latents"
+                        "StaticGeneNet 预训练输出缺少 mask 或 masked_predictions"
                     )
-                cls_loss = output.cls_loss
-                if args.loss_weighting != "none":
-                    if weight_np is None:
-                        raise RuntimeError("启用 loss weighting 时缺少 weight batch")
-                    masked_weights = torch.from_numpy(weight_np[output.mask]).to(device)
-                    token_loss = weighted_latent_loss(
-                        output.predicted_latents,
-                        output.target_latents,
-                        masked_weights,
-                        loss_type=args.loss_type,
-                    )
-                    loss = 0.5 * (cls_loss + token_loss)
-                else:
-                    token_loss = output.token_loss
-                    loss = output.loss
+                targets, masked_weights = model.masked_targets(
+                    inputs, output.mask, weights=weights
+                )
+                loss = masked_regression_loss(
+                    output.masked_predictions, targets, weights=masked_weights
+                )
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
-            model.update_target_encoder()
             global_step += 1
-
             train_losses.append(float(loss.item()))
-            train_cls_losses.append(float(cls_loss.item()))
-            train_token_losses.append(float(token_loss.item()))
 
-        val_loss, val_cls_loss, val_token_loss = evaluate_pretrain(
-            model=cast(Any, model),
+        val_loss = evaluate_pretrain(
+            model=model,
             adata=adata,
             indices=splits.val,
             totals=totals,
@@ -460,22 +377,8 @@ def train_pretrain(args: argparse.Namespace) -> None:
             amp_dtype=amp_dtype,
         )
         train_loss = float(np.mean(train_losses)) if train_losses else math.nan
-        train_cls_loss = (
-            float(np.mean(train_cls_losses)) if train_cls_losses else math.nan
-        )
-        train_token_loss = (
-            float(np.mean(train_token_losses)) if train_token_losses else math.nan
-        )
         history.append(
-            JEPAPretrainEpochRecord(
-                epoch=epoch,
-                train_loss=train_loss,
-                train_cls_loss=train_cls_loss,
-                train_token_loss=train_token_loss,
-                val_loss=val_loss,
-                val_cls_loss=val_cls_loss,
-                val_token_loss=val_token_loss,
-            )
+            PretrainEpochRecord(epoch=epoch, train_loss=train_loss, val_loss=val_loss)
         )
         if args.log_every_epochs > 0 and epoch % args.log_every_epochs == 0:
             append_jsonl(
@@ -486,9 +389,6 @@ def train_pretrain(args: argparse.Namespace) -> None:
                     "epoch": epoch,
                     "global_step": global_step,
                     "train_loss": train_loss,
-                    "train_cls_loss": train_cls_loss,
-                    "train_token_loss": train_token_loss,
-                    "ema_momentum": float(ema_momentum),
                     "lr": float(optimizer.param_groups[0]["lr"]),
                 },
             )
@@ -500,11 +400,7 @@ def train_pretrain(args: argparse.Namespace) -> None:
                 "epoch": epoch,
                 "global_step": global_step,
                 "train_loss": train_loss,
-                "train_cls_loss": train_cls_loss,
-                "train_token_loss": train_token_loss,
                 "val_loss": val_loss,
-                "val_cls_loss": val_cls_loss,
-                "val_token_loss": val_token_loss,
                 "best_val_loss_before_update": best_val_loss,
                 "lr": float(optimizer.param_groups[0]["lr"]),
             },
@@ -596,14 +492,11 @@ def train_pretrain(args: argparse.Namespace) -> None:
             },
         )
         print(
-            f"epoch={epoch:03d} train_loss={train_loss:.6f} "
-            f"train_cls={train_cls_loss:.6f} train_tok={train_token_loss:.6f} "
-            f"val_loss={val_loss:.6f} val_cls={val_cls_loss:.6f} "
-            f"val_tok={val_token_loss:.6f} best_val={best_val_loss:.6f}"
+            f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} best_val={best_val_loss:.6f}"
         )
 
     model.load_state_dict(best_state)
-    test_loss, test_cls_loss, test_token_loss = evaluate_pretrain(
+    test_loss = evaluate_pretrain(
         model=model,
         adata=adata,
         indices=splits.test,
@@ -626,8 +519,6 @@ def train_pretrain(args: argparse.Namespace) -> None:
             "records": [asdict(record) for record in history],
             "best_val_loss": best_val_loss,
             "test_loss": test_loss,
-            "test_cls_loss": test_cls_loss,
-            "test_token_loss": test_token_loss,
             "global_step": global_step,
         },
     )
@@ -639,23 +530,18 @@ def train_pretrain(args: argparse.Namespace) -> None:
             "epoch": args.epochs,
             "global_step": global_step,
             "test_loss": test_loss,
-            "test_cls_loss": test_cls_loss,
-            "test_token_loss": test_token_loss,
             "best_val_loss": best_val_loss,
         },
     )
     print(f"saved checkpoint: {best_path}")
     print(f"saved history   : {history_path}")
-    print(
-        f"final test loss : {test_loss:.6f} "
-        f"(cls={test_cls_loss:.6f}, token={test_token_loss:.6f})"
-    )
+    print(f"final test loss : {test_loss:.6f}")
 
 
 @torch.inference_mode()
 def evaluate_pretrain(
     *,
-    model: GeneJEPA,
+    model: StaticGeneNet,
     adata: ad.AnnData,
     indices: np.ndarray,
     totals: np.ndarray,
@@ -670,25 +556,32 @@ def evaluate_pretrain(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
-) -> tuple[float, float, float]:
+) -> float:
     model.eval()
     losses: list[float] = []
-    cls_losses: list[float] = []
-    token_losses: list[float] = []
     eval_batches = iter_batches(indices, batch_size, shuffle=False)
     for batch_idx in iter_with_progress(
         eval_batches, description="evaluating pretrain"
     ):
-        inputs_np = get_input_batch(
+        inputs_np = get_static_input_batch(
             adata,
             representation=representation,
             batch_idx=batch_idx,
             totals=totals,
             normalize_target=normalize_target,
         )
+        weight_np = None
+        if weighted:
+            weight_np = get_weight_batch(
+                adata,
+                batch_idx=batch_idx,
+                support_size=support_size,
+                mean_weight=float(mean_weight if mean_weight is not None else 1.0),
+            )
         inputs = torch.from_numpy(inputs_np).to(device)
+        weights = None if weight_np is None else torch.from_numpy(weight_np).to(device)
         mask = create_pretrain_mask(
-            model=model.context_encoder,
+            model=model,
             adata=adata,
             batch_idx=batch_idx,
             support_size=support_size,
@@ -702,43 +595,18 @@ def evaluate_pretrain(
                 mask=mask,
                 return_token_embeddings=False,
             )
-            if (
-                output.loss is None
-                or output.cls_loss is None
-                or output.token_loss is None
-                or output.mask is None
-                or output.predicted_latents is None
-                or output.target_latents is None
-            ):
+            if output.mask is None or output.masked_predictions is None:
                 raise RuntimeError(
-                    "JEPA 预训练输出缺少 loss / cls_loss / token_loss / mask / latents"
+                    "StaticGeneNet 预训练输出缺少 mask 或 masked_predictions"
                 )
-            if weighted:
-                weight_np = get_weight_batch(
-                    adata,
-                    batch_idx=batch_idx,
-                    support_size=support_size,
-                    mean_weight=float(mean_weight if mean_weight is not None else 1.0),
-                )
-                masked_weights = torch.from_numpy(weight_np[output.mask]).to(device)
-                token_loss = weighted_latent_loss(
-                    output.predicted_latents,
-                    output.target_latents,
-                    masked_weights,
-                    loss_type=model.config.loss_type,
-                )
-                loss = 0.5 * (output.cls_loss + token_loss)
-            else:
-                token_loss = output.token_loss
-                loss = output.loss
+            targets, masked_weights = model.masked_targets(
+                inputs, output.mask, weights=weights
+            )
+            loss = masked_regression_loss(
+                output.masked_predictions, targets, weights=masked_weights
+            )
         losses.append(float(loss.item()))
-        cls_losses.append(float(output.cls_loss.item()))
-        token_losses.append(float(token_loss.item()))
-    return (
-        float(np.mean(losses)) if losses else math.nan,
-        float(np.mean(cls_losses)) if cls_losses else math.nan,
-        float(np.mean(token_losses)) if token_losses else math.nan,
-    )
+    return float(np.mean(losses)) if losses else math.nan
 
 
 def train_downstream(args: argparse.Namespace) -> None:
@@ -749,12 +617,11 @@ def train_downstream(args: argparse.Namespace) -> None:
     scaler = cast(Any, torch.amp).GradScaler(
         "cuda", enabled=amp_enabled and amp_dtype == torch.float16
     )
-
     if args.checkpoint is not None:
         checkpoint = torch.load(
             args.checkpoint.expanduser().resolve(), map_location="cpu"
         )
-        pretrain_config = load_model_config(checkpoint["model_config"])
+        pretrain_config = StaticGeneNetConfig(**checkpoint["model_config"])
         checkpoint_gene_list = checkpoint.get("gene_list_spec")
     else:
         checkpoint = None
@@ -778,34 +645,23 @@ def train_downstream(args: argparse.Namespace) -> None:
         normalize_target = float(checkpoint.get("normalize_target", normalize_target))
     else:
         pretrain_config = build_model_config(
-            args,
-            n_genes=int(adata.n_vars),
-            n_classes=1,
-            classification_head="linear",
+            args, n_genes=int(adata.n_vars), n_classes=1
         )
     if pretrain_config is None:
         raise RuntimeError("缺少预训练配置")
 
-    classification_head = "linear" if args.task_mode == "full" else args.head
+    classification_head = "linear"
     config = replace(
         pretrain_config,
-        encoder=replace(
-            pretrain_config.encoder,
-            n_classes=len(class_names),
-            classification_head=classification_head,
-        ),
+        n_classes=len(class_names),
         classification_head=classification_head,
     )
-    model = GeneJEPA(config).to(device)
+    model = StaticGeneNet(config).to(device)
 
     if checkpoint is not None:
         state_dict = dict(checkpoint["model_state"])
         for key in [
-            name
-            for name in state_dict
-            if name.startswith("classification_head.")
-            or name.startswith("context_encoder.classification_head.")
-            or name.startswith("target_encoder.classification_head.")
+            name for name in state_dict if name.startswith("classification_head.")
         ]:
             state_dict.pop(key)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -813,11 +669,15 @@ def train_downstream(args: argparse.Namespace) -> None:
         print(f"missing keys   : {missing}")
         print(f"unexpected keys: {unexpected}")
 
-    freeze_backbone = args.task_mode == "zeroshot"
+    freeze_static = args.task_mode == "freeze_static"
     for name, param in model.named_parameters():
-        is_head = name.startswith("classification_head.")
-        is_backbone = name.startswith("context_encoder.")
-        param.requires_grad = is_head or (is_backbone and not freeze_backbone)
+        is_attention_param = ".attention." in name or name.endswith(
+            "attn_residual_lambda"
+        )
+        if freeze_static:
+            param.requires_grad = not is_attention_param
+        else:
+            param.requires_grad = True
 
     optimizer = torch.optim.AdamW(
         [param for param in model.parameters() if param.requires_grad],
@@ -848,7 +708,7 @@ def train_downstream(args: argparse.Namespace) -> None:
         splits=splits,
         normalize_target=normalize_target,
         class_names=class_names,
-        freeze_backbone=freeze_backbone,
+        freeze_static=freeze_static,
         amp_enabled=amp_enabled,
         amp_dtype=amp_dtype,
         gene_list_spec=gene_list_spec,
@@ -886,7 +746,7 @@ def train_downstream(args: argparse.Namespace) -> None:
         for batch_idx in iter_with_progress(
             train_batches, description=f"downstream epoch {epoch}/{args.epochs}"
         ):
-            features = get_input_batch(
+            features = get_static_input_batch(
                 adata,
                 representation=args.input_representation,
                 batch_idx=batch_idx,
@@ -917,7 +777,7 @@ def train_downstream(args: argparse.Namespace) -> None:
             accuracy_score(np.concatenate(train_true), np.concatenate(train_pred))
         )
         val_loss, val_true, val_pred = evaluate_downstream(
-            model=cast(Any, model),
+            model=model,
             adata=adata,
             indices=splits.val,
             labels=labels,
@@ -1055,8 +915,7 @@ def train_downstream(args: argparse.Namespace) -> None:
             },
         )
         print(
-            f"epoch={epoch:03d} train_loss={train_loss:.6f} train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.6f} val_acc={val_acc:.4f} best_val={best_val_acc:.4f}"
+            f"epoch={epoch:03d} train_loss={train_loss:.6f} train_acc={train_acc:.4f} val_loss={val_loss:.6f} val_acc={val_acc:.4f} best_val={best_val_acc:.4f}"
         )
 
     model.load_state_dict(best_state)
@@ -1105,7 +964,7 @@ def train_downstream(args: argparse.Namespace) -> None:
 @torch.inference_mode()
 def evaluate_downstream(
     *,
-    model: GeneJEPA,
+    model: StaticGeneNet,
     adata: ad.AnnData,
     indices: np.ndarray,
     labels: np.ndarray,
@@ -1126,7 +985,7 @@ def evaluate_downstream(
     for batch_idx in iter_with_progress(
         eval_batches, description="evaluating downstream"
     ):
-        features = get_input_batch(
+        features = get_static_input_batch(
             adata,
             representation=representation,
             batch_idx=batch_idx,
@@ -1187,13 +1046,12 @@ def print_pretrain_summary(
     splits: SplitIndices,
     normalize_target: float,
     support_size: int,
-    loss_weighting: str,
     weight_mean: float | None,
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     gene_list_spec: GeneListSpec | None,
 ) -> None:
-    table = Table(title="GeneJEPA Pretrain")
+    table = Table(title="StaticGeneNet Pretrain")
     table.add_column("Field")
     table.add_column("Value", overflow="fold")
     table.add_row("Dataset", f"{adata.n_obs} cells x {adata.n_vars} genes")
@@ -1204,18 +1062,13 @@ def print_pretrain_summary(
         else "all",
     )
     table.add_row("Input", str(args.input_representation))
-    table.add_row("Loss weighting", str(loss_weighting))
+    table.add_row("Loss weighting", str(args.loss_weighting))
     table.add_row("Mask selection", str(args.mask_selection))
     if args.mask_selection == "confidence_top_p":
         table.add_row("Mask top-p", str(args.mask_confidence_top_p))
-    table.add_row("Loss type", str(args.loss_type))
     table.add_row("Support size", str(support_size))
     table.add_row("Weight mean", str(weight_mean))
-    table.add_row(
-        "Predictor",
-        f"d={args.predictor_d_model} h={args.predictor_n_heads} L={args.predictor_n_layers}",
-    )
-    table.add_row("EMA", f"{args.ema_momentum} -> {args.ema_momentum_end}")
+    table.add_row("Share layers", str(args.share_layer_params))
     table.add_row("AMP", f"{amp_enabled} ({amp_dtype})")
     table.add_row("Normalize target", f"{normalize_target:.4f}")
     table.add_row("Device", str(device))
@@ -1238,12 +1091,12 @@ def print_downstream_summary(
     splits: SplitIndices,
     normalize_target: float,
     class_names: list[str],
-    freeze_backbone: bool,
+    freeze_static: bool,
     amp_enabled: bool,
     amp_dtype: torch.dtype | None,
     gene_list_spec: GeneListSpec | None,
 ) -> None:
-    table = Table(title="GeneJEPA Downstream")
+    table = Table(title="StaticGeneNet Downstream")
     table.add_column("Field")
     table.add_column("Value", overflow="fold")
     table.add_row("Dataset", f"{adata.n_obs} cells x {adata.n_vars} genes")
@@ -1255,8 +1108,9 @@ def print_downstream_summary(
     )
     table.add_row("Input", str(args.input_representation))
     table.add_row("Task mode", str(args.task_mode))
-    table.add_row("Head", "linear" if args.task_mode == "full" else str(args.head))
-    table.add_row("Freeze backbone", str(freeze_backbone))
+    table.add_row("Head", "linear")
+    table.add_row("Freeze attention", str(freeze_static))
+    table.add_row("Share layers", str(args.share_layer_params))
     table.add_row("AMP", f"{amp_enabled} ({amp_dtype})")
     table.add_row("Normalize target", f"{normalize_target:.4f}")
     table.add_row("Classes", f"{len(class_names)} -> {class_names}")
@@ -1307,6 +1161,6 @@ if __name__ == "__main__":
         main()
     except Exception as exc:
         console.print(
-            Panel(str(exc), title="train_gene_jepa failed", border_style="red")
+            Panel(str(exc), title="train_static_gene_net failed", border_style="red")
         )
         raise SystemExit(1) from exc
