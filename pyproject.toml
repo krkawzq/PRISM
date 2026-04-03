@@ -9,6 +9,7 @@ dependencies = [
     "cell-gears>=0.1.2",
     "numba>=0.64.0",
     "numpy>=2.4.3",
+    "pytest>=9.0.2",
     "rich>=14.3.3",
     "scanpy>=1.11.5",
     "scipy>=1.17.1",

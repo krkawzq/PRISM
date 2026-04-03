@@ -216,7 +216,9 @@ def _deserialize_prior_grid(payload: dict[str, Any], *, strict: bool) -> PriorGr
     grid_domain = payload.get("grid_domain")
     distribution = payload.get("distribution")
     if strict and grid_domain is None:
-        raise ValueError("schema>=2 prior payload is missing required field 'grid_domain'")
+        raise ValueError(
+            "schema>=2 prior payload is missing required field 'grid_domain'"
+        )
     if strict and distribution is None:
         raise ValueError(
             "schema>=2 prior payload is missing required field 'distribution'"
@@ -231,6 +233,78 @@ def _deserialize_prior_grid(payload: dict[str, Any], *, strict: bool) -> PriorGr
         grid_domain=cast(Any, resolved_grid_domain),
         distribution=cast(Any, resolved_distribution),
     )
+
+
+def _validate_checkpoint_prior_grid(
+    priors: PriorGrid, *, label: str | None = None
+) -> None:
+    prefix = "label prior" if label is not None else "global prior"
+    if not priors.gene_names:
+        raise ValueError(f"{prefix} gene_names cannot be empty")
+    if len(priors.gene_names) != len(set(priors.gene_names)):
+        raise ValueError(f"{prefix} gene_names must be unique")
+    if not np.isfinite(priors.S) or priors.S <= 0:
+        raise ValueError(f"{prefix} S must be positive")
+
+    p_grid = np.asarray(priors.p_grid, dtype=np.float64)
+    weights = np.asarray(priors.weights, dtype=np.float64)
+    if p_grid.ndim not in (1, 2):
+        raise ValueError(f"{prefix} p_grid must be 1D or 2D")
+    if weights.ndim not in (1, 2):
+        raise ValueError(f"{prefix} weights must be 1D or 2D")
+    if p_grid.ndim == 2 and p_grid.shape != weights.shape:
+        raise ValueError(f"{prefix} 2D p_grid and weights must have identical shape")
+    if p_grid.ndim == 1 and weights.shape[-1] != p_grid.shape[0]:
+        raise ValueError(f"{prefix} 1D p_grid length must match weights grid dimension")
+    if weights.ndim == 2 and weights.shape[0] != len(priors.gene_names):
+        raise ValueError(
+            f"{prefix} weights first dimension must match gene_names length"
+        )
+    if weights.ndim == 1 and len(priors.gene_names) != 1:
+        raise ValueError(f"{prefix} unbatched weights require exactly one gene")
+    if np.any(~np.isfinite(p_grid)) or np.any(~np.isfinite(weights)):
+        raise ValueError(f"{prefix} p_grid and weights must be finite")
+    if priors.grid_domain == "p":
+        if np.any(p_grid < 0) or np.any(p_grid > 1):
+            raise ValueError(f"{prefix} p_grid must lie in [0, 1]")
+    elif priors.grid_domain == "rate":
+        if np.any(p_grid < 0):
+            raise ValueError(f"{prefix} p_grid must be >= 0")
+    else:
+        raise ValueError(f"unsupported grid_domain: {priors.grid_domain}")
+    if priors.distribution not in _SUPPORTED_DISTRIBUTIONS:
+        raise ValueError(f"unsupported distribution: {priors.distribution}")
+    if np.any(weights < 0):
+        raise ValueError(f"{prefix} weights must be non-negative")
+    if np.any(np.abs(weights.sum(axis=-1) - 1.0) > 1e-6):
+        raise ValueError(f"{prefix} weights must sum to 1 along the grid axis")
+
+
+def _validate_checkpoint_consistency(checkpoint: ModelCheckpoint) -> None:
+    gene_name_set = set(checkpoint.gene_names)
+    if len(gene_name_set) != len(checkpoint.gene_names):
+        raise ValueError("checkpoint gene_names must be unique")
+
+    if checkpoint.priors is not None:
+        _validate_checkpoint_prior_grid(checkpoint.priors)
+        prior_gene_set = set(checkpoint.priors.gene_names)
+        if prior_gene_set != gene_name_set:
+            raise ValueError("checkpoint gene_names must match global prior gene_names")
+
+    label_prior_keys = set(checkpoint.label_priors)
+    label_scale_keys = set(checkpoint.label_scales)
+    if not label_scale_keys.issubset(label_prior_keys):
+        raise ValueError(
+            "checkpoint label_scales keys must be a subset of label_priors keys"
+        )
+
+    for label, priors in checkpoint.label_priors.items():
+        _validate_checkpoint_prior_grid(priors, label=label)
+        label_gene_set = set(priors.gene_names)
+        if not label_gene_set.issubset(gene_name_set):
+            raise ValueError(
+                f"label prior {label!r} contains genes outside checkpoint gene_names"
+            )
 
 
 def save_checkpoint(checkpoint: ModelCheckpoint, path: str | Path) -> None:
@@ -286,7 +360,7 @@ def load_checkpoint(path: str | Path) -> ModelCheckpoint:
             label_priors={},
             checkpoint_path=resolved,
         )
-        return ModelCheckpoint(
+        checkpoint = ModelCheckpoint(
             gene_names=list(payload["gene_names"]),
             priors=priors,
             scale=ScaleMetadata(**payload["scale"]),
@@ -295,9 +369,13 @@ def load_checkpoint(path: str | Path) -> ModelCheckpoint:
             label_priors={},
             label_scales={},
         )
+        _validate_checkpoint_consistency(checkpoint)
+        return checkpoint
     priors_payload = payload.get("priors")
     priors = (
-        None if priors_payload is None else _deserialize_prior_grid(priors_payload, strict=True)
+        None
+        if priors_payload is None
+        else _deserialize_prior_grid(priors_payload, strict=True)
     )
     scale_payload = payload.get("scale")
     label_priors_payload = payload.get("label_priors", {})
@@ -313,7 +391,7 @@ def load_checkpoint(path: str | Path) -> ModelCheckpoint:
         label_priors=label_priors,
         checkpoint_path=resolved,
     )
-    return ModelCheckpoint(
+    checkpoint = ModelCheckpoint(
         gene_names=list(payload["gene_names"]),
         priors=priors,
         scale=None if scale_payload is None else ScaleMetadata(**scale_payload),
@@ -325,3 +403,5 @@ def load_checkpoint(path: str | Path) -> ModelCheckpoint:
             for label, entry in dict(label_scales_payload).items()
         },
     )
+    _validate_checkpoint_consistency(checkpoint)
+    return checkpoint

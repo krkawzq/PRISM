@@ -49,8 +49,16 @@ def resolve_channels(channels: list[str] | None) -> list[str]:
 
 
 def resolve_posterior_distribution(metadata: dict[str, object]) -> str:
+    schema_version_value = metadata.get("schema_version", 2)
+    if isinstance(schema_version_value, (int, np.integer)):
+        schema_version = int(schema_version_value)
+    else:
+        try:
+            schema_version = int(str(schema_version_value))
+        except (TypeError, ValueError):
+            schema_version = 2
     resolved, _ = resolve_checkpoint_distribution(
-        schema_version=int(metadata.get("schema_version", 2)),
+        schema_version=schema_version,
         metadata=dict(metadata),
         priors=None,
         label_priors={},
@@ -93,12 +101,12 @@ def compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
 def extract_batch(
     *,
     checkpoint,
-    adata: ad.AnnData,
     batch_names: list[str],
     batch_counts: np.ndarray,
     reference_counts: np.ndarray,
     prior_source: str,
     label_key: str | None,
+    label_groups: dict[str, np.ndarray] | None,
     device: str,
     torch_dtype: str,
     selected_channels: list[str],
@@ -128,19 +136,17 @@ def extract_batch(
         )
     if label_key is None:
         raise ValueError("--label-key is required when --prior-source label")
-    if label_key not in adata.obs.columns:
-        raise KeyError(f"obs column {label_key!r} does not exist")
-    labels = np.asarray(adata.obs[label_key].astype(str)).reshape(-1)
+    if label_groups is None:
+        raise ValueError("label_groups is required when --prior-source label")
     layer_values = {
         channel: np.full(
             (batch_counts.shape[0], len(batch_names)), np.nan, dtype=np.float64
         )
         for channel in selected_channels
     }
-    for label in np.unique(labels).tolist():
+    for label, cell_indices in label_groups.items():
         if label not in checkpoint.label_priors:
             raise ValueError(f"checkpoint does not contain priors for label {label!r}")
-        cell_indices = np.flatnonzero(labels == label)
         priors = checkpoint.label_priors[label].subset(batch_names)
         posterior = Posterior(
             batch_names,

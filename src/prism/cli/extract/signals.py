@@ -92,6 +92,7 @@ def extract_signals_command(
     selected_channels = resolve_channels(channels)
     output_dtype = resolve_dtype(dtype)
     prior_source_resolved = resolve_prior_source(prior_source)
+    label_groups = None
 
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
@@ -107,17 +108,28 @@ def extract_signals_command(
         )
     reference_counts = compute_reference_counts(matrix, ref_positions)
     available_gene_names = checkpoint.gene_names
+    available_gene_set = set(available_gene_names)
     if prior_source_resolved == "global" and checkpoint.priors is None:
         raise ValueError("checkpoint does not contain global priors")
     if prior_source_resolved == "label" and not checkpoint.label_priors:
         raise ValueError("checkpoint does not contain label-specific priors")
+    if prior_source_resolved == "label":
+        if label_key is None:
+            raise ValueError("--label-key is required when --prior-source label")
+        if label_key not in adata.obs.columns:
+            raise KeyError(f"obs column {label_key!r} does not exist")
+        labels = np.asarray(adata.obs[label_key].astype(str)).reshape(-1)
+        label_groups = {
+            label: np.flatnonzero(labels == label)
+            for label in sorted(np.unique(labels).tolist())
+        }
     requested_genes = (
         available_gene_names if genes_path is None else read_gene_list(genes_path)
     )
     selected_genes = [
         name
         for name in requested_genes
-        if name in gene_to_idx and name in set(available_gene_names)
+        if name in gene_to_idx and name in available_gene_set
     ]
     if not selected_genes:
         raise ValueError(
@@ -174,12 +186,12 @@ def extract_signals_command(
             )
             extracted = extract_batch(
                 checkpoint=checkpoint,
-                adata=adata,
                 batch_names=batch_names,
                 batch_counts=batch_counts,
                 reference_counts=reference_counts,
                 prior_source=prior_source_resolved,
                 label_key=label_key,
+                label_groups=label_groups,
                 device=device,
                 torch_dtype=torch_dtype,
                 selected_channels=selected_channels,

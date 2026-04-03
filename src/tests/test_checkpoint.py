@@ -159,6 +159,8 @@ class TestCheckpointSchema:
         with open(path, "wb") as fh:
             pickle.dump(v1_payload, fh)
         loaded = load_checkpoint(path)
+        assert loaded.priors is not None
+        assert loaded.scale is not None
         assert loaded.priors.S == 8.0
         assert loaded.scale.S == 8.0
 
@@ -187,9 +189,139 @@ class TestCheckpointSchema:
         for _ in range(3):
             save_checkpoint(checkpoint, path)
             loaded = load_checkpoint(path)
+            assert loaded.priors is not None
+            assert loaded.scale is not None
             assert loaded.gene_names == ["GeneX", "GeneY"]
             assert loaded.priors.gene_names == ["GeneX", "GeneY"]
             assert loaded.scale.S == 5.0
             assert set(loaded.label_priors) == {"treated"}
             assert set(loaded.label_scales) == {"treated"}
             assert loaded.fit_config["n_iter"] == 50
+
+    def test_load_rejects_global_prior_gene_name_mismatch(self) -> None:
+        path = self.root / "bad_gene_names.pkl"
+        payload = {
+            "schema_version": 2,
+            "gene_names": ["GeneA", "GeneB"],
+            "priors": {
+                "gene_names": ["GeneA", "GeneC"],
+                "p_grid": np.linspace(0.05, 0.95, 4, dtype=np.float64),
+                "weights": np.ones((2, 4), dtype=np.float64) / 4.0,
+                "S": 10.0,
+                "grid_domain": "p",
+                "distribution": "binomial",
+            },
+            "scale": {"S": 10.0, "mean_reference_count": 10.0},
+            "fit_config": {},
+            "metadata": {
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
+            "label_priors": {},
+            "label_scales": {},
+        }
+        with open(path, "wb") as fh:
+            pickle.dump(payload, fh)
+        try:
+            load_checkpoint(path)
+        except ValueError as exc:
+            assert "checkpoint gene_names must match global prior gene_names" in str(
+                exc
+            )
+        else:
+            raise AssertionError(
+                "expected load_checkpoint to reject gene name mismatch"
+            )
+
+    def test_load_rejects_label_scale_key_mismatch(self) -> None:
+        path = self.root / "bad_label_keys.pkl"
+        payload = {
+            "schema_version": 2,
+            "gene_names": ["GeneA"],
+            "priors": {
+                "gene_names": ["GeneA"],
+                "p_grid": np.linspace(0.05, 0.95, 4, dtype=np.float64),
+                "weights": np.ones((1, 4), dtype=np.float64) / 4.0,
+                "S": 10.0,
+                "grid_domain": "p",
+                "distribution": "binomial",
+            },
+            "scale": {"S": 10.0, "mean_reference_count": 10.0},
+            "fit_config": {},
+            "metadata": {
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
+            "label_priors": {
+                "ctrl": {
+                    "gene_names": ["GeneA"],
+                    "p_grid": np.linspace(0.05, 0.95, 4, dtype=np.float64),
+                    "weights": np.ones((1, 4), dtype=np.float64) / 4.0,
+                    "S": 10.0,
+                    "grid_domain": "p",
+                    "distribution": "binomial",
+                }
+            },
+            "label_scales": {"stim": {"S": 10.0, "mean_reference_count": 10.0}},
+        }
+        with open(path, "wb") as fh:
+            pickle.dump(payload, fh)
+        try:
+            load_checkpoint(path)
+        except ValueError as exc:
+            assert (
+                "checkpoint label_scales keys must be a subset of label_priors keys"
+                in str(exc)
+            )
+        else:
+            raise AssertionError(
+                "expected load_checkpoint to reject label key mismatch"
+            )
+
+    def test_load_rejects_label_prior_genes_outside_checkpoint(self) -> None:
+        path = self.root / "bad_label_genes.pkl"
+        payload = {
+            "schema_version": 2,
+            "gene_names": ["GeneA"],
+            "priors": {
+                "gene_names": ["GeneA"],
+                "p_grid": np.linspace(0.05, 0.95, 4, dtype=np.float64),
+                "weights": np.ones((1, 4), dtype=np.float64) / 4.0,
+                "S": 10.0,
+                "grid_domain": "p",
+                "distribution": "binomial",
+            },
+            "scale": {"S": 8.0, "mean_reference_count": 8.0},
+            "fit_config": {},
+            "metadata": {
+                "fit_distribution": "binomial",
+                "posterior_distribution": "binomial",
+                "grid_domain": "p",
+            },
+            "label_priors": {
+                "ctrl": {
+                    "gene_names": ["GeneB"],
+                    "p_grid": np.linspace(0.05, 0.95, 4, dtype=np.float64),
+                    "weights": np.ones((1, 4), dtype=np.float64) / 4.0,
+                    "S": 10.0,
+                    "grid_domain": "p",
+                    "distribution": "binomial",
+                }
+            },
+            "label_scales": {},
+        }
+        with open(path, "wb") as fh:
+            pickle.dump(payload, fh)
+        try:
+            load_checkpoint(path)
+        except ValueError as exc:
+            assert (
+                "label prior 'ctrl' contains genes outside checkpoint gene_names"
+                in str(exc)
+            )
+        else:
+            raise AssertionError(
+                "expected load_checkpoint to reject out-of-range label genes"
+            )
