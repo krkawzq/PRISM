@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import typer
-from rich.console import Console
 
-from prism.cli.common import print_key_value_table
-from prism.io import write_h5ad_atomic
-console = Console()
+from prism.cli.common import (
+    console,
+    print_key_value_table,
+    resolve_float,
+    resolve_int,
+    resolve_str,
+)
+from prism.io import write_h5ad
 
 
 def stratified_sample_indices(
@@ -21,6 +24,8 @@ def stratified_sample_indices(
     seed: int,
     per_class_min: int,
 ) -> np.ndarray:
+    if labels.empty:
+        raise ValueError("label column is empty")
     if not 0.0 < fraction <= 1.0:
         raise ValueError("--fraction must be in (0, 1]")
     if per_class_min < 1:
@@ -57,36 +62,36 @@ def downsample_command(
         help="obs column used for stratified sampling.",
     ),
     fraction: float = typer.Option(
-        ...,
-        "--fraction",
-        help="Fraction of cells retained per class.",
+        ..., "--fraction", help="Fraction of cells retained per class."
     ),
     seed: int = typer.Option(42, "--seed", min=0, help="Random seed."),
     per_class_min: int = typer.Option(
-        1,
-        "--per-class-min",
-        min=1,
-        help="Minimum number of cells retained per class.",
+        1, "--per-class-min", min=1, help="Minimum number of cells retained per class."
     ),
 ) -> int:
     input_path = input_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
+    label_key = resolve_str(label_key)
+    fraction = resolve_float(fraction)
+    seed = resolve_int(seed)
+    per_class_min = resolve_int(per_class_min)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     adata = ad.read_h5ad(input_path)
     if label_key not in adata.obs:
         raise KeyError(f"obs column {label_key!r} not found")
 
+    labels = adata.obs[label_key]
+    if not isinstance(labels, pd.Series):
+        labels = pd.Series(labels, copy=False)
     sampled_idx = stratified_sample_indices(
-        cast(pd.Series, adata.obs[label_key]),
+        labels,
         fraction=fraction,
         seed=seed,
         per_class_min=per_class_min,
     )
     sampled = adata[sampled_idx].copy()
-    label_counts = (
-        sampled.obs[label_key].astype("category").value_counts().sort_index()
-    )
+    label_counts = sampled.obs[label_key].astype("category").value_counts().sort_index()
     sampled.uns["sampling"] = {
         "method": "stratified_fraction",
         "source_h5ad": str(input_path),
@@ -101,7 +106,7 @@ def downsample_command(
             str(label): int(count) for label, count in label_counts.items()
         },
     }
-    write_h5ad_atomic(sampled, output_path)
+    write_h5ad(sampled, output_path)
 
     print_key_value_table(
         console,

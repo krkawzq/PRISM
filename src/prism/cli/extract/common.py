@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from math import comb
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import anndata as ad
 import numpy as np
@@ -13,7 +13,7 @@ from prism.cli.common import (
     print_key_value_table,
     print_saved_path,
     resolve_numpy_dtype,
-    resolve_prior_source as resolve_prior_source_shared,
+    resolve_prior_source
 )
 from prism.io import (
     compute_reference_counts as compute_reference_counts_shared,
@@ -21,8 +21,13 @@ from prism.io import (
     select_matrix as select_matrix_shared,
     slice_gene_matrix as slice_gene_matrix_shared,
 )
-from prism.model import CORE_CHANNELS, ObservationBatch, Posterior, SignalChannel
-from prism.model.checkpoint import resolve_checkpoint_distribution
+from prism.model import (
+    ALL_CHANNELS,
+    CORE_CHANNELS,
+    ObservationBatch,
+    Posterior,
+    SignalChannel,
+)
 
 console = Console()
 
@@ -34,36 +39,31 @@ def require_reference_genes(metadata: dict[str, object]) -> list[str]:
     return list(value)
 
 
-def resolve_prior_source(value: str) -> str:
-    return resolve_prior_source_shared(value)
-
-
 def resolve_channels(channels: list[str] | None) -> list[str]:
     if not channels:
         return sorted(CORE_CHANNELS)
-    valid = set(CORE_CHANNELS) | {"map_p", "map_mu", "map_rate"}
+    valid = set(ALL_CHANNELS)
     unknown = [channel for channel in channels if channel not in valid]
     if unknown:
         raise ValueError(f"unknown channels: {unknown}")
     return list(dict.fromkeys(channels))
 
 
-def resolve_posterior_distribution(metadata: dict[str, object]) -> str:
-    schema_version_value = metadata.get("schema_version", 2)
-    if isinstance(schema_version_value, (int, np.integer)):
-        schema_version = int(schema_version_value)
-    else:
-        try:
-            schema_version = int(str(schema_version_value))
-        except (TypeError, ValueError):
-            schema_version = 2
-    resolved, _ = resolve_checkpoint_distribution(
-        schema_version=schema_version,
-        metadata=dict(metadata),
-        priors=None,
-        label_priors={},
+def resolve_posterior_distribution(
+    metadata: dict[str, object], fit_config: dict[str, object]
+) -> str:
+    value = fit_config.get(
+        "likelihood",
+        metadata.get(
+            "posterior_distribution", metadata.get("fit_distribution", "binomial")
+        ),
     )
-    return str(resolved["posterior_distribution"])
+    resolved = str(value).strip()
+    if resolved not in {"binomial", "negative_binomial", "poisson"}:
+        raise ValueError(
+            f"unsupported posterior distribution in checkpoint metadata: {resolved!r}"
+        )
+    return resolved
 
 
 def resolve_nb_overdispersion(
@@ -112,15 +112,17 @@ def extract_batch(
     selected_channels: list[str],
 ) -> dict[str, np.ndarray]:
     requested_channels = cast(set[SignalChannel], set(selected_channels))
-    posterior_distribution = resolve_posterior_distribution(checkpoint.metadata)
+    posterior_distribution = resolve_posterior_distribution(
+        checkpoint.metadata, checkpoint.fit_config
+    )
     nb_overdispersion = resolve_nb_overdispersion(
         checkpoint.metadata, checkpoint.fit_config
     )
     if prior_source == "global":
-        assert checkpoint.priors is not None
+        prior = checkpoint.get_prior()
         posterior = Posterior(
             batch_names,
-            checkpoint.priors.subset(batch_names),
+            prior.select_genes(batch_names),
             device=device,
             torch_dtype=torch_dtype,
             posterior_distribution=posterior_distribution,
@@ -134,10 +136,8 @@ def extract_batch(
             ),
             channels=requested_channels,
         )
-    if label_key is None:
-        raise ValueError("--label-key is required when --prior-source label")
-    if label_groups is None:
-        raise ValueError("label_groups is required when --prior-source label")
+    if label_key is None or label_groups is None:
+        raise ValueError("label groups are required when --prior-source label")
     layer_values = {
         channel: np.full(
             (batch_counts.shape[0], len(batch_names)), np.nan, dtype=np.float64
@@ -145,12 +145,10 @@ def extract_batch(
         for channel in selected_channels
     }
     for label, cell_indices in label_groups.items():
-        if label not in checkpoint.label_priors:
-            raise ValueError(f"checkpoint does not contain priors for label {label!r}")
-        priors = checkpoint.label_priors[label].subset(batch_names)
+        prior = checkpoint.get_prior(label)
         posterior = Posterior(
             batch_names,
-            priors,
+            prior.select_genes(batch_names),
             device=device,
             torch_dtype=torch_dtype,
             posterior_distribution=posterior_distribution,
@@ -191,10 +189,10 @@ def resolve_class_groups(adata: ad.AnnData, class_key: str) -> dict[str, np.ndar
     if class_key not in adata.obs.columns:
         raise KeyError(f"obs column {class_key!r} does not exist")
     labels = np.asarray(adata.obs[class_key].astype(str)).reshape(-1)
-    groups: dict[str, np.ndarray] = {}
-    for label in sorted(np.unique(labels).tolist()):
-        groups[label] = np.flatnonzero(labels == label).astype(np.int64)
-    return groups
+    return {
+        label: np.flatnonzero(labels == label).astype(np.int64)
+        for label in sorted(np.unique(labels).tolist())
+    }
 
 
 def strict_label_prior_names(checkpoint) -> set[str]:

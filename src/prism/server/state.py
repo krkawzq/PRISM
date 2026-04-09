@@ -7,7 +7,6 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-import anndata as ad
 import numpy as np
 
 from .config import ServerConfig
@@ -18,6 +17,7 @@ from .services.datasets import (
     compute_detected_counts,
     compute_gene_totals,
     compute_totals,
+    detect_label_columns,
     select_matrix,
 )
 
@@ -26,7 +26,7 @@ from .services.datasets import (
 class DatasetState:
     h5ad_path: Path
     layer: str | None
-    adata: ad.AnnData
+    adata: Any
     matrix: Any
     totals: np.ndarray
     gene_names: np.ndarray
@@ -37,8 +37,7 @@ class DatasetState:
     gene_detected_counts: np.ndarray
     cell_zero_fraction: np.ndarray
     ranked_gene_indices: np.ndarray
-    treatment_label_key: str | None
-    treatment_labels: np.ndarray | None
+    label_values: dict[str, np.ndarray]
 
 
 @dataclass(slots=True)
@@ -56,8 +55,8 @@ class LoadedState:
         return int(self.dataset.adata.n_vars)
 
     @property
-    def fitted_gene_names(self) -> tuple[str, ...]:
-        return () if self.checkpoint is None else self.checkpoint.fitted_gene_names
+    def label_keys(self) -> tuple[str, ...]:
+        return tuple(self.dataset.label_values)
 
 
 class AppState:
@@ -68,20 +67,16 @@ class AppState:
         self._cache_store: dict[str, OrderedDict[str, Any]] = {
             "summary": OrderedDict(),
             "search": OrderedDict(),
-            "browse": OrderedDict(),
             "analysis": OrderedDict(),
+            "kbulk": OrderedDict(),
             "figures": OrderedDict(),
-            "html": OrderedDict(),
-            "global_eval": OrderedDict(),
         }
         self._cache_limits = {
-            "summary": 8,
+            "summary": 16,
             "search": 256,
-            "browse": 64,
-            "analysis": 64,
+            "analysis": 128,
+            "kbulk": 64,
             "figures": 256,
-            "html": 96,
-            "global_eval": 16,
         }
 
     @property
@@ -96,8 +91,7 @@ class AppState:
         return loaded
 
     def current_context_key(self) -> str:
-        loaded = self.require_loaded()
-        return loaded.context_key
+        return self.require_loaded().context_key
 
     def get_cache(self, namespace: str, key: str) -> Any | None:
         with self._lock:
@@ -135,9 +129,9 @@ class AppState:
     ) -> LoadedState:
         resolved_h5ad_path = Path(h5ad_path).expanduser().resolve()
         resolved_ckpt_path = (
-            Path(ckpt_path).expanduser().resolve()
-            if ckpt_path and ckpt_path.strip()
-            else None
+            None
+            if ckpt_path is None or not ckpt_path.strip()
+            else Path(ckpt_path).expanduser().resolve()
         )
         loaded = self._load_uncached(resolved_h5ad_path, resolved_ckpt_path, layer)
         with self._lock:
@@ -149,6 +143,8 @@ class AppState:
     def _load_uncached(
         self, h5ad_path: Path, ckpt_path: Path | None, layer: str | None
     ) -> LoadedState:
+        import anndata as ad
+
         adata = ad.read_h5ad(h5ad_path)
         matrix = select_matrix(adata, layer)
         totals = compute_totals(matrix)
@@ -158,7 +154,8 @@ class AppState:
         gene_lower_to_idx: dict[str, int] = {}
         for idx, name in enumerate(gene_names_lower):
             gene_lower_to_idx.setdefault(name, idx)
-        treatment_label_key, treatment_labels = self._extract_treatment_info(adata)
+        label_values = detect_label_columns(adata)
+        gene_total_counts = compute_gene_totals(matrix)
         dataset = DatasetState(
             h5ad_path=h5ad_path,
             layer=layer,
@@ -169,36 +166,28 @@ class AppState:
             gene_names_lower=gene_names_lower,
             gene_to_idx=gene_to_idx,
             gene_lower_to_idx=gene_lower_to_idx,
-            gene_total_counts=compute_gene_totals(matrix),
+            gene_total_counts=gene_total_counts,
             gene_detected_counts=compute_detected_counts(matrix),
             cell_zero_fraction=compute_cell_zero_fraction(matrix),
-            ranked_gene_indices=np.argsort(compute_gene_totals(matrix))[::-1].astype(
-                np.int64
-            ),
-            treatment_label_key=treatment_label_key,
-            treatment_labels=treatment_labels,
+            ranked_gene_indices=np.argsort(gene_total_counts)[::-1].astype(np.int64),
+            label_values=label_values,
         )
         checkpoint = (
             None
             if ckpt_path is None
-            else load_checkpoint_state(ckpt_path, gene_names.tolist())
+            else load_checkpoint_state(
+                ckpt_path,
+                dataset_gene_names=gene_names.tolist(),
+                gene_to_idx=gene_to_idx,
+                available_label_keys=tuple(label_values),
+            )
         )
         context_key = self._build_context_key(h5ad_path, ckpt_path, layer or "")
         return LoadedState(
-            context_key=context_key, dataset=dataset, checkpoint=checkpoint
+            context_key=context_key,
+            dataset=dataset,
+            checkpoint=checkpoint,
         )
-
-    @staticmethod
-    def _extract_treatment_info(
-        adata: ad.AnnData,
-    ) -> tuple[str | None, np.ndarray | None]:
-        obs = adata.obs
-        for key in ("treatment", "cell_type", "label", "group"):
-            if key in obs.columns:
-                values = np.asarray(obs[key].astype(str)).reshape(-1)
-                if np.unique(values).size >= 2:
-                    return key, values
-        return None, None
 
     def _build_context_key(
         self, h5ad_path: Path, ckpt_path: Path | None, layer: str

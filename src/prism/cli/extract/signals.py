@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from time import perf_counter
+from typing import cast
 
 import anndata as ad
 import numpy as np
@@ -15,8 +16,8 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
+from prism.io import write_h5ad
 from prism.model import load_checkpoint
-from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
 
 from .common import (
     compute_reference_counts,
@@ -32,6 +33,17 @@ from .common import (
     slice_gene_counts,
     console,
 )
+
+
+def _unwrap_typer_value(value: object) -> object:
+    return getattr(value, "default", value)
+
+
+def _resolve_optional_path(value: Path | None | object) -> Path | None:
+    resolved = _unwrap_typer_value(value)
+    if resolved is None:
+        return None
+    return Path(cast(str | Path, resolved)).expanduser().resolve()
 
 
 def extract_signals_command(
@@ -58,9 +70,7 @@ def extract_signals_command(
         None, help="Obs column used when --prior-source label."
     ),
     batch_size: int = typer.Option(
-        128,
-        min=1,
-        help="Number of genes per extraction batch. Controls memory usage during signal extraction.",
+        128, min=1, help="Number of genes per extraction batch."
     ),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
     torch_dtype: str = typer.Option(
@@ -80,14 +90,19 @@ def extract_signals_command(
     checkpoint_path = checkpoint_path.expanduser().resolve()
     h5ad_path = h5ad_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
-    genes_path = None if genes_path is None else genes_path.expanduser().resolve()
+    genes_path = _resolve_optional_path(genes_path)
+    layer = cast(str | None, _unwrap_typer_value(layer))
+    output_mode = str(_unwrap_typer_value(output_mode))
+    prior_source = str(_unwrap_typer_value(prior_source))
+    label_key = cast(str | None, _unwrap_typer_value(label_key))
+    batch_size = int(cast(int | str, _unwrap_typer_value(batch_size)))
+    device = str(_unwrap_typer_value(device))
+    torch_dtype = str(_unwrap_typer_value(torch_dtype))
+    dtype = str(_unwrap_typer_value(dtype))
+    channels = cast(list[str] | None, _unwrap_typer_value(channels))
+    dry_run = bool(_unwrap_typer_value(dry_run))
 
     checkpoint = load_checkpoint(checkpoint_path)
-    resolve_cli_checkpoint_distribution(
-        checkpoint,
-        command_name="prism extract signals",
-        allow_distributions={"binomial", "negative_binomial", "poisson"},
-    )
     reference_gene_names = require_reference_genes(checkpoint.metadata)
     selected_channels = resolve_channels(channels)
     output_dtype = resolve_dtype(dtype)
@@ -109,7 +124,7 @@ def extract_signals_command(
     reference_counts = compute_reference_counts(matrix, ref_positions)
     available_gene_names = checkpoint.gene_names
     available_gene_set = set(available_gene_names)
-    if prior_source_resolved == "global" and checkpoint.priors is None:
+    if prior_source_resolved == "global" and not checkpoint.has_global_prior:
         raise ValueError("checkpoint does not contain global priors")
     if prior_source_resolved == "label" and not checkpoint.label_priors:
         raise ValueError("checkpoint does not contain label-specific priors")
@@ -209,8 +224,7 @@ def extract_signals_command(
             )
     for channel, values in layer_arrays.items():
         output_adata.layers[channel] = values
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_adata.write_h5ad(output_path)
+    write_h5ad(output_adata, output_path)
     print_extract_summary(
         output_path=output_path,
         elapsed_sec=perf_counter() - start_time,

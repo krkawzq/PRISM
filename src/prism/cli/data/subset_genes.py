@@ -4,12 +4,9 @@ from pathlib import Path
 
 import anndata as ad
 import typer
-from rich.console import Console
 
-from prism.cli.common import print_key_value_table
-from prism.io import read_gene_list_spec, write_h5ad_atomic
-
-console = Console()
+from prism.cli.common import console, print_key_value_table, resolve_bool
+from prism.io import read_gene_list, write_h5ad
 
 
 def _resolve_gene_indices(
@@ -45,11 +42,7 @@ def subset_genes_command(
         ..., exists=True, dir_okay=False, help="Input AnnData file."
     ),
     genes_path: Path = typer.Option(
-        ...,
-        "--genes",
-        exists=True,
-        dir_okay=False,
-        help="Gene-list text or JSON file.",
+        ..., "--genes", exists=True, dir_okay=False, help="Gene-list text file."
     ),
     output_path: Path = typer.Option(
         ..., "--output", "-o", help="Output subset AnnData file."
@@ -63,13 +56,14 @@ def subset_genes_command(
     input_path = input_path.expanduser().resolve()
     genes_path = genes_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
+    allow_missing = resolve_bool(allow_missing)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     adata = ad.read_h5ad(input_path)
-    spec = read_gene_list_spec(genes_path)
+    gene_names = read_gene_list(genes_path)
     indices, selected_names, missing = _resolve_gene_indices(
         adata,
-        list(spec.gene_names),
+        list(gene_names),
         allow_missing=allow_missing,
     )
 
@@ -77,20 +71,17 @@ def subset_genes_command(
     subset.uns["gene_subset"] = {
         "source_h5ad": str(input_path),
         "gene_list_path": str(genes_path),
-        "gene_list_source_path": spec.source_path,
-        "gene_list_method": spec.method,
-        "gene_list_kind": spec.kind,
-        "gene_list_schema_version": int(spec.schema_version),
+        "gene_list_format": "text",
         "allow_missing": bool(allow_missing),
         "n_obs": int(subset.n_obs),
         "n_vars_before": int(adata.n_vars),
         "n_vars_after": int(subset.n_vars),
-        "n_requested_genes": int(len(spec.gene_names)),
+        "n_requested_genes": int(len(gene_names)),
         "n_selected_genes": int(len(selected_names)),
         "n_missing_genes": int(len(missing)),
         "missing_genes_preview": missing[:10],
     }
-    write_h5ad_atomic(subset, output_path)
+    write_h5ad(subset, output_path)
 
     print_key_value_table(
         console,

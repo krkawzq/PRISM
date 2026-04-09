@@ -34,11 +34,11 @@ def project_root() -> Path:
 
 
 def default_data_dir() -> Path:
-    return project_root() / "data"
+    return project_root() / "data" / "ebw4"
 
 
 def default_raw_dir() -> Path:
-    return default_data_dir() / "raw"
+    return project_root() / "data" / "raw" / "ebw4"
 
 
 def parse_args() -> argparse.Namespace:

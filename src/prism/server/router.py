@@ -94,9 +94,7 @@ class Router:
         exact = self._exact.get((request.method, request.path))
         if exact is not None:
             return exact(request)
-
         for method, prefix, handler in self._prefix:
             if method == request.method and request.path.startswith(prefix):
                 return handler(request)
-
         return Response.text("Not Found", status=HTTPStatus.NOT_FOUND)

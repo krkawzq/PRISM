@@ -1,20 +1,30 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import perf_counter
 
 import typer
-from rich.console import Console
-from rich.table import Table
 
-from prism.cli.common import ensure_mutually_exclusive
-from prism.cli.checkpoint_validation import resolve_cli_checkpoint_distribution
-from prism.io import read_gene_list, read_string_list
+from prism.cli.common import (
+    console,
+    print_elapsed,
+    print_key_value_table,
+    print_saved_path,
+    resolve_bool,
+    resolve_float,
+    resolve_int,
+    resolve_optional_float,
+    resolve_optional_int,
+    resolve_optional_path,
+    resolve_str,
+)
 from prism.model import load_checkpoint
 from prism.plotting import (
+    SUPPORTED_CURVE_MODES,
+    SUPPORTED_STAT_FIELDS,
+    SUPPORTED_Y_SCALES,
     batch_grid_curve_sets_to_dataframe,
     batch_grid_summary_dataframe,
-    load_label_grid_entries,
-    parse_batch_grid_entries,
     plot_batch_grid_figure,
     plt,
     resolve_batch_grid_curve_sets,
@@ -22,75 +32,21 @@ from prism.plotting import (
     resolve_stat_fields,
     resolve_x_axis,
     resolve_y_scale,
-    SUPPORTED_CURVE_MODES,
-    SUPPORTED_STAT_FIELDS,
-    SUPPORTED_Y_SCALES,
 )
-from .common import option_sequence, option_value
 
-console = Console()
-
-
-def _resolve_genes(
-    *,
-    gene_names: list[str] | None,
-    genes_path: Path | None,
-    top_n: int | None,
-) -> list[str]:
-    gene_names = option_sequence(gene_names)
-    genes_path = option_value(genes_path)
-    top_n = option_value(top_n)
-    ensure_mutually_exclusive(("--gene", gene_names), ("--genes", genes_path))
-    if genes_path is not None:
-        values = read_gene_list(genes_path.expanduser().resolve())
-        limit = len(values) if top_n is None else min(top_n, len(values))
-        return values[:limit]
-    if not gene_names:
-        raise ValueError("provide either --gene or --genes")
-    return list(dict.fromkeys(gene_names))
-
-
-def _resolve_label_entries(
-    *,
-    checkpoint_path: Path,
-    labels: list[str] | None,
-    labels_path: Path | None,
-    label_grid_csv_path: Path | None,
-):
-    checkpoint_path = option_value(checkpoint_path)
-    labels = option_sequence(labels)
-    labels_path = option_value(labels_path)
-    label_grid_csv_path = option_value(label_grid_csv_path)
-    if label_grid_csv_path is not None:
-        entries = load_label_grid_entries(label_grid_csv_path.expanduser().resolve())
-        if labels is None and labels_path is None:
-            return entries
-        requested = (
-            list(dict.fromkeys(labels))
-            if labels_path is None
-            else list(dict.fromkeys(read_string_list(labels_path.expanduser().resolve())))
-        )
-        requested_set = set(requested)
-        return [entry for entry in entries if entry.label in requested_set]
-
-    ensure_mutually_exclusive(("--label", labels), ("--labels", labels_path))
-    resolved_labels = (
-        sorted(load_checkpoint(checkpoint_path).label_priors)
-        if labels_path is None and not labels
-        else (
-            list(dict.fromkeys(labels))
-            if labels_path is None
-            else list(dict.fromkeys(read_string_list(labels_path.expanduser().resolve())))
-        )
-    )
-    return parse_batch_grid_entries(resolved_labels)
+from .common import (
+    normalize_image_format,
+    resolve_gene_names,
+    resolve_label_entries,
+    resolve_optional_list,
+)
 
 
 def plot_batch_grid_command(
     checkpoint_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Checkpoint path."
     ),
-    gene_names: list[str] = typer.Option(
+    gene_names: list[str] | None = typer.Option(
         None, "--gene", help="Repeatable gene name to plot."
     ),
     genes_path: Path | None = typer.Option(
@@ -99,7 +55,7 @@ def plot_batch_grid_command(
         "--gene-list",
         exists=True,
         dir_okay=False,
-        help="Optional gene list text/JSON file. Uses the first top-n genes.",
+        help="Optional gene list file. Uses the first --top-n genes when provided.",
     ),
     top_n: int | None = typer.Option(
         None,
@@ -118,7 +74,7 @@ def plot_batch_grid_command(
         "--label-list",
         exists=True,
         dir_okay=False,
-        help="Optional text/JSON file listing labels to include.",
+        help="Optional file listing labels to include.",
     ),
     label_grid_csv_path: Path | None = typer.Option(
         None,
@@ -138,7 +94,10 @@ def plot_batch_grid_command(
         "--summary-csv",
         help="Optional CSV exporting per-cell summary statistics.",
     ),
-    x_axis: str = typer.Option("mu", help="x axis: mu or p."),
+    x_axis: str = typer.Option(
+        "scaled",
+        help="x axis: scaled, support, or rate.",
+    ),
     curve_mode: str = typer.Option(
         "density",
         help="Curve mode: " + ", ".join(SUPPORTED_CURVE_MODES) + ".",
@@ -155,17 +114,15 @@ def plot_batch_grid_command(
     ),
     image_format: str = typer.Option(
         "svg",
-        help="Vector image format for per-gene figures: svg, pdf, or eps.",
+        help="Per-gene image format: svg, pdf, or eps.",
     ),
     dpi: int = typer.Option(180, min=1, help="Output figure DPI."),
-    stat_fields: list[str] = typer.Option(
+    stat_fields: list[str] | None = typer.Option(
         None,
         "--stat",
-        help=(
-            "Repeatable per-cell stats to annotate: "
-            + ", ".join(SUPPORTED_STAT_FIELDS)
-            + "."
-        ),
+        help="Repeatable per-cell stats to annotate: "
+        + ", ".join(SUPPORTED_STAT_FIELDS)
+        + ".",
     ),
     hide_empty: bool = typer.Option(
         False,
@@ -177,52 +134,46 @@ def plot_batch_grid_command(
         "--show-axis-ticks/--hide-axis-ticks",
         help="Show axis tick labels inside batch-grid cells.",
     ),
-    panel_width: float = typer.Option(0.0, min=0.0, help="Optional panel width override."),
-    panel_height: float = typer.Option(0.0, min=0.0, help="Optional panel height override."),
+    panel_width: float | None = typer.Option(
+        None, min=0.0, help="Optional panel width override."
+    ),
+    panel_height: float | None = typer.Option(
+        None, min=0.0, help="Optional panel height override."
+    ),
 ) -> int:
-    checkpoint_path = option_value(checkpoint_path)
-    gene_names = option_sequence(gene_names)
-    genes_path = option_value(genes_path)
-    top_n = option_value(top_n)
-    labels = option_sequence(labels)
-    labels_path = option_value(labels_path)
-    label_grid_csv_path = option_value(label_grid_csv_path)
-    output_dir = option_value(output_dir)
-    output_csv_path = option_value(output_csv_path)
-    summary_csv_path = option_value(summary_csv_path)
-    x_axis = str(option_value(x_axis))
-    curve_mode = str(option_value(curve_mode))
-    y_scale = str(option_value(y_scale))
-    mass_quantile = float(option_value(mass_quantile))
-    image_format = str(option_value(image_format))
-    dpi = int(option_value(dpi))
-    stat_fields = option_sequence(stat_fields)
-    hide_empty = bool(option_value(hide_empty))
-    show_axis_ticks = bool(option_value(show_axis_ticks))
-    panel_width = float(option_value(panel_width))
-    panel_height = float(option_value(panel_height))
-
-    image_format_resolved = image_format.strip().lower()
-    if image_format_resolved not in {"svg", "pdf", "eps"}:
-        raise ValueError("--image-format must be one of: svg, pdf, eps")
+    start_time = perf_counter()
     checkpoint_path = checkpoint_path.expanduser().resolve()
-    resolved_genes = _resolve_genes(
-        gene_names=gene_names,
+    genes_path = resolve_optional_path(genes_path)
+    top_n = resolve_optional_int(top_n)
+    labels_path = resolve_optional_path(labels_path)
+    label_grid_csv_path = resolve_optional_path(label_grid_csv_path)
+    output_dir = output_dir.expanduser().resolve()
+    output_csv_path = resolve_optional_path(output_csv_path)
+    summary_csv_path = resolve_optional_path(summary_csv_path)
+    x_axis = resolve_str(x_axis)
+    curve_mode = resolve_str(curve_mode)
+    y_scale = resolve_str(y_scale)
+    image_format = resolve_str(image_format)
+    mass_quantile = resolve_float(mass_quantile)
+    dpi = resolve_int(dpi)
+    hide_empty = resolve_bool(hide_empty)
+    show_axis_ticks = resolve_bool(show_axis_ticks)
+    panel_width = resolve_optional_float(panel_width)
+    panel_height = resolve_optional_float(panel_height)
+
+    checkpoint = load_checkpoint(checkpoint_path)
+    if not checkpoint.has_label_priors:
+        raise ValueError("checkpoint has no label priors")
+    resolved_genes = resolve_gene_names(
+        gene_names=resolve_optional_list(gene_names),
         genes_path=genes_path,
         top_n=top_n,
     )
-    entries = _resolve_label_entries(
-        checkpoint_path=checkpoint_path,
-        labels=labels,
+    entries = resolve_label_entries(
+        checkpoint=checkpoint,
+        labels=resolve_optional_list(labels),
         labels_path=labels_path,
         label_grid_csv_path=label_grid_csv_path,
-    )
-    checkpoint = load_checkpoint(checkpoint_path)
-    resolve_cli_checkpoint_distribution(
-        checkpoint,
-        command_name="prism plot batch-grid",
-        allow_distributions={"binomial", "negative_binomial", "poisson"},
-        require_label_priors=True,
     )
     curve_sets, batches, perturbations = resolve_batch_grid_curve_sets(
         checkpoint,
@@ -232,24 +183,26 @@ def plot_batch_grid_command(
     resolved_x_axis = resolve_x_axis(x_axis)
     resolved_curve_mode = resolve_curve_mode(curve_mode)
     resolved_y_scale = resolve_y_scale(y_scale)
-    resolved_stat_fields = resolve_stat_fields(stat_fields)
-    resolved_panel_width = 2.2 if panel_width <= 0 else float(panel_width)
-    resolved_panel_height = 1.9 if panel_height <= 0 else float(panel_height)
+    resolved_image_format = normalize_image_format(image_format)
+    resolved_stat_fields = resolve_stat_fields(resolve_optional_list(stat_fields))
+    resolved_panel_width = 2.2 if panel_width is None or panel_width <= 0 else panel_width
+    resolved_panel_height = (
+        1.9 if panel_height is None or panel_height <= 0 else panel_height
+    )
 
-    output_dir = output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    summary = Table(show_header=False, box=None)
-    summary.add_row("Checkpoint", str(checkpoint_path))
-    summary.add_row("Genes", str(len(resolved_genes)))
-    summary.add_row("Batches", ", ".join(batches))
-    summary.add_row("Perturbations", str(len(perturbations)))
-    summary.add_row("Output dir", str(output_dir))
-    console.print(summary)
-
+    print_key_value_table(
+        console,
+        title="Batch Grid Plot",
+        values={
+            "Checkpoint": checkpoint_path,
+            "Genes": len(resolved_genes),
+            "Batches": ", ".join(batches),
+            "Perturbations": len(perturbations),
+            "Output dir": output_dir,
+        },
+    )
     for gene_name, curve_map in curve_sets.items():
-        if not curve_map:
-            console.print(f"[yellow]Skipped[/yellow] {gene_name}: no matching label priors")
-            continue
         fig = plot_batch_grid_figure(
             gene_name,
             curve_map,
@@ -265,28 +218,27 @@ def plot_batch_grid_command(
             panel_width=resolved_panel_width,
             panel_height=resolved_panel_height,
         )
-        output_path = output_dir / f"{gene_name}.{image_format_resolved}"
+        output_path = output_dir / f"{gene_name}.{resolved_image_format}"
         fig.savefig(
             output_path,
             dpi=dpi,
             bbox_inches="tight",
-            format=image_format_resolved,
+            format=resolved_image_format,
         )
         plt.close(fig)
-        console.print(f"[bold green]Saved[/bold green] {output_path}")
+        print_saved_path(console, output_path)
 
     if output_csv_path is not None:
-        output_csv_path = output_csv_path.expanduser().resolve()
         output_csv_path.parent.mkdir(parents=True, exist_ok=True)
         batch_grid_curve_sets_to_dataframe(curve_sets, x_axis=resolved_x_axis).to_csv(
             output_csv_path, index=False
         )
-        console.print(f"[bold green]Saved[/bold green] {output_csv_path}")
+        print_saved_path(console, output_csv_path)
     if summary_csv_path is not None:
-        summary_csv_path = summary_csv_path.expanduser().resolve()
         summary_csv_path.parent.mkdir(parents=True, exist_ok=True)
         batch_grid_summary_dataframe(curve_sets).to_csv(summary_csv_path, index=False)
-        console.print(f"[bold green]Saved[/bold green] {summary_csv_path}")
+        print_saved_path(console, summary_csv_path)
+    print_elapsed(console, perf_counter() - start_time)
     return 0
 
 

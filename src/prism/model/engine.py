@@ -5,92 +5,73 @@ from typing import Literal
 
 import numpy as np
 
+from .exposure import mean_reference_count
 from .fit import fit_gene_priors
-from .constants import OptimizerName, SchedulerName
-from .types import (
-    GridDistribution,
-    ObservationBatch,
-    PriorFitConfig,
-    PriorFitResult,
-    PriorGrid,
-)
+from .types import ObservationBatch, PriorFitConfig, PriorFitResult, PriorGrid
 
 
 @dataclass(frozen=True, slots=True)
 class PriorEngineSetting:
-    grid_size: int = 512
-    sigma_bins: float = 1.0
-    align_loss_weight: float = 1.0
-    align_every: int = 1
-    torch_dtype: Literal["float64", "float32"] = "float64"
-    grid_max_method: Literal["observed_max", "quantile"] = "observed_max"
-    grid_strategy: Literal["linear", "sqrt"] = "linear"
-    sigma_anneal_start: float | None = None
-    sigma_anneal_end: float | None = None
-    adaptive_grid: bool = False
-    adaptive_grid_fraction: float = 0.3
-    align_mode: Literal["jsd", "kl", "weighted_jsd"] = "jsd"
-    shrinkage_weight: float = 0.0
+    support_max_from: Literal["observed_max", "quantile"] = "observed_max"
+    support_spacing: Literal["linear", "sqrt"] = "linear"
+    use_adaptive_support: bool = False
+    adaptive_support_fraction: float = 1.0
+    adaptive_support_quantile_hi: float = 0.99
     likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
     nb_overdispersion: float = 0.01
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "use_adaptive_support", bool(self.use_adaptive_support))
+        PriorFitConfig(
+            support_max_from=self.support_max_from,
+            support_spacing=self.support_spacing,
+            use_adaptive_support=self.use_adaptive_support,
+            adaptive_support_fraction=self.adaptive_support_fraction,
+            adaptive_support_quantile_hi=self.adaptive_support_quantile_hi,
+            likelihood=self.likelihood,
+            nb_overdispersion=self.nb_overdispersion,
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class PriorEngineTrainingConfig:
-    lr: float = 0.05
-    n_iter: int = 100
-    lr_min_ratio: float = 0.1
-    grad_clip: float | None = None
-    early_stop_tol: float | None = None
-    early_stop_patience: int | None = None
-    init_method: Literal["posterior_mean", "uniform", "random"] = "posterior_mean"
-    init_seed: int = 0
-    init_temperature: float = 1.0
+    n_support_points: int = 512
+    max_em_iterations: int | None = 200
+    convergence_tolerance: float = 1e-6
     cell_chunk_size: int = 512
-    optimizer: OptimizerName = "adamw"
-    scheduler: SchedulerName = "cosine"
-    cell_sample_fraction: float = 1.0
-    cell_sample_seed: int = 0
-    ensemble_restarts: int = 1
+    torch_dtype: Literal["float64", "float32"] = "float64"
+    compile_model: bool = True
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "compile_model", bool(self.compile_model))
+        PriorFitConfig(
+            n_support_points=self.n_support_points,
+            max_em_iterations=self.max_em_iterations,
+            convergence_tolerance=self.convergence_tolerance,
+            cell_chunk_size=self.cell_chunk_size,
+        )
+        if self.torch_dtype not in {"float64", "float32"}:
+            raise ValueError(f"unsupported torch_dtype: {self.torch_dtype}")
 
 
 @dataclass(frozen=True, slots=True)
 class FitSummary:
     gene_names: list[str]
-    final_loss: float
-    best_loss: float
-    n_iter: int
+    final_objective: float
+    requested_max_em_iterations: int | None
 
 
 @dataclass(frozen=True, slots=True)
 class PriorFitReport:
     gene_names: list[str]
-    p_grid: np.ndarray
-    mu_grid: np.ndarray
-    prior_weights: np.ndarray
-    posterior_average: np.ndarray
-    initial_posterior_average: np.ndarray
-    initial_prior_weights: np.ndarray
-    final_loss: float
-    best_loss: float
-    loss_history: list[float]
-    nll_history: list[float]
-    align_history: list[float]
+    support: np.ndarray
+    scaled_support: np.ndarray
+    prior_probabilities: np.ndarray
+    posterior_mean_probabilities: np.ndarray
+    final_objective: float
     config: dict[str, object]
-    S: float
+    scale: float
     mean_reference_count: float
-
-    @property
-    def support(self) -> np.ndarray:
-        return self.mu_grid
-
-    @property
-    def grid_min(self) -> np.ndarray:
-        return self.p_grid[:, 0]
-
-    @property
-    def grid_max(self) -> np.ndarray:
-        return self.p_grid[:, -1]
 
 
 def _merge_config(
@@ -98,34 +79,15 @@ def _merge_config(
     training_cfg: PriorEngineTrainingConfig,
 ) -> PriorFitConfig:
     return PriorFitConfig(
-        grid_size=setting.grid_size,
-        sigma_bins=setting.sigma_bins,
-        align_loss_weight=setting.align_loss_weight,
-        align_every=setting.align_every,
-        lr=training_cfg.lr,
-        n_iter=training_cfg.n_iter,
-        lr_min_ratio=training_cfg.lr_min_ratio,
-        grad_clip=training_cfg.grad_clip,
-        early_stop_tol=training_cfg.early_stop_tol,
-        early_stop_patience=training_cfg.early_stop_patience,
-        init_method=training_cfg.init_method,
-        init_seed=training_cfg.init_seed,
-        init_temperature=training_cfg.init_temperature,
+        n_support_points=training_cfg.n_support_points,
+        max_em_iterations=training_cfg.max_em_iterations,
+        convergence_tolerance=training_cfg.convergence_tolerance,
         cell_chunk_size=training_cfg.cell_chunk_size,
-        optimizer=training_cfg.optimizer,
-        scheduler=training_cfg.scheduler,
-        torch_dtype=setting.torch_dtype,
-        grid_max_method=setting.grid_max_method,
-        grid_strategy=setting.grid_strategy,
-        sigma_anneal_start=setting.sigma_anneal_start,
-        sigma_anneal_end=setting.sigma_anneal_end,
-        adaptive_grid=setting.adaptive_grid,
-        adaptive_grid_fraction=setting.adaptive_grid_fraction,
-        cell_sample_fraction=training_cfg.cell_sample_fraction,
-        cell_sample_seed=training_cfg.cell_sample_seed,
-        align_mode=setting.align_mode,
-        shrinkage_weight=setting.shrinkage_weight,
-        ensemble_restarts=training_cfg.ensemble_restarts,
+        support_max_from=setting.support_max_from,
+        support_spacing=setting.support_spacing,
+        use_adaptive_support=setting.use_adaptive_support,
+        adaptive_support_fraction=setting.adaptive_support_fraction,
+        adaptive_support_quantile_hi=setting.adaptive_support_quantile_hi,
         likelihood=setting.likelihood,
         nb_overdispersion=setting.nb_overdispersion,
     )
@@ -145,99 +107,83 @@ class PriorEngine:
         self.gene_names = list(gene_names)
         self.setting = setting
         self.device = device
-        self._priors: PriorGrid | None = None
+        self._prior: PriorGrid | None = None
 
     def fit(
         self,
         batch: ObservationBatch,
-        S: float | None = None,
-        s_hat: float | None = None,
+        *,
+        scale: float,
         training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
         progress_callback=None,
-        p_grid_max: np.ndarray | None = None,
+        support_max: np.ndarray | None = None,
     ) -> FitSummary:
-        raw_S = S if S is not None else s_hat
-        if raw_S is None:
-            raise ValueError("S must be provided")
-        resolved_S = float(raw_S)
         report = self.fit_report(
             batch,
-            S=resolved_S,
+            scale=scale,
             training_cfg=training_cfg,
             progress_callback=progress_callback,
-            p_grid_max=p_grid_max,
+            support_max=support_max,
         )
         return FitSummary(
             gene_names=list(report.gene_names),
-            final_loss=float(report.final_loss),
-            best_loss=float(report.best_loss),
-            n_iter=int(training_cfg.n_iter),
+            final_objective=float(report.final_objective),
+            requested_max_em_iterations=training_cfg.max_em_iterations,
         )
 
     def fit_report(
         self,
         batch: ObservationBatch,
-        S: float | None = None,
-        s_hat: float | None = None,
+        *,
+        scale: float,
         training_cfg: PriorEngineTrainingConfig = PriorEngineTrainingConfig(),
         progress_callback=None,
-        p_grid_max: np.ndarray | None = None,
+        support_max: np.ndarray | None = None,
     ) -> PriorFitReport:
-        raw_S = S if S is not None else s_hat
-        if raw_S is None:
-            raise ValueError("S must be provided")
-        resolved_S = float(raw_S)
-        if hasattr(batch, "to_observation_batch"):
-            batch = batch.to_observation_batch()  # type: ignore[assignment]
         result = fit_gene_priors(
             batch,
-            S=resolved_S,
+            scale=float(scale),
             config=_merge_config(self.setting, training_cfg),
             device=self.device,
-            p_grid_max=p_grid_max,
+            torch_dtype=training_cfg.torch_dtype,
+            support_max=support_max,
+            compile_model=training_cfg.compile_model,
             progress_callback=progress_callback,
         )
-        self._priors = result.priors
+        self._prior = result.prior
         return PriorFitReport(
             gene_names=list(result.gene_names),
-            p_grid=np.asarray(result.priors.p_grid, dtype=np.float64),
-            mu_grid=np.asarray(result.priors.mu_grid, dtype=np.float64),
-            prior_weights=np.asarray(result.priors.weights, dtype=np.float64),
-            posterior_average=np.asarray(result.posterior_average, dtype=np.float64),
-            initial_posterior_average=np.asarray(
-                result.initial_posterior_average, dtype=np.float64
+            support=np.asarray(result.prior.support, dtype=np.float64),
+            scaled_support=np.asarray(result.prior.scaled_support, dtype=np.float64),
+            prior_probabilities=np.asarray(
+                result.prior.prior_probabilities, dtype=np.float64
             ),
-            initial_prior_weights=np.asarray(
-                result.initial_prior_weights, dtype=np.float64
+            posterior_mean_probabilities=np.asarray(
+                result.posterior_mean_probabilities, dtype=np.float64
             ),
-            final_loss=float(result.final_loss),
-            best_loss=float(result.best_loss),
-            loss_history=list(result.loss_history),
-            nll_history=list(result.nll_history),
-            align_history=list(result.align_history),
+            final_objective=float(result.final_objective),
             config=dict(result.config),
-            S=float(result.scale.S),
-            mean_reference_count=float(result.scale.mean_reference_count),
+            scale=float(result.prior.scale),
+            mean_reference_count=float(mean_reference_count(batch.reference_counts)),
         )
 
-    def get_priors(self, gene_names: str | list[str]) -> PriorGrid | None:
-        if self._priors is None:
+    def get_prior(self, gene_names: str | list[str]) -> PriorGrid | None:
+        if self._prior is None:
             return None
-        subset = self._priors.subset(gene_names)
-        return GridDistribution(
-            gene_names=list(subset.gene_names),
-            p_grid=np.asarray(subset.p_grid, dtype=np.float64),
-            weights=np.asarray(subset.weights, dtype=np.float64),
-            S=float(subset.S),
-        )
+        return self._prior.select_genes(gene_names)
 
     def is_fitted(self, gene_name: str) -> bool:
-        return self._priors is not None and gene_name in self._priors.gene_names
+        return self._prior is not None and gene_name in self._prior.gene_names
 
     def is_all_fitted(self) -> bool:
-        return self._priors is not None and set(self._priors.gene_names) == set(
+        return self._prior is not None and set(self._prior.gene_names) == set(
             self.gene_names
         )
 
-
-PriorFitter = PriorEngine
+__all__ = [
+    "FitSummary",
+    "PriorEngine",
+    "PriorEngineSetting",
+    "PriorEngineTrainingConfig",
+    "PriorFitReport",
+]

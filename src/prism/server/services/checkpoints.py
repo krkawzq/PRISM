@@ -10,39 +10,79 @@ from prism.model import ModelCheckpoint, load_checkpoint
 class CheckpointState:
     ckpt_path: Path
     checkpoint: ModelCheckpoint
-    fitted_gene_names: tuple[str, ...]
     reference_gene_names: tuple[str, ...]
-    label_prior_names: tuple[str, ...]
+    reference_positions: tuple[int, ...]
+    posterior_distribution: str
+    nb_overdispersion: float
+    suggested_label_key: str | None
 
 
-def load_checkpoint_state(path: Path, dataset_gene_names: list[str]) -> CheckpointState:
+def load_checkpoint_state(
+    path: Path,
+    *,
+    dataset_gene_names: list[str],
+    gene_to_idx: dict[str, int],
+    available_label_keys: tuple[str, ...],
+) -> CheckpointState:
     checkpoint = load_checkpoint(path)
-    dataset_gene_set = set(dataset_gene_names)
-    fitted_gene_names = tuple()
-    if checkpoint.priors is not None:
-        fitted_gene_names = tuple(
-            name for name in checkpoint.priors.gene_names if name in dataset_gene_set
-        )
-    label_prior_names = tuple(sorted(checkpoint.label_priors))
-    if not fitted_gene_names and not label_prior_names:
-        raise ValueError("checkpoint has no usable priors")
-    reference_gene_names = _read_reference_gene_names(checkpoint)
-    overlap_reference = tuple(
-        name for name in reference_gene_names if name in dataset_gene_set
-    )
-    if not overlap_reference:
+    metadata = checkpoint.metadata
+    reference_gene_names = _require_reference_gene_names(metadata)
+    overlap_names = tuple(name for name in reference_gene_names if name in gene_to_idx)
+    if not overlap_names:
         raise ValueError("checkpoint reference genes do not overlap with the dataset")
+    suggested_label_key = _resolve_suggested_label_key(metadata, available_label_keys)
     return CheckpointState(
         ckpt_path=path,
         checkpoint=checkpoint,
-        fitted_gene_names=fitted_gene_names,
-        reference_gene_names=overlap_reference,
-        label_prior_names=label_prior_names,
+        reference_gene_names=overlap_names,
+        reference_positions=tuple(gene_to_idx[name] for name in overlap_names),
+        posterior_distribution=_resolve_posterior_distribution(
+            checkpoint.metadata, checkpoint.fit_config
+        ),
+        nb_overdispersion=_resolve_nb_overdispersion(
+            checkpoint.metadata, checkpoint.fit_config
+        ),
+        suggested_label_key=suggested_label_key,
     )
 
 
-def _read_reference_gene_names(checkpoint: ModelCheckpoint) -> tuple[str, ...]:
-    value = checkpoint.metadata.get("reference_gene_names")
+def _require_reference_gene_names(metadata: dict[str, object]) -> tuple[str, ...]:
+    value = metadata.get("reference_gene_names")
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("checkpoint metadata is missing reference_gene_names")
     return tuple(value)
+
+
+def _resolve_posterior_distribution(
+    metadata: dict[str, object], fit_config: dict[str, object]
+) -> str:
+    value = fit_config.get(
+        "likelihood",
+        metadata.get(
+            "posterior_distribution",
+            metadata.get("fit_distribution", "binomial"),
+        ),
+    )
+    resolved = str(value).strip()
+    if resolved not in {"binomial", "negative_binomial", "poisson"}:
+        raise ValueError(f"unsupported posterior distribution: {resolved!r}")
+    return resolved
+
+
+def _resolve_nb_overdispersion(
+    metadata: dict[str, object], fit_config: dict[str, object]
+) -> float:
+    value = fit_config.get("nb_overdispersion", metadata.get("nb_overdispersion", 0.01))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.01
+
+
+def _resolve_suggested_label_key(
+    metadata: dict[str, object], available_label_keys: tuple[str, ...]
+) -> str | None:
+    value = metadata.get("label_key")
+    if isinstance(value, str) and value in available_label_keys:
+        return value
+    return available_label_keys[0] if available_label_keys else None

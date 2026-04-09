@@ -3,11 +3,10 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, cast
 
 import anndata as ad
 import numpy as np
-import pandas as pd
 import typer
 from rich.progress import (
     BarColumn,
@@ -18,7 +17,8 @@ from rich.progress import (
     TimeElapsedColumn,
 )
 
-from prism.io import write_h5ad_atomic
+from prism.io import write_h5ad
+
 from .common import (
     compute_reference_counts,
     console,
@@ -41,22 +41,19 @@ from .kbulk import (
 )
 
 
-def _entry_int(entry: dict[str, Any], key: str) -> int:
-    return int(entry[key])
+def _unwrap_typer_value(value: object) -> object:
+    return getattr(value, "default", value)
 
 
-def _entry_float(entry: dict[str, Any], key: str) -> float:
-    return float(entry[key])
-
-
-def _entry_str(entry: dict[str, Any], key: str) -> str:
-    return str(entry[key])
+def _resolve_optional_path(value: Path | None | object) -> Path | None:
+    resolved = _unwrap_typer_value(value)
+    if resolved is None:
+        return None
+    return Path(cast(str | Path, resolved)).expanduser().resolve()
 
 
 def _resolve_selected_genes(
-    *,
-    genes_path: Path | None,
-    dataset_gene_names: list[str],
+    *, genes_path: Path | None, dataset_gene_names: list[str]
 ) -> list[str]:
     requested = dataset_gene_names if genes_path is None else read_gene_list(genes_path)
     dataset_set = set(dataset_gene_names)
@@ -108,9 +105,7 @@ def extract_kbulk_mean_command(
         0, min=0, help="Random seed for kBulk combination sampling."
     ),
     sample_batch_size: int = typer.Option(
-        1024,
-        min=1,
-        help="Number of sampled combinations to aggregate per batch. Controls memory usage.",
+        1024, min=1, help="Number of sampled combinations to aggregate per batch."
     ),
     dtype: str = typer.Option("float32", help="Output dtype: float32 or float64."),
     dry_run: bool = typer.Option(
@@ -120,12 +115,19 @@ def extract_kbulk_mean_command(
     start_time = perf_counter()
     h5ad_path = h5ad_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
-    genes_path = None if genes_path is None else genes_path.expanduser().resolve()
-    reference_genes_path = (
-        None
-        if reference_genes_path is None
-        else reference_genes_path.expanduser().resolve()
-    )
+    genes_path = _resolve_optional_path(genes_path)
+    reference_genes_path = _resolve_optional_path(reference_genes_path)
+    class_key = str(_unwrap_typer_value(class_key))
+    layer = cast(str | None, _unwrap_typer_value(layer))
+    normalize_total = cast(float | None, _unwrap_typer_value(normalize_total))
+    log1p = bool(_unwrap_typer_value(log1p))
+    k = int(cast(int | str, _unwrap_typer_value(k)))
+    n_samples = int(cast(int | str, _unwrap_typer_value(n_samples)))
+    balance = bool(_unwrap_typer_value(balance))
+    sample_seed = int(cast(int | str, _unwrap_typer_value(sample_seed)))
+    sample_batch_size = int(cast(int | str, _unwrap_typer_value(sample_batch_size)))
+    dtype = str(_unwrap_typer_value(dtype))
+    dry_run = bool(_unwrap_typer_value(dry_run))
 
     output_dtype = resolve_dtype(dtype)
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
@@ -134,8 +136,7 @@ def extract_kbulk_mean_command(
     dataset_gene_names = [str(name) for name in adata.var_names.tolist()]
     gene_to_idx = {name: idx for idx, name in enumerate(dataset_gene_names)}
     selected_genes = _resolve_selected_genes(
-        genes_path=genes_path,
-        dataset_gene_names=dataset_gene_names,
+        genes_path=genes_path, dataset_gene_names=dataset_gene_names
     )
     reference_gene_names = (
         list(dataset_gene_names)
@@ -152,7 +153,6 @@ def extract_kbulk_mean_command(
         compute_reference_counts(matrix, reference_positions), dtype=np.float32
     )
     class_groups = resolve_class_groups(adata, class_key)
-
     class_mean_reference = {
         label: float(np.mean(reference_counts[indices]))
         for label, indices in class_groups.items()
@@ -160,32 +160,26 @@ def extract_kbulk_mean_command(
     avg_mean_reference = float(np.mean(list(class_mean_reference.values())))
     per_class_plan: list[dict[str, Any]] = []
     total_kbulk = 0
-    skipped_classes = 0
     for label, indices in class_groups.items():
         n_cells = int(indices.shape[0])
-        n_combos_exact = 0 if k > n_cells else int(math.comb(n_cells, k))
-        n_combos_approx = _approx_comb_count(n_cells, k)
         target = _resolve_target_samples(
             n_samples=n_samples,
             balance=balance,
             class_mean_reference=class_mean_reference[label],
             avg_mean_reference=avg_mean_reference,
         )
-        realized = min(target, n_combos_exact)
-        if n_combos_exact == 0:
-            skipped_classes += 1
+        realized = min(target, 0 if k > n_cells else int(math.comb(n_cells, k)))
         total_kbulk += realized
         per_class_plan.append(
             {
                 "label": label,
                 "n_cells": n_cells,
-                "n_combinations": n_combos_approx,
+                "n_combinations": _approx_comb_count(n_cells, k),
                 "mean_reference_count": class_mean_reference[label],
                 "target_samples": target,
                 "realized_samples": realized,
             }
         )
-
     print_extract_plan(
         h5ad_path=h5ad_path,
         layer=layer,
@@ -194,7 +188,7 @@ def extract_kbulk_mean_command(
         k=k,
         n_cells=int(adata.n_obs),
         n_classes=len(class_groups),
-        skipped_classes=skipped_classes,
+        skipped_classes=0,
         n_selected_genes=len(selected_genes),
         n_reference_genes=len(reference_positions),
         reference_genes_source="dataset" if reference_genes_path is None else "user",
@@ -207,22 +201,13 @@ def extract_kbulk_mean_command(
         total_planned_kbulk=total_kbulk,
         output_path=output_path,
     )
-    if per_class_plan:
-        preview_lines = [
-            f"{_entry_str(entry, 'label')}: cells={_entry_int(entry, 'n_cells')}, combos={_format_comb_count(_entry_float(entry, 'n_combinations'))}, target={_entry_int(entry, 'target_samples')}, realized={_entry_int(entry, 'realized_samples')}"
-            for entry in per_class_plan[: min(10, len(per_class_plan))]
-        ]
-        console.print("\n".join(preview_lines))
     if dry_run:
         return 0
-
     target_positions = [gene_to_idx[name] for name in selected_genes]
     gene_counts = np.ascontiguousarray(
         slice_gene_counts(matrix, target_positions), dtype=np.float32
     )
     if normalize_total is not None:
-        if normalize_total <= 0:
-            raise ValueError("--normalize-total must be positive")
         totals = gene_counts.sum(axis=1, keepdims=True).clip(1e-9)
         gene_counts = gene_counts / totals * np.float32(normalize_total)
     if log1p:
@@ -232,20 +217,9 @@ def extract_kbulk_mean_command(
     mean_rows = np.empty((total_realized, n_genes), dtype=output_dtype)
     sum_rows = np.empty((total_realized, n_genes), dtype=output_dtype)
     zero_rows = np.empty((total_realized, n_genes), dtype=output_dtype)
-    obs_class: list[str] = [""] * total_realized
-    obs_kbulk_index = np.empty(total_realized, dtype=np.int64)
-    obs_class_sample_index = np.empty(total_realized, dtype=np.int64)
-    obs_k = np.full(total_realized, int(k), dtype=np.int64)
-    obs_source_n_cells = np.empty(total_realized, dtype=np.int64)
-    obs_n_combinations_total = np.empty(total_realized, dtype=np.float64)
-    obs_sampling_mode: list[str] = [""] * total_realized
-    obs_sum_reference_count = np.empty(total_realized, dtype=np.float32)
-    obs_mean_reference_count = np.empty(total_realized, dtype=np.float32)
-
+    rows: list[dict[str, Any]] = []
     rng = np.random.default_rng(sample_seed)
-    realized_classes = [
-        entry for entry in per_class_plan if _entry_int(entry, "realized_samples") > 0
-    ]
+    offset = 0
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -255,23 +229,20 @@ def extract_kbulk_mean_command(
         console=console,
     ) as progress:
         task_id = progress.add_task(
-            "constructing kbulk-mean", total=len(realized_classes)
+            "constructing kbulk-mean",
+            total=sum(1 for e in per_class_plan if int(e["realized_samples"]) > 0),
         )
-        global_sample_index = 0
-        for class_index, entry in enumerate(realized_classes, start=1):
-            label = _entry_str(entry, "label")
+        for entry in per_class_plan:
+            label = str(entry["label"])
+            realized = int(entry["realized_samples"])
+            if realized == 0:
+                continue
             indices = class_groups[label]
-            target = _entry_int(entry, "target_samples")
-            n_combinations_total = _entry_float(entry, "n_combinations")
-            mean_reference = _entry_float(entry, "mean_reference_count")
             combos = _sample_unique_combinations(
-                indices, k=k, n_samples=target, rng=rng
+                indices, k=k, n_samples=realized, rng=rng
             )
-            indices_i64 = np.asarray(indices, dtype=np.int64)
-            for chunk_index, combo_chunk in enumerate(
-                _iter_chunks(combos, sample_batch_size), start=1
-            ):
-                combo_matrix = np.asarray(combo_chunk, dtype=np.int64)
+            for chunk in _iter_chunks(combos, sample_batch_size):
+                combo_matrix = np.asarray(chunk, dtype=np.int64)
                 flat_indices = combo_matrix.reshape(-1)
                 chunk_counts = gene_counts[flat_indices].reshape(
                     combo_matrix.shape[0], combo_matrix.shape[1], n_genes
@@ -283,55 +254,35 @@ def extract_kbulk_mean_command(
                 mean_counts = sum_counts / np.float32(k)
                 zero_frac = np.mean(chunk_counts == 0, axis=1, dtype=np.float32)
                 sum_reference = chunk_reference.sum(axis=1, dtype=np.float32)
-                chunk_size_actual = combo_matrix.shape[0]
-                start = global_sample_index
-                stop = global_sample_index + chunk_size_actual
-                mean_rows[start:stop] = np.asarray(mean_counts, dtype=output_dtype)
-                sum_rows[start:stop] = np.asarray(sum_counts, dtype=output_dtype)
-                zero_rows[start:stop] = np.asarray(zero_frac, dtype=output_dtype)
-                obs_class[start:stop] = [label] * chunk_size_actual
-                obs_kbulk_index[start:stop] = np.arange(
-                    start + 1, stop + 1, dtype=np.int64
+                size = combo_matrix.shape[0]
+                mean_rows[offset : offset + size] = np.asarray(
+                    mean_counts, dtype=output_dtype
                 )
-                obs_class_sample_index[start:stop] = np.arange(
-                    (chunk_index - 1) * sample_batch_size + 1,
-                    (chunk_index - 1) * sample_batch_size + 1 + chunk_size_actual,
-                    dtype=np.int64,
+                sum_rows[offset : offset + size] = np.asarray(
+                    sum_counts, dtype=output_dtype
                 )
-                obs_source_n_cells[start:stop] = int(indices_i64.shape[0])
-                obs_n_combinations_total[start:stop] = np.float64(n_combinations_total)
-                obs_sampling_mode[start:stop] = [
-                    "all" if n_combinations_total <= float(target) else "sampled"
-                ] * chunk_size_actual
-                obs_sum_reference_count[start:stop] = sum_reference
-                obs_mean_reference_count[start:stop] = np.float32(mean_reference)
-                global_sample_index = stop
-            progress.update(
-                task_id,
-                advance=1,
-                description=f"constructing kbulk-mean ({class_index}/{len(realized_classes)})",
-            )
-
-    rows = [
-        {
-            class_key: obs_class[idx],
-            "kbulk_index": int(obs_kbulk_index[idx]),
-            "class_sample_index": int(obs_class_sample_index[idx]),
-            "k": int(obs_k[idx]),
-            "source_n_cells": int(obs_source_n_cells[idx]),
-            "n_combinations_total": float(obs_n_combinations_total[idx]),
-            "sampling_mode": obs_sampling_mode[idx],
-            "sum_reference_count": float(obs_sum_reference_count[idx]),
-            "mean_reference_count": float(obs_mean_reference_count[idx]),
-        }
-        for idx in range(total_realized)
-    ]
-
+                zero_rows[offset : offset + size] = np.asarray(
+                    zero_frac, dtype=output_dtype
+                )
+                for idx in range(size):
+                    rows.append(
+                        {
+                            class_key: label,
+                            "kbulk_index": offset + idx + 1,
+                            "k": int(k),
+                            "sum_reference_count": float(sum_reference[idx]),
+                            "mean_reference_count": float(
+                                entry["mean_reference_count"]
+                            ),
+                        }
+                    )
+                offset += size
+            progress.update(task_id, advance=1)
     output = _build_kbulk_result_adata(
         rows=rows,
         gene_names=selected_genes,
-        map_mu_rows=mean_rows,
-        map_p_rows=np.zeros_like(mean_rows, dtype=output_dtype),
+        map_scaled_support_rows=mean_rows,
+        map_probability_rows=np.zeros_like(mean_rows, dtype=output_dtype),
         posterior_entropy_rows=np.zeros_like(mean_rows, dtype=output_dtype),
         prior_entropy_rows=np.zeros_like(mean_rows, dtype=output_dtype),
         mutual_information_rows=np.zeros_like(mean_rows, dtype=output_dtype),
@@ -351,21 +302,13 @@ def extract_kbulk_mean_command(
             "sample_seed": int(sample_seed),
             "selected_genes": list(selected_genes),
             "reference_gene_names": list(resolved_reference_gene_names),
-            "reference_genes_source": "dataset"
-            if reference_genes_path is None
-            else "user",
             "per_class_plan": _serialize_per_class_plan(per_class_plan),
         },
     )
     output.layers["mean_counts"] = np.asarray(mean_rows, dtype=output_dtype)
     output.layers["sum_counts"] = np.asarray(sum_rows, dtype=output_dtype)
     output.layers["zero_fraction"] = np.asarray(zero_rows, dtype=output_dtype)
-    write_h5ad_atomic(output, output_path)
-
-    for entry in per_class_plan:
-        console.print(
-            f"{_entry_str(entry, 'label')}: cells={_entry_int(entry, 'n_cells')}, combos={_format_comb_count(_entry_float(entry, 'n_combinations'))}, target={_entry_int(entry, 'target_samples')}, realized={_entry_int(entry, 'realized_samples')}"
-        )
+    write_h5ad(output, output_path)
     console.print(f"[bold green]Saved[/bold green] {output_path}")
     console.print(
         f"[bold green]Elapsed[/bold green] {perf_counter() - start_time:.2f}s"

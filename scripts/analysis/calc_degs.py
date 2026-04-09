@@ -92,6 +92,8 @@ def rename_deg_columns(df: pd.DataFrame) -> pd.DataFrame:
 def to_plot_fg_format(df: pd.DataFrame) -> pd.DataFrame:
     renamed = df.rename(columns={"target": "label", "feature": "gene"}).copy()
     return pd.DataFrame(renamed[["gene", "label", "log2_fold_change", "fdr"]].copy())
+
+
 def subset_genes(adata: ad.AnnData, gene_list_path: Path | None) -> ad.AnnData:
     if gene_list_path is None:
         return adata

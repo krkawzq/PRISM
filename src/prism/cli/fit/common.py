@@ -6,19 +6,22 @@ from typing import Any
 
 import anndata as ad
 import numpy as np
-from rich.console import Console
 
-from prism.cli.common import normalize_choice, print_elapsed, print_key_value_table, print_saved_path
-from prism.io import (
-    compute_reference_counts as compute_reference_counts_shared,
-    ensure_dense_matrix as ensure_dense_matrix_shared,
-    read_gene_list as read_gene_list_shared,
-    select_matrix as select_matrix_shared,
-    slice_gene_matrix as slice_gene_matrix_shared,
+from prism.cli.common import (
+    console,
+    normalize_choice,
+    print_elapsed,
+    print_key_value_table,
+    print_saved_path,
 )
-from prism.model import ModelCheckpoint, PriorGrid
-
-console = Console()
+from prism.io import (
+    compute_reference_counts,
+    read_gene_list,
+    read_string_list,
+    select_matrix,
+    slice_gene_matrix,
+)
+from prism.model import ModelCheckpoint, PriorGrid, summarize_reference_scale
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +30,20 @@ class FitTask:
     scope_name: str
     cell_indices: np.ndarray
     label_value: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GeneBatch:
+    gene_names: list[str]
+    gene_positions: list[int]
+
+
+@dataclass(frozen=True, slots=True)
+class ScaleResolution:
+    scale: float
+    default_scale: float
+    scale_source: str
+    n_positive_reference_cells: int
 
 
 def parse_shard(value: str) -> tuple[int, int]:
@@ -76,19 +93,31 @@ def resolve_label_groups(
     return groups
 
 
+def resolve_requested_labels(
+    label_values: list[str] | None,
+    label_list_path: Path | None,
+) -> list[str] | None:
+    if not label_values and label_list_path is None:
+        return None
+    merged: list[str] = []
+    if label_values:
+        merged.extend(label_values)
+    if label_list_path is not None:
+        merged.extend(read_string_list(label_list_path))
+    return list(dict.fromkeys(merged))
+
+
 def build_fit_tasks(
     fit_mode: str, label_groups: list[tuple[str, np.ndarray]], *, n_cells: int
 ) -> list[FitTask]:
     tasks: list[FitTask] = []
     if fit_mode in {"global", "both"}:
-        if label_groups:
-            all_indices = np.unique(
-                np.concatenate([indices for _, indices in label_groups])
-            )
-        else:
-            all_indices = np.arange(n_cells, dtype=np.int64)
         tasks.append(
-            FitTask(scope_kind="global", scope_name="global", cell_indices=all_indices)
+            FitTask(
+                scope_kind="global",
+                scope_name="global",
+                cell_indices=np.arange(n_cells, dtype=np.int64),
+            )
         )
     if fit_mode in {"by-label", "both"}:
         tasks.extend(
@@ -116,19 +145,15 @@ def sample_indices(
 
 
 def checkpoint_gene_names(
-    global_priors: PriorGrid | None,
+    global_prior: PriorGrid | None,
     label_priors: dict[str, PriorGrid],
     fallback_gene_names: list[str],
 ) -> list[str]:
-    if global_priors is not None:
-        return list(global_priors.gene_names)
+    if global_prior is not None:
+        return list(global_prior.gene_names)
     if label_priors:
         return list(next(iter(label_priors.values())).gene_names)
     return list(fallback_gene_names)
-
-
-def read_gene_list(path: Path) -> list[str]:
-    return read_gene_list_shared(path)
 
 
 def resolve_gene_list(
@@ -163,33 +188,44 @@ def shard_gene_names(gene_names: list[str], *, rank: int, world_size: int) -> li
     return [name for idx, name in enumerate(gene_names) if idx % world_size == rank]
 
 
-def select_matrix(adata: ad.AnnData, layer: str | None):
-    return select_matrix_shared(adata, layer)
+def build_gene_batches(
+    gene_names: list[str], gene_to_idx: dict[str, int], *, batch_size: int
+) -> list[GeneBatch]:
+    return [
+        GeneBatch(
+            gene_names=gene_names[start : start + batch_size],
+            gene_positions=[
+                gene_to_idx[name] for name in gene_names[start : start + batch_size]
+            ],
+        )
+        for start in range(0, len(gene_names), batch_size)
+    ]
 
 
-def ensure_dense_matrix(matrix) -> np.ndarray:
-    return ensure_dense_matrix_shared(matrix, dtype=np.float32)
+def resolve_scale(
+    reference_counts: np.ndarray, *, scale: float | None
+) -> ScaleResolution:
+    values = np.asarray(reference_counts, dtype=np.float64).reshape(-1)
+    positive = values[np.isfinite(values) & (values > 0)]
+    if positive.size == 0:
+        raise ValueError("reference genes produced no positive per-cell counts")
+    diagnostic = summarize_reference_scale(positive)
+    resolved_scale = (
+        float(diagnostic.suggested_scale) if scale is None else float(scale)
+    )
+    return ScaleResolution(
+        scale=resolved_scale,
+        default_scale=float(diagnostic.suggested_scale),
+        scale_source="default:mean_reference_count" if scale is None else "user",
+        n_positive_reference_cells=int(positive.size),
+    )
 
 
 def slice_gene_counts(
     matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
 ) -> np.ndarray:
-    return slice_gene_matrix_shared(
-        matrix,
-        positions,
-        cell_indices=cell_indices,
-        dtype=np.float64,
-    )
-
-
-def compute_reference_counts(
-    matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
-) -> np.ndarray:
-    return compute_reference_counts_shared(
-        matrix,
-        positions,
-        cell_indices=cell_indices,
-        dtype=np.float64,
+    return slice_gene_matrix(
+        matrix, positions, cell_indices=cell_indices, dtype=np.float64
     )
 
 
@@ -200,20 +236,51 @@ def print_fit_plan(**values: Any) -> None:
 def print_fit_summary(
     *, output_path: Path, elapsed_sec: float, checkpoint: ModelCheckpoint
 ) -> None:
-    s_value = "-" if checkpoint.scale is None else f"{checkpoint.scale.S:.4f}"
+    s_value = (
+        "-"
+        if checkpoint.scale_metadata is None
+        else f"{checkpoint.scale_metadata.scale:.4f}"
+    )
     mean_ref = (
         "-"
-        if checkpoint.scale is None
-        else f"{checkpoint.scale.mean_reference_count:.4f}"
+        if checkpoint.scale_metadata is None
+        else f"{checkpoint.scale_metadata.mean_reference_count:.4f}"
     )
     print_key_value_table(
         console,
         title="Fit Summary",
         values={
             "Genes": len(checkpoint.gene_names),
+            "Global prior": checkpoint.prior is not None,
+            "Label priors": len(checkpoint.label_priors),
             "S": s_value,
             "Mean ref count": mean_ref,
         },
     )
     print_saved_path(console, output_path)
     print_elapsed(console, elapsed_sec)
+
+
+__all__ = [
+    "FitTask",
+    "GeneBatch",
+    "ScaleResolution",
+    "build_fit_tasks",
+    "build_gene_batches",
+    "checkpoint_gene_names",
+    "compute_reference_counts",
+    "console",
+    "parse_shard",
+    "print_fit_plan",
+    "print_fit_summary",
+    "resolve_fit_gene_list",
+    "resolve_fit_mode",
+    "resolve_gene_list",
+    "resolve_label_groups",
+    "resolve_requested_labels",
+    "resolve_scale",
+    "sample_indices",
+    "select_matrix",
+    "shard_gene_names",
+    "slice_gene_counts",
+]

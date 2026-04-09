@@ -1,295 +1,301 @@
 from __future__ import annotations
 
 from html import escape
-from urllib.parse import quote_plus
 
-from prism.server.services.analysis import GeneAnalysis, GeneSummary
-from prism.server.services.datasets import GeneCandidate
+import numpy as np
 
-from .layout import render_nav, render_page, stat_card
+from prism.server.services.analysis import (
+    GeneAnalysis,
+    GeneFitParams,
+    KBulkAnalysis,
+    KBulkParams,
+)
 
-
-def _default_fit_params() -> dict[str, object]:
-    return {
-        "S": "",
-        "reference_mode": "checkpoint",
-        "grid_size": 512,
-        "sigma_bins": 1.0,
-        "align_loss_weight": 1.0,
-        "lr": 0.05,
-        "n_iter": 100,
-        "lr_min_ratio": 0.1,
-        "init_temperature": 1.0,
-        "cell_chunk_size": 512,
-        "optimizer": "adamw",
-        "scheduler": "cosine",
-        "torch_dtype": "float64",
-        "device": "cpu",
-    }
-
-
-def _default_kbulk_params() -> dict[str, object]:
-    return {
-        "kbulk_k": 8,
-        "kbulk_samples": 24,
-        "kbulk_groups": 4,
-        "kbulk_min_cells": 24,
-        "kbulk_seed": 0,
-    }
-
-
-def _candidate_block(
-    *, gene_name: str, candidates: list[GeneCandidate] | None = None
-) -> str:
-    if not candidates:
-        return ""
-    rows = "".join(
-        f'<tr><td><a href="/gene?q={quote_plus(item.gene_name)}">{escape(item.gene_name)}</a></td><td>{item.gene_index}</td><td>{item.total_umi:,}</td></tr>'
-        for item in candidates
-        if item.gene_name != gene_name
-    )
-    if not rows:
-        return ""
-    return f'<section class="panel"><h2>Nearby matches</h2><table><thead><tr><th>Gene</th><th>Index</th><th>Total UMI</th></tr></thead><tbody>{rows}</tbody></table></section>'
-
-
-def _fit_form(
-    search_query: str, fit_params: dict[str, object] | None, *, has_checkpoint: bool
-) -> str:
-    params = _default_fit_params() if fit_params is None else fit_params
-    reference_options = [
-        ("checkpoint", "Checkpoint reference set"),
-        ("all", "All genes except target"),
-    ]
-    optimizer_options = ["adamw", "adam", "sgd", "rmsprop"]
-    scheduler_options = ["cosine", "linear", "constant", "step"]
-    dtype_options = ["float64", "float32"]
-    reference_html = "".join(
-        f'<option value="{name}"{" selected" if str(params.get("reference_mode", "checkpoint")) == name else ""}{" disabled" if (name == "checkpoint" and not has_checkpoint) else ""}>{label}</option>'
-        for name, label in reference_options
-    )
-    optimizer_html = "".join(
-        f'<option value="{name}"{" selected" if str(params["optimizer"]) == name else ""}>{name}</option>'
-        for name in optimizer_options
-    )
-    scheduler_html = "".join(
-        f'<option value="{name}"{" selected" if str(params["scheduler"]) == name else ""}>{name}</option>'
-        for name in scheduler_options
-    )
-    dtype_html = "".join(
-        f'<option value="{name}"{" selected" if str(params["torch_dtype"]) == name else ""}>{name}</option>'
-        for name in dtype_options
-    )
-    return f"""
-      <section class="panel fit-panel">
-        <form class="fit-form" action="/gene" method="get">
-          <input type="hidden" name="q" value="{escape(search_query)}">
-          <input type="hidden" name="fit" value="1">
-          <div class="fit-header fit-hero">
-            <div class="fit-title-stack">
-              <div>
-                <h2>On-demand fit</h2>
-                <p>Run a quick single-gene fit directly in the browser flow using the new PRISM prior model.</p>
-              </div>
-              <div class="fit-badges">
-                <span class="fit-badge">manual start</span>
-                <span class="fit-badge">S defaults to N_avg</span>
-                <span class="fit-badge">reference-aware</span>
-              </div>
-            </div>
-            <div class="fit-action-card">
-              <p>The fit uses the selected reference set to build reference counts, then runs a one-gene prior fit and posterior extraction.</p>
-              <button type="submit">Fit / Refresh</button>
-            </div>
-          </div>
-          <div class="fit-overview">
-            <label class="fit-inline-field fit-inline-field-strong"><span>S</span><input type="text" name="S" value="{escape(str(params.get("S", "")))}" placeholder="blank = N_avg"><small>blank means use mean reference count</small></label>
-            <label class="fit-inline-field"><span>reference mode</span><select name="reference_mode">{reference_html}</select><small>use checkpoint references when available</small></label>
-            <label class="fit-inline-field"><span>grid size</span><input type="number" min="16" step="1" name="grid_size" value="{params["grid_size"]}"><small>512 is a solid default</small></label>
-            <label class="fit-inline-field"><span>iterations</span><input type="number" min="1" step="1" name="n_iter" value="{params["n_iter"]}"><small>start with 100</small></label>
-          </div>
-          <details class="fit-advanced" open>
-            <summary><span>Advanced controls</span><span class="muted">prior shape, optimizer, scheduler, and runtime knobs</span></summary>
-            <div class="fit-sections">
-              <div class="fit-section fit-section-primary">
-                <h3>Prior geometry</h3>
-                <div class="fit-fields">
-                  <label class="fit-field"><span>sigma bins</span><input type="number" step="any" name="sigma_bins" value="{params["sigma_bins"]}"><small>Gaussian smoothing over the grid</small></label>
-                  <label class="fit-field"><span>align weight</span><input type="number" step="any" name="align_loss_weight" value="{params["align_loss_weight"]}"><small>self-consistency weight</small></label>
-                </div>
-              </div>
-              <div class="fit-section">
-                <h3>Optimization</h3>
-                <div class="fit-fields">
-                  <label class="fit-field"><span>learning rate</span><input type="number" step="any" name="lr" value="{params["lr"]}"></label>
-                  <label class="fit-field"><span>lr min ratio</span><input type="number" step="any" name="lr_min_ratio" value="{params["lr_min_ratio"]}"></label>
-                  <label class="fit-field"><span>init temperature</span><input type="number" step="any" name="init_temperature" value="{params["init_temperature"]}"></label>
-                </div>
-              </div>
-              <div class="fit-section">
-                <h3>Runtime</h3>
-                <div class="fit-fields">
-                  <label class="fit-field"><span>cell chunk</span><input type="number" min="1" step="1" name="cell_chunk_size" value="{params["cell_chunk_size"]}"></label>
-                  <label class="fit-field"><span>torch dtype</span><select name="torch_dtype">{dtype_html}</select></label>
-                  <label class="fit-field"><span>optimizer</span><select name="optimizer">{optimizer_html}</select></label>
-                  <label class="fit-field"><span>scheduler</span><select name="scheduler">{scheduler_html}</select></label>
-                  <label class="fit-field"><span>device</span><input type="text" name="device" value="{escape(str(params["device"]))}"></label>
-                </div>
-              </div>
-            </div>
-          </details>
-        </form>
-      </section>
-    """
-
-
-def _kbulk_form(search_query: str, kbulk_params: dict[str, object] | None) -> str:
-    params = (
-        _default_kbulk_params()
-        if kbulk_params is None
-        else {
-            "kbulk_k": kbulk_params.get("kbulk_k", kbulk_params.get("k", 8)),
-            "kbulk_samples": kbulk_params.get(
-                "kbulk_samples", kbulk_params.get("n_samples", 24)
-            ),
-            "kbulk_groups": kbulk_params.get(
-                "kbulk_groups", kbulk_params.get("max_groups", 4)
-            ),
-            "kbulk_min_cells": kbulk_params.get(
-                "kbulk_min_cells", kbulk_params.get("min_cells_per_group", 24)
-            ),
-            "kbulk_seed": kbulk_params.get(
-                "kbulk_seed", kbulk_params.get("random_seed", 0)
-            ),
-        }
-    )
-    return f"""
-      <section class="panel kbulk-panel">
-        <form class="kbulk-form" action="/gene" method="get">
-          <input type="hidden" name="q" value="{escape(search_query)}">
-          <input type="hidden" name="kbulk" value="1">
-          <div class="kbulk-header">
-            <div>
-              <h2>kBulk comparison</h2>
-              <p>Fit class-specific F_g on label groups, then compare repeated kBulk MAP estimates across groups.</p>
-            </div>
-            <button type="submit">Compute kBulk</button>
-          </div>
-          <div class="kbulk-grid">
-            <label><span>k</span><input type="number" min="2" step="1" name="kbulk_k" value="{params["kbulk_k"]}"></label>
-            <label><span>samples</span><input type="number" min="1" step="1" name="kbulk_samples" value="{params["kbulk_samples"]}"></label>
-            <label><span>groups</span><input type="number" min="1" step="1" name="kbulk_groups" value="{params["kbulk_groups"]}"></label>
-            <label><span>min cells</span><input type="number" min="4" step="1" name="kbulk_min_cells" value="{params["kbulk_min_cells"]}"></label>
-            <label><span>seed</span><input type="number" min="0" step="1" name="kbulk_seed" value="{params["kbulk_seed"]}"></label>
-          </div>
-        </form>
-      </section>
-    """
-
-
-def render_gene_pending_page(
-    *,
-    gene_name: str,
-    gene_index: int,
-    summary: GeneSummary,
-    search_query: str,
-    fit_params: dict[str, object] | None = None,
-    candidates: list[GeneCandidate] | None = None,
-    figures: dict[str, str] | None = None,
-    has_checkpoint: bool = False,
-    kbulk_params: dict[str, object] | None = None,
-) -> str:
-    figures = {} if figures is None else figures
-    stats = "".join(
-        [
-            stat_card("Gene", gene_name),
-            stat_card("Index", str(gene_index)),
-            stat_card("Source", "raw-only"),
-            stat_card("Mean count", f"{summary.mean_count:.3f}"),
-            stat_card("Detected frac", f"{summary.detected_frac:.3f}"),
-            stat_card("Zero frac", f"{summary.zero_frac:.3f}"),
-            stat_card("P99 count", f"{summary.p99_count:.3f}"),
-            stat_card("Depth corr", f"{summary.count_total_correlation:.3f}"),
-        ]
-    )
-    overview_block = (
-        ""
-        if "gene_overview" not in figures
-        else f'<section class="panel figure-wide"><h2>Gene overview</h2><div class="figure"><img src="{figures["gene_overview"]}"></div></section>'
-    )
-    body = f"""
-      {render_nav(current_query=search_query)}
-      {_fit_form(search_query, fit_params, has_checkpoint=has_checkpoint)}
-      {_kbulk_form(search_query, kbulk_params)}
-      <section class="panel"><h2>Ready to fit</h2><p>No prior is currently available for <strong>{escape(gene_name)}</strong>. Use the on-demand fit form to build one directly from the loaded dataset.</p></section>
-      <section class="panel"><h2>Raw summary</h2><div class="stat-grid">{stats}</div></section>
-      {_candidate_block(gene_name=gene_name, candidates=candidates)}
-      {overview_block}
-    """
-    return render_page(title=f"PRISM Gene: {gene_name}", body=body)
+from .components import render_chip_row, render_detail_grid, render_section_header
+from .layout import render_message, render_nav, render_page, stat_card
 
 
 def render_gene_page(
     *,
     analysis: GeneAnalysis,
-    figures: dict[str, str],
-    search_query: str,
-    candidates: list[GeneCandidate] | None = None,
-    fit_params: dict[str, object] | None = None,
-    kbulk_params: dict[str, object] | None = None,
-    has_checkpoint: bool = False,
+    raw_figure: str | None,
+    prior_figure: str | None,
+    signal_figure: str | None,
+    gallery_figure: str | None,
+    objective_figure: str | None,
+    fit_params: GeneFitParams,
+    kbulk_params: KBulkParams,
+    kbulk_analysis: KBulkAnalysis | None = None,
+    kbulk_figure: str | None = None,
+    error_message: str | None = None,
+    kbulk_error: str | None = None,
 ) -> str:
-    stats = "".join(
+    parts = [render_nav(current_query=analysis.gene_name)]
+    if error_message:
+        parts.append(render_message(error_message, level="error"))
+    if kbulk_error:
+        parts.append(render_message(kbulk_error, level="error"))
+    parts.append(_render_gene_identity(analysis))
+    parts.append(_render_analysis_controls(analysis))
+    parts.append(_render_fit_form(analysis, fit_params))
+    parts.append(_render_kbulk_form(analysis, kbulk_params))
+    parts.append(_render_summary(analysis))
+    if raw_figure:
+        parts.append(_figure_block("Raw Overview", raw_figure))
+    if prior_figure:
+        parts.append(_figure_block("Prior Overlay", prior_figure))
+    if signal_figure:
+        parts.append(_figure_block("Signal Interface", signal_figure))
+    if gallery_figure:
+        parts.append(_figure_block("Posterior Gallery", gallery_figure))
+    if objective_figure:
+        parts.append(_figure_block("Objective Trace", objective_figure))
+    if kbulk_analysis is not None:
+        parts.append(_render_kbulk_summary(kbulk_analysis, kbulk_figure))
+    return render_page(title=f"PRISM Gene: {analysis.gene_name}", body="".join(parts))
+
+
+def _render_gene_identity(analysis: GeneAnalysis) -> str:
+    chips = render_chip_row(
         [
-            stat_card("Gene", analysis.gene_name),
-            stat_card("Index", str(analysis.gene_index)),
-            stat_card("Source", analysis.source),
-            stat_card("S", f"{analysis.S:.3f}"),
-            stat_card("S source", analysis.S_source),
-            stat_card("Reference mode", analysis.reference_mode),
-            stat_card("Reference genes", str(analysis.reference_gene_count)),
-            stat_card("Mean signal", f"{float(analysis.signal.mean()):.3f}"),
-            stat_card(
-                "Mean posterior entropy",
-                f"{float(analysis.posterior_entropy.mean()):.3f}",
-            ),
-            stat_card(
-                "Mean prior entropy", f"{float(analysis.prior_entropy.mean()):.3f}"
-            ),
-            stat_card(
-                "Mean mutual info", f"{float(analysis.mutual_information.mean()):.3f}"
-            ),
-            stat_card("Depth corr", f"{analysis.summary.count_total_correlation:.3f}"),
+            (f"Mode: {analysis.mode}", "info"),
+            (f"Source: {analysis.source}", "neutral"),
+            (f"Prior: {analysis.prior_source}", "warning"),
         ]
     )
-    metric_rows = "".join(
-        f"<tr><td>{escape(name)}</td><td>{metrics.mean:.4f}</td><td>{metrics.median:.4f}</td><td>{metrics.std:.4f}</td><td>{metrics.var:.4f}</td><td>{metrics.p95:.4f}</td><td>{metrics.nonzero_frac:.4f}</td><td>{metrics.depth_corr:.4f}</td><td>{metrics.depth_mi:.4f}</td><td>{'-' if metrics.sparsity_corr is None else f'{metrics.sparsity_corr:.4f}'}</td><td>{'-' if metrics.fisher_ratio is None else f'{metrics.fisher_ratio:.4f}'}</td><td>{'-' if metrics.kruskal_h is None else f'{metrics.kruskal_h:.4f}'}</td><td>{'-' if metrics.kruskal_p is None else f'{metrics.kruskal_p:.3e}'}</td><td>{'-' if metrics.auroc_ovr is None else f'{metrics.auroc_ovr:.4f}'}</td><td>{'-' if metrics.zero_consistency is None else f'{metrics.zero_consistency:.4f}'}</td><td>{'-' if metrics.zero_rank_tau is None else f'{metrics.zero_rank_tau:.4f}'}</td><td>{'-' if metrics.dropout_recovery is None else f'{metrics.dropout_recovery:.4f}'}</td><td>{'-' if metrics.treatment_cv is None else f'{metrics.treatment_cv:.4f}'}</td></tr>"
-        for name, metrics in analysis.representation_metrics.items()
+    details = render_detail_grid(
+        [
+            ("Gene", analysis.gene_name),
+            ("Gene index", str(analysis.gene_index)),
+            ("Label key", analysis.label_key or "Auto"),
+            ("Label", analysis.label or "Auto"),
+            ("Reference source", analysis.reference_source),
+            ("Reference genes", f"{analysis.reference_gene_count:,}"),
+        ]
     )
-    fit_trace_block = (
-        ""
-        if "loss_trace" not in figures
-        else f'<section class="panel figure-wide"><h2>On-demand fit trace</h2><div class="figure"><img src="{figures["loss_trace"]}"></div></section>'
+    stats = [
+        stat_card("Cells", f"{analysis.n_cells:,}"),
+        stat_card("Raw mean", f"{analysis.raw_summary.mean_count:.4f}"),
+        stat_card("Detected frac", f"{analysis.raw_summary.detected_fraction:.4f}"),
+        stat_card("Zero frac", f"{analysis.raw_summary.zero_fraction:.4f}"),
+    ]
+    section_header = render_section_header(
+        analysis.gene_name,
+        "Current gene workspace, analysis mode, and reference context.",
+        eyebrow="Gene Workspace",
     )
-    kbulk_block = ""
-    if analysis.kbulk is not None and "kbulk" in figures:
-        rows = "".join(
-            f"<tr><td>{escape(group.label)}</td><td>{group.n_cells}</td><td>{group.mean_map_mu:.4f}</td><td>{group.std_map_mu:.4f}</td><td>{group.mean_posterior_entropy:.4f}</td></tr>"
-            for group in analysis.kbulk.groups
-        )
-        kbulk_block = f'<section class="panel figure-wide"><h2>kBulk comparison</h2><p class="muted">Label key: <strong>{escape(analysis.kbulk.label_key)}</strong> | k={analysis.kbulk.k} | samples={analysis.kbulk.n_samples}</p><div class="table-wrap"><table><thead><tr><th>Group</th><th>Cells</th><th>Mean MAP mu</th><th>Std MAP mu</th><th>Mean posterior entropy</th></tr></thead><tbody>{rows}</tbody></table></div><div class="figure"><img src="{figures["kbulk"]}"></div></section>'
-    body = f"""
-      {render_nav(current_query=search_query)}
-      {_fit_form(search_query, fit_params, has_checkpoint=has_checkpoint)}
-      {_kbulk_form(search_query, kbulk_params)}
-      <section class="panel"><h2>Gene summary</h2><div class="stat-grid">{stats}</div></section>
-      <section class="panel"><h2>Baseline metrics</h2><div class="table-wrap"><table class="compact-table"><thead><tr><th>Signal</th><th>Mean</th><th>Median</th><th>Std</th><th>Var</th><th>P95</th><th>Nonzero frac</th><th>Depth corr</th><th>Depth MI</th><th>Sparsity corr</th><th>Fisher ratio</th><th>Kruskal H</th><th>Kruskal p</th><th>AUROC OVR</th><th>Zero-group consistency</th><th>Zero rank tau</th><th>Dropout recovery</th><th>Treatment CV</th></tr></thead><tbody>{metric_rows}</tbody></table></div></section>
-      {_candidate_block(gene_name=analysis.gene_name, candidates=candidates)}
-      <section class="panel figure-wide"><h2>Gene overview</h2><div class="figure"><img src="{figures["gene_overview"]}"></div></section>
-      {fit_trace_block}
-      <section class="panel figure-wide"><h2>Prior profile</h2><div class="figure"><img src="{figures["prior_fit"]}"></div></section>
-      {kbulk_block}
-      <section class="panel figure-wide"><h2>Signal interface</h2><div class="figure"><img src="{figures["signal_interface"]}"></div></section>
-      <section class="panel figure-wide"><h2>Posterior gallery</h2><div class="figure"><img src="{figures["posterior_gallery"]}"></div></section>
+    return f"""
+    <section class="panel">
+      {section_header}
+      {chips}
+      {details}
+      <div class="stat-grid">{"".join(stats)}</div>
+    </section>
     """
-    return render_page(title=f"PRISM Gene: {analysis.gene_name}", body=body)
+
+
+def _render_analysis_controls(analysis: GeneAnalysis) -> str:
+    label_key_options = "".join(
+        f'<option value="{escape(key)}"{" selected" if analysis.label_key == key else ""}>{escape(key)}</option>'
+        for key in analysis.available_label_keys
+    )
+    label_options = "".join(
+        f'<option value="{escape(value)}"{" selected" if analysis.label == value else ""}>{escape(value)}</option>'
+        for value in analysis.available_labels
+    )
+    section_header = render_section_header(
+        "Analysis Controls",
+        "Switch between raw, checkpoint, and fit-backed views. Narrow the analysis to a label-specific subset when available.",
+        eyebrow="Controls",
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      <form class="toolbar stack-mobile" action="/gene" method="get">
+        <input type="hidden" name="q" value="{escape(analysis.gene_name)}">
+        <label class="field"><span>Mode</span><select name="mode">
+          <option value="raw"{" selected" if analysis.mode == "raw" else ""}>Raw only</option>
+          <option value="checkpoint"{" selected" if analysis.mode == "checkpoint" else ""}>Checkpoint posterior</option>
+          <option value="fit"{" selected" if analysis.mode == "fit" else ""}>On-demand fit</option>
+        </select></label>
+        <label class="field"><span>Prior source</span><select name="prior_source">
+          <option value="global"{" selected" if analysis.prior_source == "global" else ""}>Global prior</option>
+          <option value="label"{" selected" if analysis.prior_source == "label" else ""}>Label prior</option>
+        </select></label>
+        <label class="field"><span>Label key</span><select name="label_key">
+          <option value="">Auto label key</option>
+          {label_key_options}
+        </select></label>
+        <label class="field"><span>Label</span><select name="label">
+          <option value="">Auto label</option>
+          {label_options}
+        </select></label>
+        <div class="form-actions form-actions-inline"><button type="submit">Refresh</button></div>
+      </form>
+    </section>
+    """
+
+
+def _render_fit_form(analysis: GeneAnalysis, params: GeneFitParams) -> str:
+    section_header = render_section_header(
+        "On-Demand Fit",
+        "Adjust fit configuration, rerun a single-gene prior fit, and compare the resulting posterior diagnostics.",
+        eyebrow="Fit",
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      <form class="form-grid" action="/gene" method="get">
+        {_shared_hidden_inputs(analysis)}
+        <input type="hidden" name="mode" value="fit">
+        <label><span>Scale</span><input type="text" name="scale" value="{"" if params.scale is None else params.scale}"></label>
+        <label><span>Reference source</span><select name="reference_source"><option value="checkpoint"{" selected" if params.reference_source == "checkpoint" else ""}>checkpoint</option><option value="dataset"{" selected" if params.reference_source == "dataset" else ""}>dataset</option></select></label>
+        <label><span>Support points</span><input type="number" min="2" name="n_support_points" value="{params.n_support_points}"></label>
+        <label><span>Max EM iterations</span><input type="number" min="1" name="max_em_iterations" value="{"" if params.max_em_iterations is None else params.max_em_iterations}"></label>
+        <label><span>Convergence tolerance</span><input type="text" name="convergence_tolerance" value="{params.convergence_tolerance}"></label>
+        <label><span>Cell chunk size</span><input type="number" min="1" name="cell_chunk_size" value="{params.cell_chunk_size}"></label>
+        <label><span>Support max from</span><select name="support_max_from"><option value="observed_max"{" selected" if params.support_max_from == "observed_max" else ""}>observed_max</option><option value="quantile"{" selected" if params.support_max_from == "quantile" else ""}>quantile</option></select></label>
+        <label><span>Support spacing</span><select name="support_spacing"><option value="linear"{" selected" if params.support_spacing == "linear" else ""}>linear</option><option value="sqrt"{" selected" if params.support_spacing == "sqrt" else ""}>sqrt</option></select></label>
+        <label><span>Adaptive support</span><select name="use_adaptive_support"><option value="0"{" selected" if not params.use_adaptive_support else ""}>off</option><option value="1"{" selected" if params.use_adaptive_support else ""}>on</option></select></label>
+        <label><span>Adaptive fraction</span><input type="text" name="adaptive_support_fraction" value="{params.adaptive_support_fraction}"></label>
+        <label><span>Adaptive q_hi</span><input type="text" name="adaptive_support_quantile_hi" value="{params.adaptive_support_quantile_hi}"></label>
+        <label><span>Likelihood</span><select name="likelihood"><option value="binomial"{" selected" if params.likelihood == "binomial" else ""}>binomial</option><option value="negative_binomial"{" selected" if params.likelihood == "negative_binomial" else ""}>negative_binomial</option><option value="poisson"{" selected" if params.likelihood == "poisson" else ""}>poisson</option></select></label>
+        <label><span>NB overdispersion</span><input type="text" name="nb_overdispersion" value="{params.nb_overdispersion}"></label>
+        <label><span>Torch dtype</span><select name="torch_dtype"><option value="float64"{" selected" if params.torch_dtype == "float64" else ""}>float64</option><option value="float32"{" selected" if params.torch_dtype == "float32" else ""}>float32</option></select></label>
+        <label><span>Compile model</span><select name="compile_model"><option value="1"{" selected" if params.compile_model else ""}>on</option><option value="0"{" selected" if not params.compile_model else ""}>off</option></select></label>
+        <label><span>Device</span><input type="text" name="device" value="{escape(params.device)}"></label>
+        <div class="form-actions"><button type="submit">Run Fit</button></div>
+      </form>
+    </section>
+    """
+
+
+def _render_kbulk_form(analysis: GeneAnalysis, params: KBulkParams) -> str:
+    label_key_options = "".join(
+        f'<option value="{escape(key)}"{" selected" if params.class_key == key else ""}>{escape(key)}</option>'
+        for key in analysis.available_label_keys
+    )
+    section_header = render_section_header(
+        "kBulk Analysis",
+        "Sample cell groups by class key and compare group-level signal and uncertainty summaries.",
+        eyebrow="Groups",
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      <form class="form-grid compact" action="/gene" method="get">
+        {_shared_hidden_inputs(analysis)}
+        <input type="hidden" name="kbulk" value="1">
+        <label><span>Class key</span><select name="class_key"><option value="">Auto</option>{label_key_options}</select></label>
+        <label><span>k</span><input type="number" min="1" name="k" value="{params.k}"></label>
+        <label><span>Samples</span><input type="number" min="1" name="n_samples" value="{params.n_samples}"></label>
+        <label><span>Seed</span><input type="number" min="0" name="sample_seed" value="{params.sample_seed}"></label>
+        <label><span>Max classes</span><input type="number" min="1" name="max_classes" value="{params.max_classes}"></label>
+        <label><span>Batch size</span><input type="number" min="1" name="sample_batch_size" value="{params.sample_batch_size}"></label>
+        <label><span>Prior source</span><select name="kbulk_prior_source"><option value="global"{" selected" if params.kbulk_prior_source == "global" else ""}>global</option><option value="label"{" selected" if params.kbulk_prior_source == "label" else ""}>label</option></select></label>
+        <div class="form-actions"><button type="submit">Run kBulk</button></div>
+      </form>
+    </section>
+    """
+
+
+def _render_summary(analysis: GeneAnalysis) -> str:
+    stats = [
+        stat_card("Gene", analysis.gene_name),
+        stat_card("Index", str(analysis.gene_index)),
+        stat_card("Mode", analysis.mode),
+        stat_card("Source", analysis.source),
+        stat_card("Prior source", analysis.prior_source),
+        stat_card("Label key", analysis.label_key or "-"),
+        stat_card("Label", analysis.label or "-"),
+        stat_card("Cells", f"{analysis.n_cells:,}"),
+        stat_card("Reference source", analysis.reference_source),
+        stat_card("Reference genes", f"{analysis.reference_gene_count:,}"),
+        stat_card("Raw mean", f"{analysis.raw_summary.mean_count:.4f}"),
+        stat_card("Raw median", f"{analysis.raw_summary.median_count:.4f}"),
+        stat_card("P99", f"{analysis.raw_summary.p99_count:.4f}"),
+        stat_card("Detected frac", f"{analysis.raw_summary.detected_fraction:.4f}"),
+        stat_card("Zero frac", f"{analysis.raw_summary.zero_fraction:.4f}"),
+        stat_card("Depth corr", f"{analysis.raw_summary.count_total_correlation:.4f}"),
+    ]
+    if analysis.posterior is not None:
+        signal = np.asarray(
+            analysis.posterior.map_scaled_support[:, 0], dtype=np.float64
+        )
+        stats.extend(
+            [
+                stat_card("Mean signal", f"{float(np.mean(signal)):.4f}"),
+                stat_card(
+                    "Mean entropy",
+                    f"{float(np.mean(analysis.posterior.posterior_entropy[:, 0])):.4f}",
+                ),
+                stat_card(
+                    "Mean MI",
+                    f"{float(np.mean(analysis.posterior.mutual_information[:, 0])):.4f}",
+                ),
+            ]
+        )
+    section_header = render_section_header(
+        "Gene Summary",
+        "Raw and posterior summary metrics for the currently selected gene context.",
+        eyebrow="Summary",
+    )
+    return f'<section class="panel">{section_header}<div class="stat-grid">{"".join(stats)}</div></section>'
+
+
+def _render_kbulk_summary(result: KBulkAnalysis, figure_uri: str | None) -> str:
+    max_classes = getattr(result, "max_classes", "-")
+    sample_batch_size = getattr(result, "sample_batch_size", "-")
+    rows = "".join(
+        f"<tr><td>{escape(group.label)}</td><td>{group.n_cells:,}</td><td>{group.realized_samples:,}</td><td>{group.mean_signal:.4f}</td><td>{group.std_signal:.4f}</td><td>{group.mean_entropy:.4f}</td><td>{group.std_entropy:.4f}</td></tr>"
+        for group in result.groups
+    )
+    figure = (
+        ""
+        if figure_uri is None
+        else _figure_block("kBulk Group Comparison", figure_uri)
+    )
+    section_header = render_section_header(
+        "kBulk Summary",
+        "Aggregated signal and entropy summaries for each eligible class under the current sampling setup.",
+        eyebrow="Result",
+    )
+    chips = render_chip_row(
+        [
+            (f"Class key: {result.class_key}", "info"),
+            (f"Prior: {result.prior_source}", "neutral"),
+            (f"k={result.k}", "warning"),
+        ]
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      {chips}
+      <p class="muted">Requested samples: {result.n_samples} | Max classes: {max_classes} | Batch size: {sample_batch_size}</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Label</th><th>Cells</th><th>Samples</th><th>Mean signal</th><th>Std signal</th><th>Mean entropy</th><th>Std entropy</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    {figure}
+    """
+
+
+def _figure_block(title: str, src: str) -> str:
+    section_header = render_section_header(
+        title,
+        "Figure output generated from the current analysis state.",
+        eyebrow="Figure",
+    )
+    return f'<section class="panel figure-panel">{section_header}<div class="figure"><img src="{src}" alt="{escape(title)}"></div></section>'
+
+
+def _shared_hidden_inputs(analysis: GeneAnalysis) -> str:
+    return (
+        f'<input type="hidden" name="q" value="{escape(analysis.gene_name)}">'
+        f'<input type="hidden" name="prior_source" value="{escape(analysis.prior_source)}">'
+        f'<input type="hidden" name="label_key" value="{escape(analysis.label_key or "")}">'
+        f'<input type="hidden" name="label" value="{escape(analysis.label or "")}">'
+    )

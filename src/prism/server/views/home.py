@@ -4,180 +4,240 @@ from html import escape
 from typing import cast
 from urllib.parse import quote_plus
 
-from prism.server.services.analysis import GeneBrowsePage
-from prism.server.services.datasets import GeneCandidate
-from prism.server.services.global_eval import GlobalEvalParams, GlobalEvaluationResult
+from prism.server.services.analysis import CheckpointSummary, GeneBrowsePage
 
-from .layout import render_loader, render_nav, render_page, stat_card
+from .components import render_chip_row, render_detail_grid, render_section_header
+from .layout import render_loader, render_message, render_nav, render_page, stat_card
 
 
 def render_home_page(
     *,
     dataset_summary: dict[str, object] | None,
+    checkpoint_summary: CheckpointSummary | None,
     gene_browser: GeneBrowsePage | None,
     search_query: str = "",
     h5ad_path: str = "",
     ckpt_path: str = "",
     layer: str = "",
     error_message: str | None = None,
-    global_eval: GlobalEvaluationResult | None = None,
-    global_eval_params: GlobalEvalParams | None = None,
-    global_eval_figures: dict[str, str] | None = None,
 ) -> str:
-    loader = render_loader(h5ad_path=h5ad_path, ckpt_path=ckpt_path, layer=layer)
+    body_parts = [
+        render_nav(current_query=search_query),
+        render_loader(h5ad_path=h5ad_path, ckpt_path=ckpt_path, layer=layer),
+    ]
+    if error_message:
+        body_parts.append(render_message(error_message, level="error"))
     if dataset_summary is None:
-        message = (
-            f'<section class="panel"><h2>Load error</h2><p>{escape(error_message)}</p></section>'
-            if error_message
-            else '<section class="panel"><h2>Welcome</h2><p>Load an h5ad file and optionally a PRISM checkpoint to browse genes, inspect posteriors, and run quick on-demand fits.</p></section>'
-        )
-        return render_page(
-            title="PRISM Analysis Server",
-            body=f"{render_nav(current_query=search_query)}{loader}{message}",
-        )
+        body_parts.append(_render_welcome_panel())
+        return render_page(title="PRISM Server", body="".join(body_parts))
 
-    n_cells = int(cast(int, dataset_summary["n_cells"]))
-    n_genes = int(cast(int, dataset_summary["n_genes"]))
-    fitted_genes = int(cast(int, dataset_summary["fitted_genes"]))
-    s_value = dataset_summary["S"]
-    s_source = dataset_summary["S_source"]
-    mean_reference_count = dataset_summary["mean_reference_count"]
+    body_parts.append(_render_dataset_snapshot(dataset_summary))
+    body_parts.append(_render_checkpoint_panel(checkpoint_summary))
+    if gene_browser is not None:
+        body_parts.append(_render_gene_browser(gene_browser))
+    return render_page(title="PRISM Server", body="".join(body_parts))
+
+
+def _render_welcome_panel() -> str:
+    section_header = render_section_header(
+        "Welcome",
+        "Use this local analysis workspace to load a dataset, inspect checkpoint coverage, and move directly into gene-level diagnostics.",
+        eyebrow="Overview",
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      <div class="feature-grid">
+        <article class="feature"><h3>Load Once</h3><p>Bring a dataset and optional checkpoint into one shared analysis context.</p></article>
+        <article class="feature"><h3>Browse Fast</h3><p>Filter genes by name, sort by expression, and jump straight into a target gene page.</p></article>
+        <article class="feature"><h3>Inspect Deeply</h3><p>Compare raw counts, posterior summaries, on-demand fits, and kBulk group behavior in one place.</p></article>
+      </div>
+    </section>
+    """
+
+
+def _render_dataset_snapshot(dataset_summary: dict[str, object]) -> str:
+    label_keys = cast_tuple_str(dataset_summary.get("label_keys"))
+    n_cells = _coerce_int(dataset_summary.get("n_cells"))
+    n_genes = _coerce_int(dataset_summary.get("n_genes"))
+    total_count_mean = _coerce_float(dataset_summary.get("total_count_mean"))
+    total_count_median = _coerce_float(dataset_summary.get("total_count_median"))
+    total_count_p99 = _coerce_float(dataset_summary.get("total_count_p99"))
     stats = [
         stat_card("Cells", f"{n_cells:,}"),
         stat_card("Genes", f"{n_genes:,}"),
-        stat_card("Fitted genes", f"{fitted_genes:,}"),
         stat_card("Layer", str(dataset_summary["layer"])),
-        stat_card("Model source", str(dataset_summary["model_source"])),
-        stat_card(
-            "S", "-" if s_value is None else f"{float(cast(float, s_value)):.3f}"
-        ),
-        stat_card("S source", "-" if s_source is None else str(s_source)),
-        stat_card(
-            "Mean reference count",
-            "-"
-            if mean_reference_count is None
-            else f"{float(cast(float, mean_reference_count)):.3f}",
-        ),
-        stat_card("Reference genes", str(dataset_summary["reference_genes"])),
-        stat_card(
-            "Label key",
-            "-"
-            if dataset_summary["label_key"] is None
-            else str(dataset_summary["label_key"]),
-        ),
+        stat_card("Mean total count", f"{total_count_mean:.3f}"),
+        stat_card("Median total count", f"{total_count_median:.3f}"),
+        stat_card("P99 total count", f"{total_count_p99:.3f}"),
+        stat_card("Label keys", ", ".join(label_keys) if label_keys else "-"),
     ]
-    browser_block = (
-        "" if gene_browser is None else _render_gene_browser_block(gene_browser)
+    chips = render_chip_row(
+        [(key, "info") for key in label_keys[:6]]
+        or [("No label keys detected", "neutral")]
     )
-    global_block = _render_global_eval_block(
-        global_eval,
-        has_checkpoint=bool(dataset_summary["ckpt_path"]),
-        params=global_eval_params or GlobalEvalParams(),
-        figures=global_eval_figures or {},
+    detail_grid = render_detail_grid(
+        [
+            ("Dataset path", str(dataset_summary["h5ad_path"])),
+            ("Active layer", str(dataset_summary["layer"])),
+            ("Label key count", str(len(label_keys))),
+        ]
     )
-    body = f"""
-      {render_nav(current_query=search_query)}
-      {loader}
-      <section class="panel">
-        <h2>Dataset snapshot</h2>
-        <div class="stat-grid">{"".join(stats)}</div>
-        <div class="meta-block">
-          <div><strong>h5ad</strong><span>{escape(str(dataset_summary["h5ad_path"]))}</span></div>
-          <div><strong>checkpoint</strong><span>{escape(str(dataset_summary["ckpt_path"]))}</span></div>
-        </div>
-      </section>
-      {global_block}
-      {browser_block}
-    """
-    return render_page(title="PRISM Analysis Server", body=body)
-
-
-def _render_gene_browser_block(page: GeneBrowsePage) -> str:
-    scope_options = [
-        ("auto", "Auto scope"),
-        ("fitted", "Fitted only"),
-        ("all", "All genes"),
-    ]
-    sort_options = [
-        ("total_umi", "Total UMI"),
-        ("detected_cells", "Detected cells"),
-        ("detected_fraction", "Detected fraction"),
-        ("gene_name", "Gene name"),
-        ("gene_index", "Gene index"),
-    ]
-    dir_options = [("desc", "Descending"), ("asc", "Ascending")]
-    scope_html = "".join(
-        f'<option value="{value}"{" selected" if value == page.scope else ""}>{label}</option>'
-        for value, label in scope_options
+    section_header = render_section_header(
+        "Dataset Snapshot",
+        "Current dataset context, expression depth summary, and detected label coverage.",
+        eyebrow="Dataset",
     )
-    sort_html = "".join(
-        f'<option value="{value}"{" selected" if value == page.sort_by else ""}>{label}</option>'
-        for value, label in sort_options
-    )
-    dir_html = "".join(
-        f'<option value="{value}"{" selected" if ((page.descending and value == "desc") or ((not page.descending) and value == "asc")) else ""}>{label}</option>'
-        for value, label in dir_options
-    )
-    rows = (
-        "".join(_candidate_row(candidate) for candidate in page.items)
-        or '<tr><td colspan="5" class="muted">No genes match the current filter.</td></tr>'
-    )
-    page_start = 0 if page.total_items == 0 else (page.page - 1) * page.page_size + 1
-    page_end = min(page.page * page.page_size, page.total_items)
     return f"""
-      <section class="panel">
-        <h2>Gene browser</h2>
-        <form class="browser-toolbar" action="/" method="get">
-          <input type="text" name="browse_q" value="{escape(page.query)}" placeholder="Filter genes by substring">
-          <select name="browse_scope">{scope_html}</select>
-          <select name="browse_sort">{sort_html}</select>
-          <select name="browse_dir">{dir_html}</select>
-          <input type="number" name="browse_page" min="1" max="{page.total_pages}" step="1" value="{page.page}">
-          <button type="submit">Apply</button>
-        </form>
-        <div class="browser-summary"><span class="browser-page-label">Showing {page_start}-{page_end} / {page.total_items}</span><span class="browser-page-label">Page {page.page} / {page.total_pages}</span></div>
-        <div class="table-wrap browser-table-wrap"><table class="browser-table"><thead><tr><th>Gene</th><th>Index</th><th>Total UMI</th><th>Detected cells</th><th>Detected frac</th></tr></thead><tbody>{rows}</tbody></table></div>
-      </section>
+    <section class="panel">
+      {section_header}
+      {chips}
+      <div class="stat-grid">{"".join(stats)}</div>
+      {detail_grid}
+    </section>
     """
 
 
-def _render_global_eval_block(
-    result: GlobalEvaluationResult | None,
-    *,
-    has_checkpoint: bool,
-    params: GlobalEvalParams,
-    figures: dict[str, str],
-) -> str:
-    if not has_checkpoint:
-        return '<section class="panel"><h2>Global evaluation</h2><p>Load a checkpoint to enable checkpoint-backed global metrics.</p></section>'
-    controls = f"""
-    <form class="toolbar" action="/" method="get">
-      <input type="hidden" name="global_eval" value="1">
-      <input type="number" name="ge_max_cells" min="64" step="1" value="{params.max_cells}" placeholder="max cells">
-      <input type="number" name="ge_max_genes" min="8" step="1" value="{params.max_genes}" placeholder="max genes">
-      <input type="number" name="ge_batch" min="1" step="1" value="{params.gene_batch_size}" placeholder="gene batch">
-      <input type="number" name="ge_seed" min="0" step="1" value="{params.random_seed}" placeholder="seed">
-      <button type="submit">Compute global metrics</button>
-    </form>
+def _render_checkpoint_panel(checkpoint_summary: CheckpointSummary | None) -> str:
+    section_header = render_section_header(
+        "Checkpoint Summary" if checkpoint_summary is not None else "Checkpoint",
+        "Checkpoint-backed analysis metadata and coverage for the active dataset."
+        if checkpoint_summary is not None
+        else "No checkpoint is loaded. Raw gene inspection and on-demand fit still work.",
+        eyebrow="Model",
+    )
+    if checkpoint_summary is None:
+        return f'<section class="panel">{section_header}</section>'
+    preview = (
+        ", ".join(checkpoint_summary.label_preview)
+        if checkpoint_summary.label_preview
+        else "-"
+    )
+    chips = render_chip_row(
+        [
+            (
+                "Global prior ready"
+                if checkpoint_summary.has_global_prior
+                else "Global prior missing",
+                "success" if checkpoint_summary.has_global_prior else "warning",
+            ),
+            (f"{checkpoint_summary.n_label_priors:,} label priors", "info"),
+            (checkpoint_summary.distribution, "neutral"),
+        ]
+    )
+    stats = [
+        stat_card("Genes", f"{checkpoint_summary.gene_count:,}"),
+        stat_card(
+            "Global prior", "yes" if checkpoint_summary.has_global_prior else "no"
+        ),
+        stat_card("Label priors", f"{checkpoint_summary.n_label_priors:,}"),
+        stat_card("Distribution", checkpoint_summary.distribution),
+        stat_card("Support", checkpoint_summary.support_domain or "-"),
+        stat_card(
+            "Scale",
+            "-"
+            if checkpoint_summary.scale is None
+            else f"{checkpoint_summary.scale:.3f}",
+        ),
+        stat_card(
+            "Mean reference",
+            "-"
+            if checkpoint_summary.mean_reference_count is None
+            else f"{checkpoint_summary.mean_reference_count:.3f}",
+        ),
+        stat_card(
+            "Reference overlap",
+            f"{checkpoint_summary.n_overlap_reference_genes:,} / {checkpoint_summary.n_reference_genes:,}",
+        ),
+        stat_card("Suggested label key", checkpoint_summary.suggested_label_key or "-"),
+    ]
+    details = render_detail_grid(
+        [
+            ("Checkpoint path", checkpoint_summary.ckpt_path),
+            ("Label preview", preview),
+        ]
+    )
+    return f"""
+    <section class="panel">
+      {section_header}
+      {chips}
+      <div class="stat-grid">{"".join(stats)}</div>
+      {details}
+    </section>
     """
-    if result is None:
-        return f'<section class="panel"><h2>Global evaluation</h2><p>Compare raw counts, normalized counts, log-normalized counts, and checkpoint-backed signal on a sampled subset.</p>{controls}</section>'
+
+
+def _render_gene_browser(page: GeneBrowsePage) -> str:
+    scope_options = {
+        "auto": "Auto",
+        "fitted": "Checkpoint genes",
+        "all": "All genes",
+    }
+    sort_options = {
+        "total_count": "Total count",
+        "detected_cells": "Detected cells",
+        "detected_fraction": "Detected fraction",
+        "gene_name": "Gene name",
+        "gene_index": "Gene index",
+    }
+    dir_value = "desc" if page.descending else "asc"
     rows = "".join(
-        f"<tr><td>{escape(name)}</td><td>{metrics.silhouette:.4f}</td><td>{metrics.ari:.4f}</td><td>{metrics.nmi:.4f}</td><td>{metrics.pca_var_ratio:.4f}</td><td>{metrics.neighborhood_consistency:.4f}</td></tr>"
-        for name, metrics in result.representation_metrics.items()
+        f'<tr><td><a class="table-link" href="/gene?q={quote_plus(item.gene_name)}">{escape(item.gene_name)}</a></td><td>{item.gene_index}</td><td>{item.total_count:,}</td><td>{item.detected_cells:,}</td><td>{item.detected_fraction:.3f}</td></tr>'
+        for item in page.items
     )
-    entropy_rows = "".join(
-        f"<tr><td>{escape(name)}</td><td>{score:.4f}</td></tr>"
-        for name, score in result.top_entropy_genes
+    if not rows:
+        rows = '<tr><td colspan="5" class="muted">No genes matched the current filter.</td></tr>'
+    section_header = render_section_header(
+        "Gene Browser",
+        "Filter and rank genes by abundance, detection, or identity before opening a gene workspace.",
+        eyebrow="Explore",
     )
-    figure_block = (
-        ""
-        if "global_overview" not in figures
-        else f'<section class="panel figure-wide"><h3>Metric overview</h3><div class="figure"><img src="{figures["global_overview"]}"></div></section>'
-    )
-    return f'<section class="panel"><h2>Global evaluation</h2><p class="muted">Label source: <strong>{escape(result.label_key)}</strong> | Cells: {result.n_cells:,} | Genes: {result.n_genes:,}</p>{controls}<div class="table-wrap"><table class="compact-table"><thead><tr><th>Representation</th><th>Silhouette</th><th>ARI</th><th>NMI</th><th>PCA var@10</th><th>Neighbor consistency</th></tr></thead><tbody>{rows}</tbody></table></div><h3>Top prior-entropy genes</h3><div class="table-wrap"><table><thead><tr><th>Gene</th><th>Entropy</th></tr></thead><tbody>{entropy_rows}</tbody></table></div></section>{figure_block}'
+    return f"""
+    <section class="panel">
+      {section_header}
+      <form class="toolbar browser" action="/" method="get">
+        <label class="field field-grow"><span>Substring search</span><input type="text" name="browse_q" value="{escape(page.query)}" placeholder="substring search"></label>
+        <label class="field"><span>Scope</span><select name="browse_scope">
+          {"".join(f'<option value="{value}"{" selected" if page.scope == value else ""}>{label}</option>' for value, label in scope_options.items())}
+        </select></label>
+        <label class="field"><span>Sort by</span><select name="browse_sort">
+          {"".join(f'<option value="{value}"{" selected" if page.sort_by == value else ""}>{label}</option>' for value, label in sort_options.items())}
+        </select></label>
+        <label class="field"><span>Direction</span><select name="browse_dir">
+          <option value="desc"{" selected" if dir_value == "desc" else ""}>Descending</option>
+          <option value="asc"{" selected" if dir_value == "asc" else ""}>Ascending</option>
+        </select></label>
+        <label class="field"><span>Page</span><input type="number" name="browse_page" min="1" value="{page.page}"></label>
+        <div class="form-actions form-actions-inline"><button type="submit">Apply</button></div>
+      </form>
+      <p class="muted">Showing page {page.page} / {page.total_pages}, {page.total_items:,} genes total.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Gene</th><th>Index</th><th>Total</th><th>Detected</th><th>Detected frac</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
 
 
-def _candidate_row(candidate: GeneCandidate) -> str:
-    href = f"/gene?q={quote_plus(candidate.gene_name)}"
-    return f'<tr><td><a href="{href}">{escape(candidate.gene_name)}</a></td><td>{candidate.gene_index}</td><td>{candidate.total_umi:,}</td><td>{candidate.detected_cells:,}</td><td>{candidate.detected_fraction:.3f}</td></tr>'
+def cast_tuple_str(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        return ()
+    return tuple(str(item) for item in value)
+
+
+def _coerce_int(value: object) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float, str)):
+        return int(cast(int | float | str, value))
+    return 0
+
+
+def _coerce_float(value: object) -> float:
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float, str)):
+        return float(cast(int | float | str, value))
+    return 0.0

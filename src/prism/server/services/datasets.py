@@ -26,7 +26,7 @@ class GeneNotFoundError(GeneLookupError):
 class GeneCandidate:
     gene_name: str
     gene_index: int
-    total_umi: int
+    total_count: int
     detected_cells: int
     detected_fraction: float
 
@@ -88,9 +88,9 @@ def resolve_gene_query(
     if token in gene_to_idx:
         return gene_to_idx[token]
     if token.isdigit():
-        idx = int(token)
-        if 0 <= idx < len(gene_names):
-            return idx
+        index = int(token)
+        if 0 <= index < len(gene_names):
+            return index
     lowered = token.lower()
     exact = gene_lower_to_idx.get(lowered)
     if exact is not None:
@@ -111,15 +111,16 @@ def search_gene_candidates(
     token = query.strip().lower()
     indices: list[int] = []
     for idx in ranked_indices.tolist():
-        if not token or token in gene_names_lower[int(idx)]:
-            indices.append(int(idx))
+        resolved = int(idx)
+        if not token or token in gene_names_lower[resolved]:
+            indices.append(resolved)
             if len(indices) >= limit:
                 break
     return [
         GeneCandidate(
             gene_name=str(gene_names[idx]),
             gene_index=int(idx),
-            total_umi=int(round(float(gene_total_counts[idx]))),
+            total_count=int(round(float(gene_total_counts[idx]))),
             detected_cells=int(gene_detected_counts[idx]),
             detected_fraction=float(gene_detected_counts[idx]) / max(n_cells, 1),
         )
@@ -158,7 +159,17 @@ def compute_reference_counts(
     )
 
 
-def resolve_gene_positions(
-    gene_names: list[str] | tuple[str, ...], gene_to_idx: dict[str, int]
-) -> list[int]:
-    return [gene_to_idx[name] for name in gene_names if name in gene_to_idx]
+def detect_label_columns(adata: Any) -> dict[str, np.ndarray]:
+    preferred = {"label", "cell_type", "treatment", "group", "condition", "cluster"}
+    ranked: list[tuple[int, str, np.ndarray]] = []
+    for column in adata.obs.columns:
+        values = np.asarray(adata.obs[column].astype(str)).reshape(-1)
+        unique = np.unique(values)
+        if unique.size < 2:
+            continue
+        if unique.size > min(64, max(int(adata.n_obs), 1)):
+            continue
+        rank = 0 if column in preferred else 1
+        ranked.append((rank, str(column), values))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    return {name: values for _, name, values in ranked}

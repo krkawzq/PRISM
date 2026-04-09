@@ -1,14 +1,24 @@
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
 
-from .constants import DTYPE_NP, OPTIMIZERS, SCHEDULERS, OptimizerName, SchedulerName
+from .constants import DTYPE_NP, DistributionName, SupportDomain
 
 
-def _as_1d_float(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
+def _require_unique_names(names: list[str], *, field_name: str) -> list[str]:
+    resolved = [str(name) for name in names]
+    if not resolved:
+        raise ValueError(f"{field_name} cannot be empty")
+    if len(resolved) != len(set(resolved)):
+        raise ValueError(f"{field_name} must be unique")
+    return resolved
+
+
+def _as_vector(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
     array = np.asarray(values, dtype=DTYPE_NP).reshape(-1)
     if array.size == 0:
         raise ValueError(f"{name} cannot be empty")
@@ -17,7 +27,7 @@ def _as_1d_float(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
     return array
 
 
-def _as_2d_float(values: np.ndarray, *, name: str) -> np.ndarray:
+def _as_matrix(values: np.ndarray, *, name: str) -> np.ndarray:
     array = np.asarray(values, dtype=DTYPE_NP)
     if array.ndim != 2:
         raise ValueError(f"{name} must be 2D, got shape={array.shape}")
@@ -28,322 +38,81 @@ def _as_2d_float(values: np.ndarray, *, name: str) -> np.ndarray:
     return array
 
 
+def _as_support(
+    values: np.ndarray | list[float] | list[list[float]], *, name: str
+) -> np.ndarray:
+    array = np.asarray(values, dtype=DTYPE_NP)
+    if array.ndim not in (1, 2):
+        raise ValueError(f"{name} must be 1D or 2D, got shape={array.shape}")
+    if array.shape[-1] == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if array.ndim == 2 and array.shape[0] == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must be finite")
+    return array
+
+
+def _as_probabilities(
+    values: np.ndarray | list[float] | list[list[float]], *, name: str
+) -> np.ndarray:
+    array = np.asarray(values, dtype=DTYPE_NP)
+    if array.ndim not in (1, 2):
+        raise ValueError(f"{name} must be 1D or 2D, got shape={array.shape}")
+    if array.shape[-1] == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if array.ndim == 2 and array.shape[0] == 0:
+        raise ValueError(f"{name} cannot be empty")
+    if np.any(~np.isfinite(array)):
+        raise ValueError(f"{name} must be finite")
+    if np.any(array < 0):
+        raise ValueError(f"{name} must be non-negative")
+    if np.any(np.abs(array.sum(axis=-1) - 1.0) > 1e-6):
+        raise ValueError(f"{name} must sum to 1 along the support axis")
+    return array
+
+
+def _validate_support_domain(support: np.ndarray, *, domain: SupportDomain) -> None:
+    if domain == "probability":
+        if np.any(support < 0) or np.any(support > 1):
+            raise ValueError("probability support must lie in [0, 1]")
+        return
+    if domain == "rate":
+        if np.any(support < 0):
+            raise ValueError("rate support must be >= 0")
+        return
+    raise ValueError(f"unsupported support domain: {domain}")
+
+
 @dataclass(frozen=True, slots=True)
 class ObservationBatch:
     gene_names: list[str]
-    counts: np.ndarray  # (C, G)
-    reference_counts: np.ndarray  # (C,)
+    counts: np.ndarray
+    reference_counts: np.ndarray
 
-    @property
-    def n_cells(self) -> int:
-        return int(self.reference_counts.shape[0])
-
-    @property
-    def n_genes(self) -> int:
-        return int(len(self.gene_names))
-
-    def check_shape(self) -> None:
-        if not self.gene_names:
-            raise ValueError("gene_names cannot be empty")
-        if len(self.gene_names) != len(set(self.gene_names)):
-            raise ValueError("gene_names must be unique")
-        counts = _as_2d_float(self.counts, name="counts")
-        reference_counts = _as_1d_float(self.reference_counts, name="reference_counts")
-        if counts.shape != (reference_counts.shape[0], len(self.gene_names)):
+    def __post_init__(self) -> None:
+        names = _require_unique_names(self.gene_names, field_name="gene_names")
+        counts = _as_matrix(self.counts, name="counts")
+        reference_counts = _as_vector(
+            self.reference_counts,
+            name="reference_counts",
+        )
+        if counts.shape != (reference_counts.shape[0], len(names)):
             raise ValueError(
                 "counts shape must equal (n_cells, n_genes), "
-                f"got {counts.shape} vs {(reference_counts.shape[0], len(self.gene_names))}"
+                f"got {counts.shape} vs {(reference_counts.shape[0], len(names))}"
             )
         if np.any(counts < 0):
             raise ValueError("counts must be non-negative")
         if np.any(reference_counts <= 0):
             raise ValueError("reference_counts must be positive")
-
-    @property
-    def totals(self) -> np.ndarray:
-        return self.reference_counts
-
-
-@dataclass(frozen=True, slots=True)
-class PriorGrid:
-    gene_names: list[str]
-    p_grid: np.ndarray  # (G, M) or (M,)
-    weights: np.ndarray  # (G, M) or (M,)
-    S: float
-    grid_domain: Literal["p", "rate"] = "p"
-    distribution: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
-
-    @property
-    def M(self) -> int:
-        return int(self.weights.shape[-1])
-
-    @property
-    def is_batched(self) -> bool:
-        return self.weights.ndim == 2
-
-    @property
-    def G(self) -> int:
-        return int(self.weights.shape[0]) if self.is_batched else 1
-
-    @property
-    def mu_grid(self) -> np.ndarray:
-        grid = np.asarray(self.p_grid, dtype=DTYPE_NP)
-        if self.grid_domain == "rate":
-            return grid
-        return grid * float(self.S)
-
-    def check_shape(self) -> None:
-        if not self.gene_names:
-            raise ValueError("gene_names cannot be empty")
-        if len(self.gene_names) != len(set(self.gene_names)):
-            raise ValueError("gene_names must be unique")
-        if not np.isfinite(self.S) or self.S <= 0:
-            raise ValueError(f"S must be positive, got {self.S}")
-        p_grid = np.asarray(self.p_grid, dtype=DTYPE_NP)
-        weights = np.asarray(self.weights, dtype=DTYPE_NP)
-        if p_grid.ndim not in (1, 2):
-            raise ValueError(f"p_grid must be 1D or 2D, got shape={p_grid.shape}")
-        if weights.ndim not in (1, 2):
-            raise ValueError(f"weights must be 1D or 2D, got shape={weights.shape}")
-        if p_grid.shape != weights.shape:
-            raise ValueError(
-                f"p_grid and weights must have identical shape, got {p_grid.shape} != {weights.shape}"
-            )
-        if self.is_batched and weights.shape[0] != len(self.gene_names):
-            raise ValueError(
-                f"weights first dimension must match gene_names, got {weights.shape[0]} != {len(self.gene_names)}"
-            )
-        if (not self.is_batched) and len(self.gene_names) != 1:
-            raise ValueError("unbatched PriorGrid requires exactly one gene")
-        if np.any(~np.isfinite(p_grid)) or np.any(~np.isfinite(weights)):
-            raise ValueError("p_grid and weights must be finite")
-        if self.grid_domain == "p":
-            if np.any(p_grid < 0) or np.any(p_grid > 1):
-                raise ValueError("p_grid must lie in [0, 1] for grid_domain='p'")
-        elif self.grid_domain == "rate":
-            if np.any(p_grid < 0):
-                raise ValueError("p_grid must be >= 0 for grid_domain='rate'")
-        else:
-            raise ValueError(f"unsupported grid_domain: {self.grid_domain}")
-        if self.distribution not in {"binomial", "negative_binomial", "poisson"}:
-            raise ValueError(f"unsupported distribution: {self.distribution}")
-        sums = weights.sum(axis=-1)
-        if np.any(weights < 0):
-            raise ValueError("weights must be non-negative")
-        if np.any(np.abs(sums - 1.0) > 1e-6):
-            raise ValueError("weights must sum to 1 along the grid axis")
-
-    def batched(self) -> PriorGrid:
-        self.check_shape()
-        if self.is_batched:
-            return self
-        return PriorGrid(
-            gene_names=list(self.gene_names),
-            p_grid=np.asarray(self.p_grid, dtype=DTYPE_NP)[None, :],
-            weights=np.asarray(self.weights, dtype=DTYPE_NP)[None, :],
-            S=float(self.S),
-            grid_domain=self.grid_domain,
-            distribution=self.distribution,
-        )
-
-    def subset(self, gene_names: str | list[str]) -> PriorGrid:
-        batched = self.batched()
-        lookup = {name: idx for idx, name in enumerate(batched.gene_names)}
-        names = [gene_names] if isinstance(gene_names, str) else list(gene_names)
-        indices = np.asarray([lookup[name] for name in names], dtype=np.int64)
-        p_grid = np.asarray(batched.p_grid, dtype=DTYPE_NP)[indices]
-        weights = np.asarray(batched.weights, dtype=DTYPE_NP)[indices]
-        if len(names) == 1:
-            return PriorGrid(
-                gene_names=names,
-                p_grid=p_grid[0],
-                weights=weights[0],
-                S=float(batched.S),
-                grid_domain=batched.grid_domain,
-                distribution=batched.distribution,
-            )
-        return PriorGrid(
-            gene_names=names,
-            p_grid=p_grid,
-            weights=weights,
-            S=float(batched.S),
-            grid_domain=batched.grid_domain,
-            distribution=batched.distribution,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class ScaleMetadata:
-    S: float
-    mean_reference_count: float
-
-
-@dataclass(frozen=True, slots=True)
-class PriorFitConfig:
-    grid_size: int = 512
-    sigma_bins: float = 1.0
-    align_loss_weight: float = 1.0
-    align_every: int = 1
-    lr: float = 0.05
-    n_iter: int = 100
-    lr_min_ratio: float = 0.1
-    grad_clip: float | None = None
-    early_stop_tol: float | None = None
-    early_stop_patience: int | None = None
-    init_method: Literal["posterior_mean", "uniform", "random"] = "posterior_mean"
-    init_seed: int = 0
-    init_temperature: float = 1.0
-    cell_chunk_size: int = 512
-    optimizer: OptimizerName = "adamw"
-    scheduler: SchedulerName = "cosine"
-    torch_dtype: Literal["float64", "float32"] = "float64"
-    grid_max_method: Literal["observed_max", "quantile"] = "observed_max"
-    grid_strategy: Literal["linear", "sqrt"] = "linear"
-    # --- algorithm enhancements (all optional, defaults preserve old behaviour) ---
-    sigma_anneal_start: float | None = None
-    sigma_anneal_end: float | None = None
-    adaptive_grid: bool = False
-    adaptive_grid_fraction: float = 0.3
-    adaptive_grid_quantile_lo: float = 0.01
-    adaptive_grid_quantile_hi: float = 0.99
-    cell_sample_fraction: float = 1.0
-    cell_sample_seed: int = 0
-    align_mode: Literal["jsd", "kl", "weighted_jsd"] = "jsd"
-    shrinkage_weight: float = 0.0
-    ensemble_restarts: int = 1
-    likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
-    nb_overdispersion: float = 0.01
-
-    def __post_init__(self) -> None:
-        if self.grid_size < 2:
-            raise ValueError("grid_size must be >= 2")
-        if self.sigma_bins < 0:
-            raise ValueError("sigma_bins must be >= 0")
-        if self.align_loss_weight < 0:
-            raise ValueError("align_loss_weight must be >= 0")
-        if self.align_every < 1:
-            raise ValueError("align_every must be >= 1")
-        if self.lr <= 0:
-            raise ValueError("lr must be > 0")
-        if self.n_iter < 1:
-            raise ValueError("n_iter must be >= 1")
-        if self.lr_min_ratio < 0:
-            raise ValueError("lr_min_ratio must be >= 0")
-        if self.grad_clip is not None and self.grad_clip < 0:
-            raise ValueError("grad_clip must be >= 0")
-        if self.early_stop_tol is not None and self.early_stop_tol < 0:
-            raise ValueError("early_stop_tol must be >= 0")
-        if self.early_stop_patience is not None and self.early_stop_patience < 1:
-            raise ValueError("early_stop_patience must be >= 1")
-        if self.init_method not in {"posterior_mean", "uniform", "random"}:
-            raise ValueError(f"unsupported init_method: {self.init_method}")
-        if self.init_seed < 0:
-            raise ValueError("init_seed must be >= 0")
-        if self.init_temperature <= 0:
-            raise ValueError("init_temperature must be > 0")
-        if self.cell_chunk_size < 1:
-            raise ValueError("cell_chunk_size must be >= 1")
-        if self.optimizer not in OPTIMIZERS:
-            raise ValueError(f"unsupported optimizer: {self.optimizer}")
-        if self.scheduler not in SCHEDULERS:
-            raise ValueError(f"unsupported scheduler: {self.scheduler}")
-        if self.torch_dtype not in {"float64", "float32"}:
-            raise ValueError(f"unsupported torch_dtype: {self.torch_dtype}")
-        if self.grid_max_method not in {"observed_max", "quantile"}:
-            raise ValueError(f"unsupported grid_max_method: {self.grid_max_method}")
-        if self.grid_strategy not in {"linear", "sqrt"}:
-            raise ValueError(f"unsupported grid_strategy: {self.grid_strategy}")
-        if self.sigma_anneal_start is not None and self.sigma_anneal_start < 0:
-            raise ValueError("sigma_anneal_start must be >= 0")
-        if self.sigma_anneal_end is not None and self.sigma_anneal_end < 0:
-            raise ValueError("sigma_anneal_end must be >= 0")
-        if self.adaptive_grid_fraction <= 0 or self.adaptive_grid_fraction > 1:
-            raise ValueError("adaptive_grid_fraction must be in (0, 1]")
-        if not (0.0 <= self.adaptive_grid_quantile_lo < 1.0):
-            raise ValueError("adaptive_grid_quantile_lo must be in [0, 1)")
-        if not (0.0 < self.adaptive_grid_quantile_hi <= 1.0):
-            raise ValueError("adaptive_grid_quantile_hi must be in (0, 1]")
-        if self.adaptive_grid_quantile_lo >= self.adaptive_grid_quantile_hi:
-            raise ValueError(
-                "adaptive_grid_quantile_lo must be < adaptive_grid_quantile_hi"
-            )
-        if self.cell_sample_fraction <= 0 or self.cell_sample_fraction > 1:
-            raise ValueError("cell_sample_fraction must be in (0, 1]")
-        if self.align_mode not in {"jsd", "kl", "weighted_jsd"}:
-            raise ValueError(f"unsupported align_mode: {self.align_mode}")
-        if self.shrinkage_weight < 0 or self.shrinkage_weight > 1:
-            raise ValueError("shrinkage_weight must be in [0, 1]")
-        if self.ensemble_restarts < 1:
-            raise ValueError("ensemble_restarts must be >= 1")
-        if self.likelihood not in {"binomial", "negative_binomial", "poisson"}:
-            raise ValueError(f"unsupported likelihood: {self.likelihood}")
-        if self.nb_overdispersion <= 0:
-            raise ValueError("nb_overdispersion must be > 0")
-
-
-@dataclass(frozen=True, slots=True)
-class PriorFitResult:
-    gene_names: list[str]
-    priors: PriorGrid
-    posterior_average: np.ndarray
-    initial_posterior_average: np.ndarray
-    initial_prior_weights: np.ndarray
-    loss_history: list[float]
-    nll_history: list[float]
-    align_history: list[float]
-    final_loss: float
-    best_loss: float
-    config: dict[str, Any]
-    scale: ScaleMetadata
-
-
-@dataclass(frozen=True, slots=True)
-class InferenceResult:
-    gene_names: list[str]
-    grid_domain: Literal["p", "rate"]
-    p_grid: np.ndarray
-    mu_grid: np.ndarray
-    prior_weights: np.ndarray
-    map_p: np.ndarray
-    map_mu: np.ndarray
-    map_rate: np.ndarray | None
-    posterior_entropy: np.ndarray
-    prior_entropy: np.ndarray
-    mutual_information: np.ndarray
-    posterior: np.ndarray | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ScaleDiagnostic:
-    mean_reference_count: float
-    median_reference_count: float
-    suggested_S: float
-    lower_quantile_S: float
-    upper_quantile_S: float
-
-
-@dataclass(frozen=True, slots=True)
-class PoolEstimate:
-    mu: float
-    sigma: float
-    point_mu: float
-    point_eta: float
-    used_posterior_softargmax: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class GeneBatch:
-    gene_names: list[str]
-    counts: np.ndarray
-    totals: np.ndarray
-
-    @property
-    def reference_counts(self) -> np.ndarray:
-        return self.totals
+        object.__setattr__(self, "gene_names", names)
+        object.__setattr__(self, "counts", counts)
+        object.__setattr__(self, "reference_counts", reference_counts)
 
     @property
     def n_cells(self) -> int:
-        return int(np.asarray(self.totals).reshape(-1).shape[0])
+        return int(np.asarray(self.reference_counts).reshape(-1).shape[0])
 
     @property
     def n_genes(self) -> int:
@@ -353,80 +122,480 @@ class GeneBatch:
         ObservationBatch(
             gene_names=list(self.gene_names),
             counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.totals, dtype=DTYPE_NP),
-        ).check_shape()
+            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GeneBatch:
+    gene_names: list[str]
+    counts: np.ndarray
+    reference_counts: np.ndarray
+
+    def __post_init__(self) -> None:
+        normalized = ObservationBatch(
+            gene_names=list(self.gene_names),
+            counts=np.asarray(self.counts, dtype=DTYPE_NP),
+            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        )
+        object.__setattr__(self, "gene_names", list(normalized.gene_names))
+        object.__setattr__(self, "counts", np.asarray(normalized.counts, dtype=DTYPE_NP))
+        object.__setattr__(
+            self,
+            "reference_counts",
+            np.asarray(normalized.reference_counts, dtype=DTYPE_NP),
+        )
+
+    @property
+    def n_cells(self) -> int:
+        return int(np.asarray(self.reference_counts).reshape(-1).shape[0])
+
+    @property
+    def n_genes(self) -> int:
+        return int(len(self.gene_names))
+
+    def check_shape(self) -> None:
+        ObservationBatch(
+            gene_names=list(self.gene_names),
+            counts=np.asarray(self.counts, dtype=DTYPE_NP),
+            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        )
 
     def to_observation_batch(self) -> ObservationBatch:
         return ObservationBatch(
             gene_names=list(self.gene_names),
             counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.totals, dtype=DTYPE_NP),
+            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
         )
 
 
-class GridDistribution(PriorGrid):
+@dataclass(frozen=True, slots=True, init=False)
+class DistributionGrid(ABC):
+    support: np.ndarray
+    probabilities: np.ndarray
+
     def __init__(
         self,
         *,
-        gene_names: list[str] | None = None,
-        p_grid: np.ndarray | None = None,
-        weights: np.ndarray,
-        S: float = 1.0,
-        grid_domain: Literal["p", "rate"] = "p",
-        grid_min: float | np.ndarray | None = None,
-        grid_max: float | np.ndarray | None = None,
+        support: np.ndarray | list[float] | list[list[float]],
+        probabilities: np.ndarray | list[float] | list[list[float]],
     ) -> None:
-        weights_np = np.asarray(weights, dtype=DTYPE_NP)
-        if gene_names is None:
-            gene_names = [
-                f"gene_{idx}"
-                for idx in range(weights_np.shape[0] if weights_np.ndim == 2 else 1)
-            ]
-        if p_grid is None:
-            if grid_min is None or grid_max is None:
-                raise ValueError(
-                    "either p_grid or (grid_min, grid_max) must be provided"
-                )
-            if weights_np.ndim == 1:
-                p_grid = np.linspace(
-                    float(grid_min),
-                    float(grid_max),
-                    weights_np.shape[-1],
-                    dtype=DTYPE_NP,
-                )
-            else:
-                grid_min_np = np.asarray(grid_min, dtype=DTYPE_NP).reshape(-1)
-                grid_max_np = np.asarray(grid_max, dtype=DTYPE_NP).reshape(-1)
-                p_grid = np.stack(
-                    [
-                        np.linspace(
-                            grid_min_np[idx],
-                            grid_max_np[idx],
-                            weights_np.shape[-1],
-                            dtype=DTYPE_NP,
-                        )
-                        for idx in range(weights_np.shape[0])
-                    ],
-                    axis=0,
-                )
-        super().__init__(
-            gene_names=list(gene_names),
-            p_grid=np.asarray(p_grid, dtype=DTYPE_NP),
-            weights=weights_np,
-            S=float(S),
-            grid_domain=grid_domain,
+        object.__setattr__(self, "support", _as_support(support, name="support"))
+        object.__setattr__(
+            self,
+            "probabilities",
+            _as_probabilities(probabilities, name="probabilities"),
+        )
+        self.check_shape()
+
+    @property
+    @abstractmethod
+    def distribution(self) -> DistributionName:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def support_domain(self) -> SupportDomain:
+        raise NotImplementedError
+
+    @property
+    def is_gene_specific(self) -> bool:
+        return self.probabilities.ndim == 2
+
+    @property
+    def n_genes(self) -> int:
+        return int(self.probabilities.shape[0]) if self.is_gene_specific else 1
+
+    @property
+    def n_support_points(self) -> int:
+        return int(self.probabilities.shape[-1])
+
+    def check_shape(self) -> None:
+        if self.support.shape != self.probabilities.shape:
+            raise ValueError(
+                "support and probabilities must have identical shape, got "
+                f"{self.support.shape} != {self.probabilities.shape}"
+            )
+        _validate_support_domain(self.support, domain=self.support_domain)
+
+    def as_gene_specific(self) -> DistributionGrid:
+        if self.is_gene_specific:
+            return self
+        return self.__class__(
+            support=np.asarray(self.support, dtype=DTYPE_NP)[None, :],
+            probabilities=np.asarray(self.probabilities, dtype=DTYPE_NP)[None, :],
         )
 
+    def select_genes(self, indices: list[int] | np.ndarray) -> DistributionGrid:
+        gene_specific = self.as_gene_specific()
+        resolved = np.asarray(indices, dtype=np.int64).reshape(-1)
+        support = np.asarray(gene_specific.support, dtype=DTYPE_NP)[resolved]
+        probabilities = np.asarray(gene_specific.probabilities, dtype=DTYPE_NP)[
+            resolved
+        ]
+        if resolved.size == 1:
+            return self.__class__(
+                support=support[0],
+                probabilities=probabilities[0],
+            )
+        return self.__class__(support=support, probabilities=probabilities)
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class BinomialDistributionGrid(DistributionGrid):
     @property
-    def grid_min(self) -> float | np.ndarray:
-        p_grid = np.asarray(self.p_grid, dtype=DTYPE_NP)
-        return float(p_grid[0]) if p_grid.ndim == 1 else p_grid[:, 0]
+    def distribution(self) -> DistributionName:
+        return "binomial"
 
     @property
-    def grid_max(self) -> float | np.ndarray:
-        p_grid = np.asarray(self.p_grid, dtype=DTYPE_NP)
-        return float(p_grid[-1]) if p_grid.ndim == 1 else p_grid[:, -1]
+    def support_domain(self) -> SupportDomain:
+        return "probability"
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class NegativeBinomialDistributionGrid(DistributionGrid):
+    @property
+    def distribution(self) -> DistributionName:
+        return "negative_binomial"
+
+    @property
+    def support_domain(self) -> SupportDomain:
+        return "probability"
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PoissonDistributionGrid(DistributionGrid):
+    @property
+    def distribution(self) -> DistributionName:
+        return "poisson"
+
+    @property
+    def support_domain(self) -> SupportDomain:
+        return "rate"
+
+
+def make_distribution_grid(
+    distribution: DistributionName,
+    *,
+    support: np.ndarray | list[float] | list[list[float]],
+    probabilities: np.ndarray | list[float] | list[list[float]],
+) -> DistributionGrid:
+    if distribution == "binomial":
+        return BinomialDistributionGrid(
+            support=support,
+            probabilities=probabilities,
+        )
+    if distribution == "negative_binomial":
+        return NegativeBinomialDistributionGrid(
+            support=support,
+            probabilities=probabilities,
+        )
+    if distribution == "poisson":
+        return PoissonDistributionGrid(
+            support=support,
+            probabilities=probabilities,
+        )
+    raise ValueError(f"unsupported distribution: {distribution}")
+
+
+@dataclass(frozen=True, slots=True, init=False)
+class PriorGrid:
+    gene_names: list[str]
+    distribution: DistributionGrid
+    scale: float
+
+    def __init__(
+        self,
+        *,
+        gene_names: list[str],
+        distribution: DistributionGrid,
+        scale: float,
+    ) -> None:
+        object.__setattr__(
+            self,
+            "gene_names",
+            _require_unique_names(gene_names, field_name="gene_names"),
+        )
+        object.__setattr__(self, "distribution", distribution)
+        object.__setattr__(self, "scale", float(scale))
+        self.check_shape()
 
     @property
     def support(self) -> np.ndarray:
-        return np.asarray(self.mu_grid, dtype=DTYPE_NP)
+        return np.asarray(self.distribution.support, dtype=DTYPE_NP)
+
+    @property
+    def prior_probabilities(self) -> np.ndarray:
+        return np.asarray(self.distribution.probabilities, dtype=DTYPE_NP)
+
+    @property
+    def support_domain(self) -> SupportDomain:
+        return self.distribution.support_domain
+
+    @property
+    def distribution_name(self) -> DistributionName:
+        return self.distribution.distribution
+
+    @property
+    def is_gene_specific(self) -> bool:
+        return self.distribution.is_gene_specific
+
+    @property
+    def n_genes(self) -> int:
+        return self.distribution.n_genes
+
+    @property
+    def n_support_points(self) -> int:
+        return self.distribution.n_support_points
+
+    @property
+    def scaled_support(self) -> np.ndarray:
+        if self.support_domain == "rate":
+            return np.asarray(self.support, dtype=DTYPE_NP)
+        return np.asarray(self.support, dtype=DTYPE_NP) * float(self.scale)
+
+    def check_shape(self) -> None:
+        if not np.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError(f"scale must be positive, got {self.scale}")
+        if self.is_gene_specific and self.n_genes != len(self.gene_names):
+            raise ValueError(
+                "distribution first dimension must match gene_names, "
+                f"got {self.n_genes} != {len(self.gene_names)}"
+            )
+        if (not self.is_gene_specific) and len(self.gene_names) != 1:
+            raise ValueError("non gene-specific priors require exactly one gene")
+
+    def as_gene_specific(self) -> PriorGrid:
+        if self.is_gene_specific:
+            return self
+        return PriorGrid(
+            gene_names=list(self.gene_names),
+            distribution=self.distribution.as_gene_specific(),
+            scale=float(self.scale),
+        )
+
+    def select_genes(self, gene_names: str | list[str]) -> PriorGrid:
+        gene_specific = self.as_gene_specific()
+        names = [gene_names] if isinstance(gene_names, str) else list(gene_names)
+        lookup = {name: idx for idx, name in enumerate(gene_specific.gene_names)}
+        indices = [lookup[name] for name in names]
+        return PriorGrid(
+            gene_names=names,
+            distribution=gene_specific.distribution.select_genes(indices),
+            scale=float(gene_specific.scale),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ScaleMetadata:
+    scale: float
+    mean_reference_count: float
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError(f"scale must be positive, got {self.scale}")
+        if not np.isfinite(self.mean_reference_count) or self.mean_reference_count <= 0:
+            raise ValueError("mean_reference_count must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PriorFitConfig:
+    n_support_points: int = 512
+    max_em_iterations: int | None = 200
+    convergence_tolerance: float = 1e-6
+    cell_chunk_size: int = 512
+    support_max_from: Literal["observed_max", "quantile"] = "observed_max"
+    support_spacing: Literal["linear", "sqrt"] = "linear"
+    use_adaptive_support: bool = False
+    adaptive_support_fraction: float = 1.0
+    adaptive_support_quantile_hi: float = 0.99
+    likelihood: DistributionName = "binomial"
+    nb_overdispersion: float = 0.01
+
+    def __post_init__(self) -> None:
+        if self.n_support_points < 2:
+            raise ValueError("n_support_points must be >= 2")
+        if self.max_em_iterations is not None and self.max_em_iterations < 1:
+            raise ValueError("max_em_iterations must be >= 1")
+        if self.convergence_tolerance < 0:
+            raise ValueError("convergence_tolerance must be >= 0")
+        if self.cell_chunk_size < 1:
+            raise ValueError("cell_chunk_size must be >= 1")
+        if self.support_max_from not in {"observed_max", "quantile"}:
+            raise ValueError(f"unsupported support_max_from: {self.support_max_from}")
+        if self.support_spacing not in {"linear", "sqrt"}:
+            raise ValueError(f"unsupported support_spacing: {self.support_spacing}")
+        if self.use_adaptive_support:
+            if (
+                self.adaptive_support_fraction <= 0
+                or self.adaptive_support_fraction > 1
+            ):
+                raise ValueError("adaptive_support_fraction must be in (0, 1]")
+            if not (0.0 < self.adaptive_support_quantile_hi <= 1.0):
+                raise ValueError("adaptive_support_quantile_hi must be in (0, 1]")
+        if self.likelihood not in {"binomial", "negative_binomial", "poisson"}:
+            raise ValueError(f"unsupported likelihood: {self.likelihood}")
+        if self.nb_overdispersion <= 0:
+            raise ValueError("nb_overdispersion must be > 0")
+
+
+@dataclass(frozen=True, slots=True)
+class PriorFitResult:
+    gene_names: list[str]
+    prior: PriorGrid
+    posterior_mean_probabilities: np.ndarray
+    objective_history: list[float]
+    final_objective: float
+    config: dict[str, Any]
+
+    def __post_init__(self) -> None:
+        names = _require_unique_names(self.gene_names, field_name="gene_names")
+        posterior_mean_probabilities = _as_probabilities(
+            self.posterior_mean_probabilities,
+            name="posterior_mean_probabilities",
+        )
+        objective_history = [float(value) for value in self.objective_history]
+        if not objective_history:
+            raise ValueError("objective_history cannot be empty")
+        if not np.all(np.isfinite(np.asarray(objective_history, dtype=DTYPE_NP))):
+            raise ValueError("objective_history must contain only finite values")
+        final_objective = float(self.final_objective)
+        if not np.isfinite(final_objective):
+            raise ValueError("final_objective must be finite")
+        if abs(final_objective - objective_history[-1]) > 1e-9:
+            raise ValueError("final_objective must equal objective_history[-1]")
+        if names != list(self.prior.gene_names):
+            raise ValueError("gene_names must match prior.gene_names")
+        if posterior_mean_probabilities.shape != self.prior.prior_probabilities.shape:
+            raise ValueError(
+                "posterior_mean_probabilities must match prior probability shape, "
+                f"got {posterior_mean_probabilities.shape} != {self.prior.prior_probabilities.shape}"
+            )
+        object.__setattr__(self, "gene_names", names)
+        object.__setattr__(
+            self,
+            "posterior_mean_probabilities",
+            posterior_mean_probabilities,
+        )
+        object.__setattr__(self, "objective_history", objective_history)
+        object.__setattr__(self, "final_objective", final_objective)
+        object.__setattr__(self, "config", dict(self.config))
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceResult:
+    gene_names: list[str]
+    support_domain: SupportDomain
+    support: np.ndarray
+    prior_probabilities: np.ndarray
+    map_support: np.ndarray
+    posterior_entropy: np.ndarray
+    prior_entropy: np.ndarray
+    mutual_information: np.ndarray
+    posterior_probabilities: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        names = _require_unique_names(self.gene_names, field_name="gene_names")
+        support = _as_support(self.support, name="support")
+        _validate_support_domain(support, domain=self.support_domain)
+        prior_probabilities = _as_probabilities(
+            self.prior_probabilities,
+            name="prior_probabilities",
+        )
+        if support.shape != prior_probabilities.shape:
+            raise ValueError(
+                f"support and prior_probabilities must have identical shape, got {support.shape} != {prior_probabilities.shape}"
+            )
+        map_support = _as_matrix(self.map_support, name="map_support")
+        posterior_entropy = _as_matrix(
+            self.posterior_entropy,
+            name="posterior_entropy",
+        )
+        prior_entropy = _as_matrix(self.prior_entropy, name="prior_entropy")
+        mutual_information = _as_matrix(
+            self.mutual_information,
+            name="mutual_information",
+        )
+        if map_support.shape != posterior_entropy.shape:
+            raise ValueError("map_support and posterior_entropy must match")
+        if map_support.shape != prior_entropy.shape:
+            raise ValueError("map_support and prior_entropy must match")
+        if map_support.shape != mutual_information.shape:
+            raise ValueError("map_support and mutual_information must match")
+        if map_support.shape[1] != len(names):
+            raise ValueError(
+                "inference result second dimension must match gene_names, "
+                f"got {map_support.shape[1]} != {len(names)}"
+            )
+        if self.posterior_probabilities is not None:
+            posterior_probabilities = np.asarray(
+                self.posterior_probabilities,
+                dtype=DTYPE_NP,
+            )
+            if posterior_probabilities.ndim != 3:
+                raise ValueError(
+                    "posterior_probabilities must be 3D when present, "
+                    f"got shape={posterior_probabilities.shape}"
+                )
+            if posterior_probabilities.shape[:2] != map_support.shape:
+                raise ValueError(
+                    "posterior_probabilities leading dimensions must match map_support, "
+                    f"got {posterior_probabilities.shape[:2]} != {map_support.shape}"
+                )
+            if posterior_probabilities.shape[2] != support.shape[-1]:
+                raise ValueError(
+                    "posterior_probabilities support dimension must match support, "
+                    f"got {posterior_probabilities.shape[2]} != {support.shape[-1]}"
+                )
+        else:
+            posterior_probabilities = None
+        object.__setattr__(self, "gene_names", names)
+        object.__setattr__(self, "support", support)
+        object.__setattr__(self, "prior_probabilities", prior_probabilities)
+        object.__setattr__(self, "map_support", map_support)
+        object.__setattr__(self, "posterior_entropy", posterior_entropy)
+        object.__setattr__(self, "prior_entropy", prior_entropy)
+        object.__setattr__(self, "mutual_information", mutual_information)
+        object.__setattr__(self, "posterior_probabilities", posterior_probabilities)
+
+
+@dataclass(frozen=True, slots=True)
+class ScaleDiagnostic:
+    mean_reference_count: float
+    suggested_scale: float
+    upper_quantile_scale: float
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.mean_reference_count) or self.mean_reference_count <= 0:
+            raise ValueError("mean_reference_count must be finite and positive")
+        if not np.isfinite(self.suggested_scale) or self.suggested_scale <= 0:
+            raise ValueError("suggested_scale must be finite and positive")
+        if not np.isfinite(self.upper_quantile_scale) or self.upper_quantile_scale <= 0:
+            raise ValueError("upper_quantile_scale must be finite and positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PoolEstimate:
+    point_scale: float
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.point_scale) or self.point_scale <= 0:
+            raise ValueError("point_scale must be finite and positive")
+
+
+__all__ = [
+    "BinomialDistributionGrid",
+    "DistributionGrid",
+    "GeneBatch",
+    "InferenceResult",
+    "make_distribution_grid",
+    "NegativeBinomialDistributionGrid",
+    "ObservationBatch",
+    "PoissonDistributionGrid",
+    "PoolEstimate",
+    "PriorFitConfig",
+    "PriorFitResult",
+    "PriorGrid",
+    "ScaleDiagnostic",
+    "ScaleMetadata",
+]

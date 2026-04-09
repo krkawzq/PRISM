@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import typer
+from prism.cli.common import create_typer_app
 
 from .priors import fit_priors_command
 
-fit_app = typer.Typer(help="Fit model artifacts.", no_args_is_help=True)
+fit_app = create_typer_app(help="Fit model priors.")
 fit_app.command("priors")(fit_priors_command)
 
 __all__ = ["fit_app"]

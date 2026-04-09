@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import os
 
-import anndata as ad
 import numpy as np
 from scipy import sparse
+
+if TYPE_CHECKING:
+    import anndata as ad
 
 
 def select_matrix(adata: Any, layer: str | None):
@@ -59,9 +61,17 @@ def compute_reference_counts(
     return np.asarray(totals, dtype=dtype).reshape(-1)
 
 
-def write_h5ad_atomic(adata: ad.AnnData, output_path: str | Path) -> None:
+def write_h5ad(
+    adata: "ad.AnnData",
+    output_path: str | Path,
+    *,
+    atomic: bool = True,
+) -> None:
     resolved = Path(output_path).expanduser().resolve()
     resolved.parent.mkdir(parents=True, exist_ok=True)
+    if not atomic:
+        adata.write_h5ad(resolved)
+        return
     temp_path = resolved.with_name(f".{resolved.name}.tmp-{os.getpid()}")
     if temp_path.exists():
         temp_path.unlink()
@@ -74,5 +84,5 @@ __all__ = [
     "ensure_dense_matrix",
     "select_matrix",
     "slice_gene_matrix",
-    "write_h5ad_atomic",
+    "write_h5ad",
 ]

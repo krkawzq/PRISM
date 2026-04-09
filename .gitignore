@@ -21,4 +21,8 @@ uv.lock
 .opencode/
 .ruff_cache/
 .agents/
+.codex/
 /forks/
+node_modules/
+
+src/prism_v*
