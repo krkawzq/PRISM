@@ -24,5 +24,9 @@ uv.lock
 .codex/
 /forks/
 node_modules/
+src/prism/server/frontend/dist/
+src/prism/server/frontend/*.tsbuildinfo
+src/prism/server/frontend/vite.config.js
+src/prism/server/frontend/vite.config.d.ts
 
 src/prism_v*

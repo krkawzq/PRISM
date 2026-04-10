@@ -209,10 +209,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable adaptive support refinement.",
     )
     parser.add_argument(
-        "--adaptive-support-fraction",
+        "--adaptive-support-scale",
         type=float,
-        default=0.3,
-        help="Retained support fraction during adaptive refinement.",
+        default=1.0,
+        help="Expansion factor applied to the adaptive support range.",
     )
     parser.add_argument(
         "--adaptive-support-quantile-hi",
@@ -297,7 +297,9 @@ def resolve_reference_positions(
     gene_to_idx = {name: idx for idx, name in enumerate(dataset_gene_names)}
     if reference_gene_list is None:
         return list(range(len(dataset_gene_names)))
-    selected = [gene_to_idx[name] for name in reference_gene_list if name in gene_to_idx]
+    selected = [
+        gene_to_idx[name] for name in reference_gene_list if name in gene_to_idx
+    ]
     if not selected:
         raise ValueError("reference gene list has no overlap with the dataset")
     return list(dict.fromkeys(selected))
@@ -396,7 +398,9 @@ def build_gaussian_prior(prior: PriorGrid) -> PriorGrid:
     scaled_support = np.asarray(prior.scaled_support, dtype=np.float64)
     weights = normalize_weights(prior.prior_probabilities)
     mean = np.sum(weights * scaled_support, axis=-1, keepdims=True)
-    variance = np.sum(weights * np.square(scaled_support - mean), axis=-1, keepdims=True)
+    variance = np.sum(
+        weights * np.square(scaled_support - mean), axis=-1, keepdims=True
+    )
     std = np.sqrt(np.clip(variance, 1e-12, None))
     gaussian_weights = normalize_weights(
         np.exp(-0.5 * np.square((scaled_support - mean) / std))
@@ -426,7 +430,9 @@ def compare_priors_on_scaled_support(
             np.concatenate([left_scaled[idx], right_scaled[idx]], axis=0)
         )
         left_interp = normalize_weights(
-            np.interp(merged_support, left_scaled[idx], left_weights[idx], left=0.0, right=0.0)
+            np.interp(
+                merged_support, left_scaled[idx], left_weights[idx], left=0.0, right=0.0
+            )
         )
         right_interp = normalize_weights(
             np.interp(
@@ -501,7 +507,7 @@ def fit_distribution(
         support_max_from=args.support_max_from,
         support_spacing=args.support_spacing,
         use_adaptive_support=bool(args.adaptive_support),
-        adaptive_support_fraction=args.adaptive_support_fraction,
+        adaptive_support_scale=args.adaptive_support_scale,
         adaptive_support_quantile_hi=args.adaptive_support_quantile_hi,
         likelihood=cast(Any, distribution),
         nb_overdispersion=args.nb_overdispersion,
@@ -586,8 +592,12 @@ def build_figure(
                 ax = axes[row_idx][col_idx]
                 artifact = scope_results[scope_name][distribution]
                 x = np.asarray(artifact.prior.scaled_support[row_idx], dtype=np.float64)
-                prior = np.asarray(artifact.prior.prior_probabilities[row_idx], dtype=np.float64)
-                posterior = np.asarray(artifact.posterior_average[row_idx], dtype=np.float64)
+                prior = np.asarray(
+                    artifact.prior.prior_probabilities[row_idx], dtype=np.float64
+                )
+                posterior = np.asarray(
+                    artifact.posterior_average[row_idx], dtype=np.float64
+                )
                 prior_color, post_color = DIST_COLORS[distribution]
                 annotation_lines = [
                     f"objective={artifact.final_objective:.4f}",
@@ -619,7 +629,9 @@ def build_figure(
                 )
                 ax.set_xlim(0.0, max(float(np.max(x)), 1e-12))
                 ax.set_xlabel("scaled support")
-                ax.set_ylabel(f"{gene_name}\nprobability" if col_idx == 0 else "probability")
+                ax.set_ylabel(
+                    f"{gene_name}\nprobability" if col_idx == 0 else "probability"
+                )
                 if row_idx == 0:
                     ax.set_title(f"{scope_name}\n{DIST_LABELS[distribution]}")
                 ax.grid(alpha=0.2)
@@ -631,7 +643,12 @@ def build_figure(
                     ha="right",
                     va="top",
                     fontsize=8,
-                    bbox={"boxstyle": "round,pad=0.3", "fc": "white", "alpha": 0.85, "ec": "none"},
+                    bbox={
+                        "boxstyle": "round,pad=0.3",
+                        "fc": "white",
+                        "alpha": 0.85,
+                        "ec": "none",
+                    },
                 )
                 if row_idx == 0 and col_idx == 0:
                     ax.legend(frameon=False)

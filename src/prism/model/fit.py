@@ -52,15 +52,17 @@ def _default_probability_support_max(
     *,
     method: Literal["observed_max", "quantile"],
 ) -> np.ndarray:
-    if method == "observed_max":
-        mean_values = np.max(batch.counts, axis=0)
-    else:
-        mean_values = np.nanpercentile(batch.counts, 95, axis=0)
-    mean_reference = max(mean_reference_count(batch.reference_counts), EPS)
-    max_support = np.clip(
-        mean_values * float(scale) / mean_reference / float(scale), EPS, 1.0
+    effective_exposure_values = np.asarray(
+        effective_exposure(batch.reference_counts, scale), dtype=DTYPE_NP
+    ).reshape(-1)
+    observed_probabilities = np.asarray(batch.counts, dtype=DTYPE_NP) / np.maximum(
+        effective_exposure_values[:, None], EPS
     )
-    return np.asarray(max_support, dtype=DTYPE_NP)
+    if method == "observed_max":
+        max_support = np.max(observed_probabilities, axis=0)
+    else:
+        max_support = np.nanpercentile(observed_probabilities, 95, axis=0)
+    return np.clip(np.asarray(max_support, dtype=DTYPE_NP), EPS, 1.0)
 
 
 def _build_probability_support(
@@ -79,13 +81,24 @@ def _build_probability_support(
         base = base / base[-1]
     else:
         base = torch.linspace(0.0, 1.0, n_support_points, dtype=dtype, device=device)
-    return (max_values[:, None] * base[None, :]).clamp(EPS, 1.0)
+    return (max_values[:, None] * base[None, :]).clamp(0.0, 1.0)
+
+
+def _scale_support_max(
+    support_max: np.ndarray,
+    support_scale: float,
+    *,
+    upper_bound: float | None = None,
+) -> np.ndarray:
+    scaled = np.asarray(support_max, dtype=DTYPE_NP) * float(support_scale)
+    return np.clip(scaled, EPS, upper_bound)
 
 
 def _build_rate_support(
     counts: np.ndarray,
     n_support_points: int,
     *,
+    support_scale: float,
     dtype: torch.dtype,
     device: torch.device,
     spacing: Literal["linear", "sqrt"],
@@ -97,7 +110,10 @@ def _build_rate_support(
         base = base / base[-1]
     else:
         base = torch.linspace(0.0, 1.0, n_support_points, dtype=dtype, device=device)
-    max_values = np.clip(np.nanmax(counts, axis=0), EPS, None)
+    max_values = _scale_support_max(
+        np.nanmax(counts, axis=0),
+        support_scale,
+    )
     max_tensor = torch.as_tensor(max_values, dtype=dtype, device=device)
     return (max_tensor[:, None] * base[None, :]).clamp_min(EPS)
 
@@ -168,8 +184,6 @@ def _adaptive_refine_support(
         gene_probabilities = probabilities[gene_idx]
         cdf = np.cumsum(gene_probabilities)
         cdf = cdf / max(cdf[-1], EPS)
-        mode_value = float(gene_support[int(np.argmax(gene_probabilities))])
-        min_value = float(gene_support[0])
         max_value = float(gene_support[-1])
         quantile_hi_value = float(
             gene_support[
@@ -179,20 +193,13 @@ def _adaptive_refine_support(
                 )
             ]
         )
-        full_width = max(max_value - min_value, EPS)
-        target_width = max(
-            full_width * config.adaptive_support_fraction,
-            full_width / max(len(gene_support) - 1, 1),
+        minimum_upper = max(max_value / max(len(gene_support) - 1, 1), EPS)
+        upper = min(
+            max_value,
+            max(quantile_hi_value * config.adaptive_support_scale, minimum_upper),
         )
-        lower = max(min_value, mode_value - 0.5 * target_width)
-        upper = min(quantile_hi_value, mode_value + 0.5 * target_width)
-        if upper <= lower:
-            upper = min(max_value, max(mode_value, quantile_hi_value))
-            lower = max(min_value, upper - target_width)
-        if upper <= lower:
-            upper = min(max_value, lower + full_width / max(len(gene_support) - 1, 1))
         refined[gene_idx] = np.linspace(
-            lower, upper, gene_support.shape[0], dtype=DTYPE_NP
+            0.0, upper, gene_support.shape[0], dtype=DTYPE_NP
         )
     return torch.as_tensor(refined, dtype=dtype, device=device)
 
@@ -425,6 +432,7 @@ def _build_support(
         return _build_rate_support(
             batch.counts,
             config.n_support_points,
+            support_scale=config.support_scale,
             dtype=dtype,
             device=device,
             spacing=config.support_spacing,
@@ -444,6 +452,11 @@ def _build_support(
         or np.any(resolved_max > 1)
     ):
         raise ValueError("support_max must lie in (0, 1]")
+    resolved_max = _scale_support_max(
+        resolved_max,
+        config.support_scale,
+        upper_bound=1.0,
+    )
     return _build_probability_support(
         config.n_support_points,
         resolved_max,

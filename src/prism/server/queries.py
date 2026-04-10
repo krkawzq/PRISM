@@ -107,13 +107,18 @@ def parse_fit_params(request: Request) -> GeneFitParams:
         support_spacing="sqrt"
         if (request.first("support_spacing") or "").strip().lower() == "sqrt"
         else "linear",
+        support_scale=parse_float(
+            request.first("support_scale"),
+            default=1.5,
+            min_value=1.0,
+        ),
         use_adaptive_support=parse_bool(
             request.first("use_adaptive_support"), default=False
         ),
-        adaptive_support_fraction=parse_float(
-            request.first("adaptive_support_fraction"),
-            default=1.0,
-            min_value=1e-12,
+        adaptive_support_scale=parse_float(
+            request.first("adaptive_support_scale"),
+            default=1.5,
+            min_value=1.0,
         ),
         adaptive_support_quantile_hi=parse_float(
             request.first("adaptive_support_quantile_hi"),

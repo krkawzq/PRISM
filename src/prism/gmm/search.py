@@ -50,6 +50,20 @@ class _StagePrefixBatch:
     row_target_k: np.ndarray
 
 
+def _result_metric_values(
+    result: MixtureOptimizationResult,
+    *,
+    metric: str,
+) -> np.ndarray:
+    if metric == "jsd":
+        return np.asarray(result.jsd, dtype=DTYPE_NP)
+    if metric == "cross_entropy":
+        return np.asarray(result.cross_entropy, dtype=DTYPE_NP)
+    if metric == "l1":
+        return np.asarray(result.l1_error, dtype=DTYPE_NP)
+    raise ValueError(f"unsupported metric: {metric!r}")
+
+
 def _merge_sorted_support_points(
     support: np.ndarray,
     probabilities: np.ndarray,
@@ -207,6 +221,21 @@ def _peak_indices(
     local_max = np.flatnonzero(
         (values >= left) & (values >= right) & (values > config.peak_min_value)
     )
+    if local_max.size > 1:
+        collapsed: list[int] = []
+        group = [int(local_max[0])]
+        for idx in local_max[1:].tolist():
+            if (
+                idx == group[-1] + 1
+                and abs(float(values[idx]) - float(values[group[-1]]))
+                <= config.peak_plateau_tolerance
+            ):
+                group.append(int(idx))
+                continue
+            collapsed.append(group[len(group) // 2])
+            group = [int(idx)]
+        collapsed.append(group[len(group) // 2])
+        local_max = np.asarray(collapsed, dtype=np.int64)
     if not config.include_boundary_peaks:
         local_max = local_max[(local_max > 0) & (local_max < values.size - 1)]
     if local_max.size == 0:
@@ -366,27 +395,49 @@ def _score_peak_candidates(
             rights_t,
             support_mask_t,
         )[0]
-        max_mass = candidate_masses.max(dim=0).values.clamp_min(EPS)
-        significant = candidate_masses > config.mass_floor * max_mass.unsqueeze(0)
-        ratio = residual_t[0].unsqueeze(-1) / candidate_masses.clamp_min(EPS)
-        ratio = torch.where(significant, ratio, torch.full_like(ratio, float("inf")))
-        alpha_max = torch.min(ratio, dim=0).values
-        alpha = torch.minimum(
-            alpha_max * config.candidate_weight_slack,
-            residual_t[0].sum(),
+        candidate_masses_np = (
+            candidate_masses.detach().cpu().numpy().astype(DTYPE_NP, copy=False)
         )
-        residual_after = torch.clamp(
-            residual_t[0].unsqueeze(-1) - alpha.unsqueeze(0) * candidate_masses,
-            min=0.0,
-        )
-        baseline = torch.sum(residual_t[0] * residual_t[0])
-        improvement = baseline - torch.sum(residual_after * residual_after, dim=0)
-        valid = (alpha >= config.min_component_mass) & torch.isfinite(improvement)
+        residual_np = np.asarray(residual, dtype=DTYPE_NP)
+        baseline = float(np.sum(residual_np * residual_np))
+        alpha = np.zeros(candidate_masses_np.shape[1], dtype=DTYPE_NP)
+        improvement = np.full(candidate_masses_np.shape[1], -np.inf, dtype=DTYPE_NP)
+        for candidate_idx in range(candidate_masses_np.shape[1]):
+            masses = candidate_masses_np[:, candidate_idx]
+            max_mass = max(float(np.max(masses)), EPS)
+            significant = masses > config.mass_floor * max_mass
+            if np.any(significant):
+                ratios = residual_np[significant] / np.clip(masses[significant], EPS, None)
+                alpha_cap = float(
+                    np.quantile(ratios, config.candidate_alpha_cap_quantile)
+                )
+            else:
+                alpha_cap = float(np.sum(residual_np))
+            alpha_cap = min(
+                alpha_cap * config.candidate_weight_slack,
+                float(np.sum(residual_np)),
+            )
+            if config.candidate_alpha_strategy == "least_squares":
+                alpha_base = float(
+                    np.dot(residual_np, masses)
+                    / max(float(np.dot(masses, masses)), EPS)
+                )
+                alpha_value = min(max(alpha_base, 0.0), alpha_cap)
+            else:
+                alpha_value = max(alpha_cap, 0.0)
+            residual_after = np.clip(residual_np - alpha_value * masses, 0.0, None)
+            alpha[candidate_idx] = float(alpha_value)
+            improvement[candidate_idx] = float(
+                baseline - np.sum(residual_after * residual_after)
+            )
+        alpha_t = torch.as_tensor(alpha, dtype=dtype_obj, device=device_obj)
+        improvement_t = torch.as_tensor(improvement, dtype=dtype_obj, device=device_obj)
+        valid = (alpha_t >= config.min_component_mass) & torch.isfinite(improvement_t)
         if not torch.any(valid):
-            best_idx = int(torch.argmax(alpha).detach().cpu().item())
+            best_idx = int(torch.argmax(alpha_t).detach().cpu().item())
             return (
-                float(alpha[best_idx].detach().cpu().item()),
-                float(improvement[best_idx].detach().cpu().item()),
+                float(alpha_t[best_idx].detach().cpu().item()),
+                float(improvement_t[best_idx].detach().cpu().item()),
                 float(means[best_idx]),
                 float(stds[best_idx]),
                 float(lefts[best_idx]),
@@ -394,18 +445,102 @@ def _score_peak_candidates(
             )
         masked_improvement = torch.where(
             valid,
-            improvement,
-            torch.full_like(improvement, -float("inf")),
+            improvement_t,
+            torch.full_like(improvement_t, -float("inf")),
         )
         best_idx = int(torch.argmax(masked_improvement).detach().cpu().item())
     return (
-        float(alpha[best_idx].detach().cpu().item()),
-        float(improvement[best_idx].detach().cpu().item()),
+        float(alpha_t[best_idx].detach().cpu().item()),
+        float(improvement_t[best_idx].detach().cpu().item()),
         float(means[best_idx]),
         float(stds[best_idx]),
         float(lefts[best_idx]),
         float(rights[best_idx]),
     )
+
+
+def _rerank_candidate_rows(
+    prepared: _PreparedGridBatch,
+    *,
+    row_idx: int,
+    frontier_k: int,
+    frontier_weights: np.ndarray,
+    frontier_means: np.ndarray,
+    frontier_stds: np.ndarray,
+    frontier_lefts: np.ndarray,
+    frontier_rights: np.ndarray,
+    candidate_rows: list[tuple[float, float, float, float, float, float]],
+    config: GMMSearchConfig,
+    device: str | torch.device,
+    torch_dtype: str,
+) -> list[tuple[float, float, float, float, float, float]]:
+    if len(candidate_rows) <= 1:
+        return candidate_rows
+    ordered = sorted(candidate_rows, key=lambda item: item[0], reverse=True)
+    top_n = len(ordered) if config.candidate_rerank_top_n is None else min(
+        config.candidate_rerank_top_n,
+        len(ordered),
+    )
+    if top_n <= 1:
+        return ordered
+
+    weights = np.zeros((top_n, config.max_components), dtype=DTYPE_NP)
+    means = np.zeros_like(weights)
+    stds = np.ones_like(weights)
+    lefts = np.repeat(prepared.lower_bounds[[row_idx], None], config.max_components, axis=1)
+    lefts = np.repeat(lefts, top_n, axis=0).astype(DTYPE_NP, copy=False)
+    rights = np.repeat(prepared.upper_bounds[[row_idx], None], config.max_components, axis=1)
+    rights = np.repeat(rights, top_n, axis=0).astype(DTYPE_NP, copy=False)
+    for candidate_idx, (_, alpha, mean, std, left, right) in enumerate(ordered[:top_n]):
+        if frontier_k > 0:
+            weights[candidate_idx, :frontier_k] = frontier_weights[:frontier_k]
+            means[candidate_idx, :frontier_k] = frontier_means[:frontier_k]
+            stds[candidate_idx, :frontier_k] = frontier_stds[:frontier_k]
+            lefts[candidate_idx, :frontier_k] = frontier_lefts[:frontier_k]
+            rights[candidate_idx, :frontier_k] = frontier_rights[:frontier_k]
+        weights[candidate_idx, frontier_k] = alpha
+        means[candidate_idx, frontier_k] = mean
+        stds[candidate_idx, frontier_k] = std
+        if frontier_k == 0:
+            lefts[candidate_idx, frontier_k] = float(prepared.lower_bounds[row_idx])
+            rights[candidate_idx, frontier_k] = float(prepared.upper_bounds[row_idx])
+        else:
+            lefts[candidate_idx, frontier_k] = left
+            rights[candidate_idx, frontier_k] = right
+        active_total = max(float(np.sum(weights[candidate_idx, : frontier_k + 1])), EPS)
+        weights[candidate_idx, : frontier_k + 1] /= active_total
+    batch = _StagePrefixBatch(
+        probabilities=np.repeat(prepared.probabilities[[row_idx]], top_n, axis=0),
+        bin_edges=np.repeat(prepared.bin_edges[[row_idx]], top_n, axis=0),
+        support_mask=np.repeat(prepared.support_mask[[row_idx]], top_n, axis=0),
+        lower_bounds=np.repeat(prepared.lower_bounds[[row_idx]], top_n, axis=0),
+        upper_bounds=np.repeat(prepared.upper_bounds[[row_idx]], top_n, axis=0),
+        selected_k=np.full(top_n, frontier_k + 1, dtype=np.int64),
+        component_weights=weights,
+        component_means=means,
+        component_stds=stds,
+        component_lefts=lefts,
+        component_rights=rights,
+        row_gene_indices=np.full(top_n, row_idx, dtype=np.int64),
+        row_target_k=np.full(top_n, frontier_k + 1, dtype=np.int64),
+    )
+    result = _evaluate_prefix_batch(
+        batch,
+        config=config,
+        device=device,
+        torch_dtype=torch_dtype,
+    )
+    metric_values = _result_metric_values(result, metric=config.selection_metric)
+    reranked_top = [
+        ordered[idx]
+        for idx in np.lexsort(
+            (
+                -np.asarray([row[0] for row in ordered[:top_n]], dtype=DTYPE_NP),
+                metric_values,
+            )
+        ).tolist()
+    ]
+    return reranked_top + ordered[top_n:]
 
 
 def _extract_stage_components_for_gene(
@@ -414,6 +549,11 @@ def _extract_stage_components_for_gene(
     row_idx: int,
     residual: np.ndarray,
     frontier_k: int,
+    frontier_weights: np.ndarray,
+    frontier_means: np.ndarray,
+    frontier_stds: np.ndarray,
+    frontier_lefts: np.ndarray,
+    frontier_rights: np.ndarray,
     config: GMMSearchConfig,
     device: str | torch.device,
     torch_dtype: str,
@@ -510,6 +650,20 @@ def _extract_stage_components_for_gene(
         )
 
     candidate_rows.sort(key=lambda item: item[0], reverse=True)
+    candidate_rows = _rerank_candidate_rows(
+        prepared,
+        row_idx=row_idx,
+        frontier_k=frontier_k,
+        frontier_weights=frontier_weights,
+        frontier_means=frontier_means,
+        frontier_stds=frontier_stds,
+        frontier_lefts=frontier_lefts,
+        frontier_rights=frontier_rights,
+        candidate_rows=candidate_rows,
+        config=config,
+        device=device,
+        torch_dtype=torch_dtype,
+    )
     remaining = max(config.max_components - frontier_k, 0)
     if remaining == 0:
         return (
@@ -654,6 +808,8 @@ def _evaluate_prefix_batch(
             optimize_right_truncations=config.search_refit_optimize_right_truncations,
             sigma_floor_fraction=config.search_refit_sigma_floor_fraction,
             min_window_fraction=config.search_refit_min_window_fraction,
+            truncation_mode=config.search_refit_truncation_mode,
+            truncation_regularization_strength=config.search_refit_truncation_regularization_strength,
             initial_weight_logit_floor=config.search_refit_initial_weight_logit_floor,
             inactive_weight_floor=config.search_refit_inactive_weight_floor,
             masked_logit_value=config.search_refit_masked_logit_value,
@@ -677,21 +833,64 @@ def _evaluate_prefix_batch(
     )
 
 
+def _select_frontier_target_k(
+    *,
+    frontier_k: int,
+    stage_target_k: np.ndarray,
+    stage_metric_values: np.ndarray,
+    strategy: str,
+) -> int:
+    if stage_target_k.size == 0:
+        raise ValueError("stage_target_k cannot be empty")
+    if strategy == "full_stage":
+        return int(np.max(stage_target_k))
+    if strategy == "single_step":
+        return int(frontier_k + 1)
+    if strategy == "best_prefix":
+        order = np.lexsort((stage_target_k, stage_metric_values))
+        return int(stage_target_k[int(order[0])])
+    raise ValueError(f"unsupported frontier_update_strategy: {strategy!r}")
+
+
 def _select_component_count(
-    error_path: np.ndarray,
+    metric_path: np.ndarray,
     explored_k: np.ndarray,
     *,
     error_threshold: float,
+    mode: str,
+    min_improvement: float,
+    min_improvement_patience: int,
+    penalty_weight: float,
 ) -> np.ndarray:
-    selected = np.ones(error_path.shape[0], dtype=np.int64)
-    for row_idx in range(error_path.shape[0]):
+    selected = np.ones(metric_path.shape[0], dtype=np.int64)
+    for row_idx in range(metric_path.shape[0]):
         max_k = int(explored_k[row_idx])
-        row_errors = error_path[row_idx, :max_k]
+        row_errors = metric_path[row_idx, :max_k]
         within = np.flatnonzero(row_errors <= error_threshold)
         if within.size > 0:
             selected[row_idx] = int(within[0] + 1)
             continue
-        selected[row_idx] = int(np.argmin(row_errors) + 1)
+        if mode == "threshold_first":
+            selected[row_idx] = int(np.argmin(row_errors) + 1)
+            continue
+        if mode == "marginal_gain":
+            if row_errors.shape[0] == 1:
+                selected[row_idx] = 1
+                continue
+            gains = row_errors[:-1] - row_errors[1:]
+            for gain_idx in range(max(0, gains.shape[0] - min_improvement_patience + 1)):
+                window = gains[gain_idx : gain_idx + min_improvement_patience]
+                if np.all(window <= min_improvement):
+                    selected[row_idx] = int(gain_idx + 1)
+                    break
+            else:
+                selected[row_idx] = int(np.argmin(row_errors) + 1)
+            continue
+        if mode == "penalized_error":
+            penalties = penalty_weight * np.arange(1, max_k + 1, dtype=DTYPE_NP)
+            selected[row_idx] = int(np.argmin(row_errors + penalties) + 1)
+            continue
+        raise ValueError(f"unsupported k_selection_mode: {mode!r}")
     return selected
 
 
@@ -786,6 +985,7 @@ def _search_prepared_batch(
     right_history = np.repeat(right_history, max_components, axis=2).astype(DTYPE_NP)
     fitted_history = np.zeros((n_genes, prepared.n_support_points, max_components), dtype=DTYPE_NP)
     error_path = np.full((n_genes, max_components), np.inf, dtype=DTYPE_NP)
+    selection_path = np.full((n_genes, max_components), np.inf, dtype=DTYPE_NP)
     residual_mass_path = np.full((n_genes, max_components), np.inf, dtype=DTYPE_NP)
     residual_peak_path = np.full((n_genes, max_components), np.inf, dtype=DTYPE_NP)
 
@@ -804,7 +1004,8 @@ def _search_prepared_batch(
             )
             if frontier_k[row_idx] > 0:
                 if (
-                    residual.sum() <= config.residual_mass_threshold
+                    error_path[row_idx, frontier_k[row_idx] - 1] <= config.error_threshold
+                    or residual.sum() <= config.residual_mass_threshold
                     or residual.max() <= config.residual_peak_threshold
                 ):
                     done[row_idx] = True
@@ -814,6 +1015,11 @@ def _search_prepared_batch(
                 row_idx=row_idx,
                 residual=residual,
                 frontier_k=int(frontier_k[row_idx]),
+                frontier_weights=frontier_weights[row_idx],
+                frontier_means=frontier_means[row_idx],
+                frontier_stds=frontier_stds[row_idx],
+                frontier_lefts=frontier_lefts[row_idx],
+                frontier_rights=frontier_rights[row_idx],
                 config=config,
                 device=device,
                 torch_dtype=torch_dtype,
@@ -842,6 +1048,7 @@ def _search_prepared_batch(
             device=device,
             torch_dtype=torch_dtype,
         )
+        selection_values = _result_metric_values(result, metric=config.selection_metric)
         for batch_row, (gene_idx, target_k) in enumerate(
             zip(batch.row_gene_indices.tolist(), batch.row_target_k.tolist(), strict=True)
         ):
@@ -853,6 +1060,7 @@ def _search_prepared_batch(
             right_history[gene_idx, step_idx] = result.component_right_truncations[batch_row]
             fitted_history[gene_idx, :, step_idx] = result.fitted_probabilities[batch_row]
             error_path[gene_idx, step_idx] = result.jsd[batch_row]
+            selection_path[gene_idx, step_idx] = selection_values[batch_row]
             residual = np.clip(
                 prepared.probabilities[gene_idx] - result.fitted_probabilities[batch_row],
                 0.0,
@@ -863,7 +1071,15 @@ def _search_prepared_batch(
             explored_k[gene_idx] = max(explored_k[gene_idx], target_k)
 
         for gene_idx, extracted in stage_components.items():
-            new_frontier_k = int(frontier_k[gene_idx] + extracted[0].shape[0])
+            gene_mask = batch.row_gene_indices == gene_idx
+            stage_target_k = np.asarray(batch.row_target_k[gene_mask], dtype=np.int64)
+            stage_metric_values = np.asarray(selection_values[gene_mask], dtype=DTYPE_NP)
+            new_frontier_k = _select_frontier_target_k(
+                frontier_k=int(frontier_k[gene_idx]),
+                stage_target_k=stage_target_k,
+                stage_metric_values=stage_metric_values,
+                strategy=config.frontier_update_strategy,
+            )
             step_idx = new_frontier_k - 1
             frontier_k[gene_idx] = new_frontier_k
             frontier_weights[gene_idx] = weight_history[gene_idx, step_idx]
@@ -890,9 +1106,13 @@ def _search_prepared_batch(
             residual_peak_path[row_idx, last_idx + 1 :] = residual_peak_path[row_idx, last_idx]
 
     selected_k = _select_component_count(
-        error_path,
+        selection_path,
         explored_k,
         error_threshold=config.error_threshold,
+        mode=config.k_selection_mode,
+        min_improvement=config.k_min_improvement,
+        min_improvement_patience=config.k_min_improvement_patience,
+        penalty_weight=config.k_penalty_weight,
     )
     return _finalize_search(
         prepared,

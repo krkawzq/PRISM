@@ -396,6 +396,8 @@ class RefitModule(torch.nn.Module):
         overshoot_penalty: float,
         min_window_fraction: float,
         masked_logit_value: float,
+        truncation_mode: str,
+        truncation_regularization_strength: float,
         optimize_weights: bool,
         optimize_means: bool,
         optimize_stds: bool,
@@ -442,6 +444,10 @@ class RefitModule(torch.nn.Module):
         self.overshoot_penalty = float(overshoot_penalty)
         self.min_window_fraction = float(min_window_fraction)
         self.masked_logit_value = float(masked_logit_value)
+        self.truncation_mode = str(truncation_mode)
+        self.truncation_regularization_strength = float(
+            truncation_regularization_strength
+        )
 
     def forward(
         self,
@@ -460,18 +466,22 @@ class RefitModule(torch.nn.Module):
         mean_high = self.upper_bounds.unsqueeze(-1) + self.mean_margin_fraction * span
         means = mean_low + torch.sigmoid(self.mean_raw) * (mean_high - mean_low)
         stds = self.sigma_floor.unsqueeze(-1) + F.softplus(self.std_raw)
-        lefts = self.lower_bounds.unsqueeze(-1) + torch.sigmoid(self.left_raw) * span
-        min_window = torch.maximum(
-            self.sigma_floor.unsqueeze(-1),
-            span * self.min_window_fraction,
-        )
-        available_window = (self.upper_bounds.unsqueeze(-1) - lefts).clamp_min(
-            min_window + EPS
-        )
-        windows = min_window + torch.sigmoid(self.window_raw) * (
-            available_window - min_window
-        )
-        rights = torch.minimum(lefts + windows, self.upper_bounds.unsqueeze(-1))
+        if self.truncation_mode == "fixed_bounds":
+            lefts = self.lower_bounds.unsqueeze(-1).expand_as(means)
+            rights = self.upper_bounds.unsqueeze(-1).expand_as(means)
+        else:
+            lefts = self.lower_bounds.unsqueeze(-1) + torch.sigmoid(self.left_raw) * span
+            min_window = torch.maximum(
+                self.sigma_floor.unsqueeze(-1),
+                span * self.min_window_fraction,
+            )
+            available_window = (self.upper_bounds.unsqueeze(-1) - lefts).clamp_min(
+                min_window + EPS
+            )
+            windows = min_window + torch.sigmoid(self.window_raw) * (
+                available_window - min_window
+            )
+            rights = torch.minimum(lefts + windows, self.upper_bounds.unsqueeze(-1))
         masked_logits = torch.where(
             self.active_mask,
             self.weight_logits,
@@ -493,6 +503,14 @@ class RefitModule(torch.nn.Module):
                 torch.relu(fitted - self.target) ** 2,
                 dim=-1,
             )
+        if self.truncation_regularization_strength > 0:
+            window_fraction = ((rights - lefts) / span).clamp(0.0, 1.0)
+            active_components = self.active_mask.to(dtype=self.target.dtype)
+            truncation_penalty = torch.sum(
+                ((1.0 - window_fraction) ** 2) * active_components,
+                dim=-1,
+            ) / active_components.sum(dim=-1).clamp_min(1.0)
+            loss = loss + self.truncation_regularization_strength * truncation_penalty
         return fitted, component_masses, weights, means, stds, lefts, rights, loss
 
 
@@ -524,6 +542,8 @@ def optimize_mixture_parameters(
     optimize_right_truncations: bool = True,
     sigma_floor_fraction: float = 0.25,
     min_window_fraction: float = 1e-6,
+    truncation_mode: str = "free",
+    truncation_regularization_strength: float = 0.0,
     initial_weight_logit_floor: float = -12.0,
     inactive_weight_floor: float = 1e-12,
     masked_logit_value: float = -1e9,
@@ -569,6 +589,10 @@ def optimize_mixture_parameters(
         raise ValueError("sigma_floor_fraction must be > 0")
     if min_window_fraction <= 0:
         raise ValueError("min_window_fraction must be > 0")
+    if truncation_mode not in {"free", "fixed_bounds"}:
+        raise ValueError(f"unsupported truncation_mode: {truncation_mode}")
+    if truncation_regularization_strength < 0:
+        raise ValueError("truncation_regularization_strength must be >= 0")
     if inactive_weight_floor <= 0:
         raise ValueError("inactive_weight_floor must be > 0")
     if logit_clip <= 0 or logit_clip >= 0.5:
@@ -580,6 +604,15 @@ def optimize_mixture_parameters(
         np.arange(initial_weights_np.shape[1], dtype=np.int64)[None, :]
         < selected_k_np[:, None]
     )
+    if truncation_mode == "fixed_bounds":
+        initial_left_np = np.repeat(lower_bounds_np[:, None], initial_left_np.shape[1], axis=1)
+        initial_right_np = np.repeat(
+            upper_bounds_np[:, None],
+            initial_right_np.shape[1],
+            axis=1,
+        )
+        optimize_left_truncations = False
+        optimize_right_truncations = False
     (
         initial_weight_logits,
         initial_mean_raw,
@@ -644,6 +677,8 @@ def optimize_mixture_parameters(
         overshoot_penalty=overshoot_penalty,
         min_window_fraction=min_window_fraction,
         masked_logit_value=masked_logit_value,
+        truncation_mode=truncation_mode,
+        truncation_regularization_strength=truncation_regularization_strength,
         optimize_weights=optimize_weights,
         optimize_means=optimize_means,
         optimize_stds=optimize_stds,

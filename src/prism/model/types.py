@@ -139,7 +139,9 @@ class GeneBatch:
             reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
         )
         object.__setattr__(self, "gene_names", list(normalized.gene_names))
-        object.__setattr__(self, "counts", np.asarray(normalized.counts, dtype=DTYPE_NP))
+        object.__setattr__(
+            self, "counts", np.asarray(normalized.counts, dtype=DTYPE_NP)
+        )
         object.__setattr__(
             self,
             "reference_counts",
@@ -406,8 +408,9 @@ class PriorFitConfig:
     cell_chunk_size: int = 512
     support_max_from: Literal["observed_max", "quantile"] = "observed_max"
     support_spacing: Literal["linear", "sqrt"] = "linear"
+    support_scale: float = 1.5
     use_adaptive_support: bool = False
-    adaptive_support_fraction: float = 1.0
+    adaptive_support_scale: float = 1.5
     adaptive_support_quantile_hi: float = 0.99
     likelihood: DistributionName = "binomial"
     nb_overdispersion: float = 0.01
@@ -425,14 +428,12 @@ class PriorFitConfig:
             raise ValueError(f"unsupported support_max_from: {self.support_max_from}")
         if self.support_spacing not in {"linear", "sqrt"}:
             raise ValueError(f"unsupported support_spacing: {self.support_spacing}")
-        if self.use_adaptive_support:
-            if (
-                self.adaptive_support_fraction <= 0
-                or self.adaptive_support_fraction > 1
-            ):
-                raise ValueError("adaptive_support_fraction must be in (0, 1]")
-            if not (0.0 < self.adaptive_support_quantile_hi <= 1.0):
-                raise ValueError("adaptive_support_quantile_hi must be in (0, 1]")
+        if self.support_scale < 1.0:
+            raise ValueError("support_scale must be >= 1")
+        if self.adaptive_support_scale < 1.0:
+            raise ValueError("adaptive_support_scale must be >= 1")
+        if not (0.0 < self.adaptive_support_quantile_hi <= 1.0):
+            raise ValueError("adaptive_support_quantile_hi must be in (0, 1]")
         if self.likelihood not in {"binomial", "negative_binomial", "poisson"}:
             raise ValueError(f"unsupported likelihood: {self.likelihood}")
         if self.nb_overdispersion <= 0:

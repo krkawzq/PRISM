@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Legacy server-rendered handlers kept for reference and compatibility tests.
+
+The active `prism serve` runtime uses FastAPI routes from `prism.server.api_routes`.
+"""
+
 from dataclasses import dataclass
 from functools import partial
 from http import HTTPStatus

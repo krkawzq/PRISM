@@ -98,8 +98,9 @@ class GeneFitParams:
     cell_chunk_size: int = 512
     support_max_from: Literal["observed_max", "quantile"] = "observed_max"
     support_spacing: Literal["linear", "sqrt"] = "linear"
+    support_scale: float = 1.5
     use_adaptive_support: bool = False
-    adaptive_support_fraction: float = 1.0
+    adaptive_support_scale: float = 1.5
     adaptive_support_quantile_hi: float = 0.99
     likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
     nb_overdispersion: float = 0.01
@@ -115,8 +116,9 @@ class GeneFitParams:
             cell_chunk_size=self.cell_chunk_size,
             support_max_from=self.support_max_from,
             support_spacing=self.support_spacing,
+            support_scale=self.support_scale,
             use_adaptive_support=self.use_adaptive_support,
-            adaptive_support_fraction=self.adaptive_support_fraction,
+            adaptive_support_scale=self.adaptive_support_scale,
             adaptive_support_quantile_hi=self.adaptive_support_quantile_hi,
             likelihood=self.likelihood,
             nb_overdispersion=self.nb_overdispersion,

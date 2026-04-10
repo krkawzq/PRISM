@@ -120,7 +120,9 @@ def test_infer_kbulk_rejects_binomial_counts_above_exposure() -> None:
         )
 
 
-def test_inferencer_cache_key_distinguishes_compile_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inferencer_cache_key_distinguishes_compile_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     infer_module._COMPILED_INFERENCERS.clear()
     compiled_calls: list[torch.nn.Module] = []
 
@@ -149,7 +151,9 @@ def test_inferencer_cache_key_distinguishes_compile_mode(monkeypatch: pytest.Mon
     assert compiled_calls
 
 
-def test_em_step_cache_key_distinguishes_compile_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_em_step_cache_key_distinguishes_compile_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fit_module._COMPILED_EM_STEPS.clear()
     compiled_calls: list[torch.nn.Module] = []
 
@@ -179,19 +183,108 @@ def test_em_step_cache_key_distinguishes_compile_mode(monkeypatch: pytest.Monkey
 
 
 def test_cache_device_key_keeps_cuda_indices_distinct() -> None:
-    assert infer_module._cache_device_key(torch.device("cuda:0")) != infer_module._cache_device_key(
-        torch.device("cuda:1")
-    )
-    assert fit_module._cache_device_key(torch.device("cuda:0")) != fit_module._cache_device_key(
-        torch.device("cuda:1")
-    )
+    assert infer_module._cache_device_key(
+        torch.device("cuda:0")
+    ) != infer_module._cache_device_key(torch.device("cuda:1"))
+    assert fit_module._cache_device_key(
+        torch.device("cuda:0")
+    ) != fit_module._cache_device_key(torch.device("cuda:1"))
 
 
 def test_prior_engine_configs_validate_at_construction() -> None:
-    with pytest.raises(ValueError, match="adaptive_support_fraction"):
-        PriorEngineSetting(use_adaptive_support=True, adaptive_support_fraction=0.0)
+    with pytest.raises(ValueError, match="support_scale"):
+        PriorEngineSetting(support_scale=0.5)
+    with pytest.raises(ValueError, match="adaptive_support_scale"):
+        PriorEngineSetting(use_adaptive_support=True, adaptive_support_scale=0.5)
     with pytest.raises(ValueError, match="unsupported torch_dtype"):
         PriorEngineTrainingConfig(torch_dtype="float16")  # type: ignore[arg-type]
+
+
+def test_probability_support_max_uses_effective_exposure() -> None:
+    batch = ObservationBatch(
+        gene_names=["g1", "g2"],
+        counts=np.array([[1.0, 4.0], [2.0, 2.0]], dtype=np.float64),
+        reference_counts=np.array([10.0, 20.0], dtype=np.float64),
+    )
+
+    support_max = fit_module._default_probability_support_max(
+        batch,
+        scale=15.0,
+        method="observed_max",
+    )
+
+    assert np.allclose(support_max, np.array([0.1, 0.4], dtype=np.float64))
+
+
+def test_probability_support_grid_includes_zero() -> None:
+    support = fit_module._build_probability_support(
+        4,
+        np.array([0.6], dtype=np.float64),
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+        spacing="linear",
+    )
+
+    assert np.allclose(
+        support.detach().cpu().numpy(),
+        np.array([[0.0, 0.2, 0.4, 0.6]], dtype=np.float64),
+    )
+
+
+def test_support_scale_expands_probability_support_upper_bound() -> None:
+    batch = ObservationBatch(
+        gene_names=["g1", "g2"],
+        counts=np.array([[0.0, 0.0]], dtype=np.float64),
+        reference_counts=np.array([1.0], dtype=np.float64),
+    )
+
+    support = fit_module._build_support(
+        batch,
+        scale=1.0,
+        config=PriorFitConfig(
+            n_support_points=4,
+            support_scale=1.5,
+            likelihood="binomial",
+        ),
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+        support_max=np.array([0.6, 0.8], dtype=np.float64),
+    )
+
+    assert np.allclose(
+        support.detach().cpu().numpy(),
+        np.array(
+            [
+                [0.0, 0.3, 0.6, 0.9],
+                [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0],
+            ],
+            dtype=np.float64,
+        ),
+    )
+
+
+def test_adaptive_refine_support_keeps_zero_and_scales_upper_bound() -> None:
+    support = torch.as_tensor(
+        [[0.0, 0.15, 0.3, 0.45, 0.6]],
+        dtype=torch.float64,
+    )
+    probabilities = np.array([[0.6, 0.2, 0.1, 0.1, 0.0]], dtype=np.float64)
+
+    refined = fit_module._adaptive_refine_support(
+        support,
+        probabilities,
+        config=PriorFitConfig(
+            use_adaptive_support=True,
+            adaptive_support_scale=2.0,
+            adaptive_support_quantile_hi=0.75,
+        ),
+        dtype=torch.float64,
+        device=torch.device("cpu"),
+    )
+
+    refined_np = refined.detach().cpu().numpy()
+    assert refined_np[0, 0] == 0.0
+    assert np.isclose(refined_np[0, -1], 0.3)
 
 
 def test_checkpoint_from_fit_result_sets_current_distribution_metadata() -> None:

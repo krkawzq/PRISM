@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "prism"
 version = "0.1.0"
@@ -8,6 +12,7 @@ dependencies = [
     "anndata>=0.12.10",
     "cell-gears>=0.1.2",
     "fastapi>=0.116.1",
+    "httpx>=0.28.1",
     "numba>=0.64.0",
     "numpy>=2.4.3",
     "pytest>=9.0.2",
@@ -22,6 +27,22 @@ dependencies = [
 
 [project.scripts]
 prism = "prism.cli.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["prism*"]
+exclude = ["tests*"]
+
+[tool.setuptools.package-data]
+"prism.server" = [
+    "assets/*",
+    "frontend/dist/*.html",
+    "frontend/dist/assets/*",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["src/tests"]

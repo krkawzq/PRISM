@@ -10,6 +10,10 @@ from prism.model.constants import DTYPE_NP, EPS, SupportDomain
 SupportAxis = Literal["raw", "scaled"]
 RefitPruningMetric = Literal["weight", "peak_mass"]
 RefitErrorMetric = Literal["jsd", "l1", "cross_entropy"]
+FrontierUpdateStrategy = Literal["full_stage", "best_prefix", "single_step"]
+CandidateAlphaStrategy = Literal["min_ratio", "least_squares"]
+KSelectionMode = Literal["threshold_first", "marginal_gain", "penalized_error"]
+TruncationMode = Literal["free", "fixed_bounds"]
 
 
 def _as_vector(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
@@ -115,11 +119,15 @@ class GMMSearchConfig:
     residual_peak_threshold: float = 1e-4
     merge_tolerance: float = 1e-12
     peak_min_value: float = 0.0
+    peak_plateau_tolerance: float = 1e-12
     include_boundary_peaks: bool = True
     peak_limit_per_stage: int | None = None
     candidate_window_count: int = 6
     candidate_sigma_count: int = 8
     candidate_weight_slack: float = 0.98
+    candidate_alpha_strategy: CandidateAlphaStrategy = "least_squares"
+    candidate_alpha_cap_quantile: float = 0.1
+    candidate_rerank_top_n: int | None = 4
     min_component_mass: float = 1e-4
     mass_floor: float = 1e-8
     min_sigma_factor: float = 0.5
@@ -131,6 +139,12 @@ class GMMSearchConfig:
     single_point_rate_half_width_floor: float = 1.0
     support_match_atol: float = 1e-9
     support_match_rtol: float = 1e-9
+    selection_metric: RefitErrorMetric = "jsd"
+    frontier_update_strategy: FrontierUpdateStrategy = "best_prefix"
+    k_selection_mode: KSelectionMode = "threshold_first"
+    k_min_improvement: float = 1e-4
+    k_min_improvement_patience: int = 2
+    k_penalty_weight: float = 0.0
     search_refit_enabled: bool = True
     search_refit_max_iterations: int = 25
     search_refit_min_iterations_first_component: int = 100
@@ -146,6 +160,8 @@ class GMMSearchConfig:
     search_refit_optimize_right_truncations: bool = True
     search_refit_sigma_floor_fraction: float = 0.25
     search_refit_min_window_fraction: float = 1e-6
+    search_refit_truncation_mode: TruncationMode = "free"
+    search_refit_truncation_regularization_strength: float = 0.0
     search_refit_initial_weight_logit_floor: float = -12.0
     search_refit_inactive_weight_floor: float = 1e-12
     search_refit_masked_logit_value: float = -1e9
@@ -165,6 +181,8 @@ class GMMSearchConfig:
             raise ValueError("merge_tolerance must be >= 0")
         if self.peak_min_value < 0:
             raise ValueError("peak_min_value must be >= 0")
+        if self.peak_plateau_tolerance < 0:
+            raise ValueError("peak_plateau_tolerance must be >= 0")
         if self.peak_limit_per_stage is not None and self.peak_limit_per_stage < 1:
             raise ValueError("peak_limit_per_stage must be >= 1 when provided")
         if self.candidate_window_count < 1:
@@ -173,6 +191,14 @@ class GMMSearchConfig:
             raise ValueError("candidate_sigma_count must be >= 1")
         if not (0.0 < self.candidate_weight_slack <= 1.0):
             raise ValueError("candidate_weight_slack must be in (0, 1]")
+        if self.candidate_alpha_strategy not in {"min_ratio", "least_squares"}:
+            raise ValueError(
+                f"unsupported candidate_alpha_strategy: {self.candidate_alpha_strategy}"
+            )
+        if not (0.0 <= self.candidate_alpha_cap_quantile <= 1.0):
+            raise ValueError("candidate_alpha_cap_quantile must be in [0, 1]")
+        if self.candidate_rerank_top_n is not None and self.candidate_rerank_top_n < 1:
+            raise ValueError("candidate_rerank_top_n must be >= 1 when provided")
         if self.min_component_mass < 0:
             raise ValueError("min_component_mass must be >= 0")
         if self.mass_floor <= 0:
@@ -195,6 +221,20 @@ class GMMSearchConfig:
             raise ValueError("support_match_atol must be >= 0")
         if self.support_match_rtol < 0:
             raise ValueError("support_match_rtol must be >= 0")
+        if self.selection_metric not in {"jsd", "l1", "cross_entropy"}:
+            raise ValueError(f"unsupported selection_metric: {self.selection_metric}")
+        if self.frontier_update_strategy not in {"full_stage", "best_prefix", "single_step"}:
+            raise ValueError(
+                f"unsupported frontier_update_strategy: {self.frontier_update_strategy}"
+            )
+        if self.k_selection_mode not in {"threshold_first", "marginal_gain", "penalized_error"}:
+            raise ValueError(f"unsupported k_selection_mode: {self.k_selection_mode}")
+        if self.k_min_improvement < 0:
+            raise ValueError("k_min_improvement must be >= 0")
+        if self.k_min_improvement_patience < 1:
+            raise ValueError("k_min_improvement_patience must be >= 1")
+        if self.k_penalty_weight < 0:
+            raise ValueError("k_penalty_weight must be >= 0")
         if self.search_refit_max_iterations < 0:
             raise ValueError("search_refit_max_iterations must be >= 0")
         if self.search_refit_min_iterations_first_component < 0:
@@ -213,6 +253,14 @@ class GMMSearchConfig:
             raise ValueError("search_refit_sigma_floor_fraction must be > 0")
         if self.search_refit_min_window_fraction <= 0:
             raise ValueError("search_refit_min_window_fraction must be > 0")
+        if self.search_refit_truncation_mode not in {"free", "fixed_bounds"}:
+            raise ValueError(
+                f"unsupported search_refit_truncation_mode: {self.search_refit_truncation_mode}"
+            )
+        if self.search_refit_truncation_regularization_strength < 0:
+            raise ValueError(
+                "search_refit_truncation_regularization_strength must be >= 0"
+            )
         if self.search_refit_inactive_weight_floor <= 0:
             raise ValueError("search_refit_inactive_weight_floor must be > 0")
         if (
@@ -241,11 +289,18 @@ class GMMTrainingConfig:
     optimize_right_truncations: bool = True
     sigma_floor_fraction: float = 0.25
     min_window_fraction: float = 1e-6
+    truncation_mode: TruncationMode = "free"
+    truncation_regularization_strength: float = 0.0
     initial_weight_logit_floor: float = -12.0
     inactive_weight_floor: float = 1e-12
     masked_logit_value: float = -1e9
     logit_clip: float = 1e-6
     inverse_softplus_clip: float = 1e-8
+    multi_start_count: int = 1
+    multi_start_trigger_threshold: float = float("inf")
+    multi_start_jitter_scale: float = 0.1
+    multi_start_metric: RefitErrorMetric = "jsd"
+    multi_start_seed: int = 0
     pruning_enabled: bool = False
     pruning_error_metric: RefitErrorMetric = "jsd"
     pruning_error_threshold: float = 1e-3
@@ -272,12 +327,26 @@ class GMMTrainingConfig:
             raise ValueError("sigma_floor_fraction must be > 0")
         if self.min_window_fraction <= 0:
             raise ValueError("min_window_fraction must be > 0")
+        if self.truncation_mode not in {"free", "fixed_bounds"}:
+            raise ValueError(f"unsupported truncation_mode: {self.truncation_mode}")
+        if self.truncation_regularization_strength < 0:
+            raise ValueError("truncation_regularization_strength must be >= 0")
         if self.inactive_weight_floor <= 0:
             raise ValueError("inactive_weight_floor must be > 0")
         if self.logit_clip <= 0 or self.logit_clip >= 0.5:
             raise ValueError("logit_clip must be in (0, 0.5)")
         if self.inverse_softplus_clip <= 0:
             raise ValueError("inverse_softplus_clip must be > 0")
+        if self.multi_start_count < 1:
+            raise ValueError("multi_start_count must be >= 1")
+        if self.multi_start_trigger_threshold < 0:
+            raise ValueError("multi_start_trigger_threshold must be >= 0")
+        if self.multi_start_jitter_scale < 0:
+            raise ValueError("multi_start_jitter_scale must be >= 0")
+        if self.multi_start_metric not in {"jsd", "l1", "cross_entropy"}:
+            raise ValueError(f"unsupported multi_start_metric: {self.multi_start_metric}")
+        if self.multi_start_seed < 0:
+            raise ValueError("multi_start_seed must be >= 0")
         if self.pruning_error_threshold < 0:
             raise ValueError("pruning_error_threshold must be >= 0")
         if self.pruning_max_refits < 0:
@@ -749,12 +818,16 @@ class PriorGMMReport:
 __all__ = [
     "DistributionGMMReport",
     "DistributionGMMSearch",
+    "FrontierUpdateStrategy",
     "GaussianComponent",
     "GaussianMixtureDistribution",
     "GMMSearchConfig",
     "GMMTrainingConfig",
+    "CandidateAlphaStrategy",
+    "KSelectionMode",
     "PriorGMMReport",
     "RefitErrorMetric",
     "RefitPruningMetric",
     "SupportAxis",
+    "TruncationMode",
 ]

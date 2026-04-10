@@ -86,24 +86,53 @@ def test_handler_parse_helpers_cover_clamping_and_modes() -> None:
     assert _parse_optional_float("") is None
 
 
-def test_parse_fit_params_defaults_adaptive_fraction_to_one() -> None:
+def test_parse_fit_params_defaults_support_scales() -> None:
     request = Request.from_raw_path("GET", "/gene")
 
     params = _parse_fit_params(request)
 
-    assert params.adaptive_support_fraction == 1.0
+    assert params.support_scale == 1.5
+    assert params.adaptive_support_scale == 1.5
 
 
-def test_handle_home_renders_loaded_and_unloaded_states(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_home_renders_loaded_and_unloaded_states(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     unloaded = AppState(ServerConfig())
     response = handle_home(Request.from_raw_path("GET", "/"), unloaded)
     assert response.status == 200
     assert b"Welcome" in response.body
 
     loaded = _state_with_loaded()
-    monkeypatch.setattr("prism.server.handlers.build_dataset_summary", lambda _state: {"n_cells": 10, "n_genes": 2, "layer": "counts", "h5ad_path": "/tmp/data.h5ad", "label_keys": ("condition",), "total_count_mean": 2.5, "total_count_median": 2.0, "total_count_p99": 4.0})
-    monkeypatch.setattr("prism.server.handlers.build_checkpoint_summary", lambda _state: None)
-    monkeypatch.setattr("prism.server.handlers.browse_gene_candidates", lambda *args, **kwargs: SimpleNamespace(query="", scope="all", sort_by="total_count", descending=True, page=1, total_pages=1, total_items=1, items=[_Candidate()]))
+    monkeypatch.setattr(
+        "prism.server.handlers.build_dataset_summary",
+        lambda _state: {
+            "n_cells": 10,
+            "n_genes": 2,
+            "layer": "counts",
+            "h5ad_path": "/tmp/data.h5ad",
+            "label_keys": ("condition",),
+            "total_count_mean": 2.5,
+            "total_count_median": 2.0,
+            "total_count_p99": 4.0,
+        },
+    )
+    monkeypatch.setattr(
+        "prism.server.handlers.build_checkpoint_summary", lambda _state: None
+    )
+    monkeypatch.setattr(
+        "prism.server.handlers.browse_gene_candidates",
+        lambda *args, **kwargs: SimpleNamespace(
+            query="",
+            scope="all",
+            sort_by="total_count",
+            descending=True,
+            page=1,
+            total_pages=1,
+            total_items=1,
+            items=[_Candidate()],
+        ),
+    )
     response = handle_home(Request.from_raw_path("GET", "/?browse_q=gene"), loaded)
     assert response.status == 200
     assert b"Dataset Snapshot" in response.body
@@ -114,14 +143,24 @@ def test_handle_health_and_search_json(monkeypatch: pytest.MonkeyPatch) -> None:
     state = _state_with_loaded()
     health = handle_health(Request.from_raw_path("GET", "/api/health"), state)
     assert b'"loaded":true' in health.body
-    monkeypatch.setattr("prism.server.handlers.search_gene_candidates", lambda *_args, **_kwargs: [_Candidate()])
+    monkeypatch.setattr(
+        "prism.server.handlers.search_gene_candidates",
+        lambda *_args, **_kwargs: [_Candidate()],
+    )
     search = handle_search(Request.from_raw_path("GET", "/api/search?q=Gene"), state)
     assert b'"gene_name":"GeneA"' in search.body
 
 
-def test_handle_gene_redirects_and_falls_back_to_raw(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_gene_redirects_and_falls_back_to_raw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     unloaded = AppState(ServerConfig())
-    assert handle_gene(Request.from_raw_path("GET", "/gene?q=GeneA"), unloaded).headers["Location"] == "/"
+    assert (
+        handle_gene(Request.from_raw_path("GET", "/gene?q=GeneA"), unloaded).headers[
+            "Location"
+        ]
+        == "/"
+    )
 
     state = _state_with_loaded()
     analysis = SimpleNamespace(
@@ -159,10 +198,20 @@ def test_handle_gene_redirects_and_falls_back_to_raw(monkeypatch: pytest.MonkeyP
         assert kwargs["mode"] == "raw"
         return analysis
 
-    monkeypatch.setattr("prism.server.handlers.build_gene_analysis", fake_build_gene_analysis)
-    monkeypatch.setattr("prism.server.handlers._cached_figure", lambda *_args, **_kwargs: "data:image/png;base64,abc")
-    monkeypatch.setattr("prism.server.handlers.render_gene_page", lambda **kwargs: kwargs["error_message"] or "ok")
-    response = handle_gene(Request.from_raw_path("GET", "/gene?q=GeneA&mode=checkpoint"), state)
+    monkeypatch.setattr(
+        "prism.server.handlers.build_gene_analysis", fake_build_gene_analysis
+    )
+    monkeypatch.setattr(
+        "prism.server.handlers._cached_figure",
+        lambda *_args, **_kwargs: "data:image/png;base64,abc",
+    )
+    monkeypatch.setattr(
+        "prism.server.handlers.render_gene_page",
+        lambda **kwargs: kwargs["error_message"] or "ok",
+    )
+    response = handle_gene(
+        Request.from_raw_path("GET", "/gene?q=GeneA&mode=checkpoint"), state
+    )
     assert response.status == 400
     assert b"boom" in response.body
     assert calls["count"] == 2

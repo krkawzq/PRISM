@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/10xgenomics/../.." && pwd)"
 
 usage() {
     cat <<'EOF'
@@ -51,17 +51,17 @@ run_step() {
 cd "$REPO_ROOT"
 
 run_step "10x introns" \
-    "$SCRIPT_DIR/prepare_10xgenomics_pbmc_10k_introns.py" \
+    "$SCRIPT_DIR/10xgenomics/prepare_10xgenomics_pbmc_10k_introns.py" \
     "$@"
 run_step "10x anticoagulants" \
-    "$SCRIPT_DIR/prepare_10xgenomics_anticoagulants.py" \
+    "$SCRIPT_DIR/10xgenomics/prepare_10xgenomics_anticoagulants.py" \
     "$@"
 run_step "10x platforms" \
-    "$SCRIPT_DIR/prepare_10xgenomics_platforms.py" \
+    "$SCRIPT_DIR/10xgenomics/prepare_10xgenomics_platforms.py" \
     "$@"
 run_step "10x cell gradients" \
-    "$SCRIPT_DIR/prepare_10xgenomics_cell_gradients.py" \
+    "$SCRIPT_DIR/10xgenomics/prepare_10xgenomics_cell_gradients.py" \
     "$@"
 run_step "10x tissues" \
-    "$SCRIPT_DIR/prepare_10xgenomics_tissues.py" \
+    "$SCRIPT_DIR/10xgenomics/prepare_10xgenomics_tissues.py" \
     "$@"

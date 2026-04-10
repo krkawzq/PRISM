@@ -60,7 +60,11 @@ def _resolve_checkpoint_name_values(
     resolved = unwrap_typer_value(value)
     if resolved is None:
         return None
-    return [str(item).strip() for item in cast(list[str], resolved)]
+    names: list[str] = []
+    for item in cast(list[str], resolved):
+        parts = [part.strip() for part in str(item).split(",")]
+        names.extend(part for part in parts if part)
+    return names
 
 
 def _normalize_missing_policy(value: str) -> str:
@@ -288,7 +292,9 @@ def plot_priors_command(
     if annot_csv_resolved:
         if resolved_layout != "facet":
             raise ValueError("--annot-csv is only supported with --layout facet")
-        annotation_tables = load_annotation_tables(annot_csv_resolved, annot_names_resolved)
+        annotation_tables = load_annotation_tables(
+            annot_csv_resolved, annot_names_resolved
+        )
 
     checkpoint_specs = _resolve_checkpoint_specs(
         checkpoint_paths,
@@ -302,12 +308,16 @@ def plot_priors_command(
         missing_policy=missing_policy,
     )
     resolved_x_axis = _resolve_x_axis_auto(curve_sets, x_axis=x_axis)
-    overlay_panel_width = 8.2 if panel_width is None or panel_width <= 0 else panel_width
+    overlay_panel_width = (
+        8.2 if panel_width is None or panel_width <= 0 else panel_width
+    )
     overlay_panel_height = (
         4.8 if panel_height is None or panel_height <= 0 else panel_height
     )
     facet_panel_width = 4.6 if panel_width is None or panel_width <= 0 else panel_width
-    facet_panel_height = 3.2 if panel_height is None or panel_height <= 0 else panel_height
+    facet_panel_height = (
+        3.2 if panel_height is None or panel_height <= 0 else panel_height
+    )
 
     fig = (
         plot_prior_facet_figure(

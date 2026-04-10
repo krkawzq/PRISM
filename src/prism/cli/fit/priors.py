@@ -111,8 +111,9 @@ def _build_fit_config(
     cell_chunk_size: int,
     support_max_from: str,
     support_spacing: str,
+    support_scale: float,
     use_adaptive_support: bool,
-    adaptive_support_fraction: float,
+    adaptive_support_scale: float,
     adaptive_support_quantile_hi: float,
     likelihood: str,
     nb_overdispersion: float,
@@ -124,8 +125,9 @@ def _build_fit_config(
         cell_chunk_size=cell_chunk_size,
         support_max_from=cast(Any, _normalize_support_max_from(support_max_from)),
         support_spacing=cast(Any, _normalize_support_spacing(support_spacing)),
+        support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
-        adaptive_support_fraction=adaptive_support_fraction,
+        adaptive_support_scale=adaptive_support_scale,
         adaptive_support_quantile_hi=adaptive_support_quantile_hi,
         likelihood=cast(Any, _normalize_likelihood(likelihood)),
         nb_overdispersion=nb_overdispersion,
@@ -253,14 +255,18 @@ def fit_priors_command(
     support_spacing: str = typer.Option(
         "linear", help="Support spacing: linear or sqrt."
     ),
+    support_scale: float = typer.Option(
+        1.5,
+        min=1.0,
+        help="Expansion factor applied to the first-pass support max.",
+    ),
     use_adaptive_support: bool = typer.Option(
         False, help="Enable two-phase adaptive support refinement."
     ),
-    adaptive_support_fraction: float = typer.Option(
-        1.0,
-        min=0.01,
-        max=1.0,
-        help="Fraction of the original support range kept in adaptive refinement.",
+    adaptive_support_scale: float = typer.Option(
+        1.5,
+        min=1.0,
+        help="Expansion factor applied to the adaptive support range [0, q_hi].",
     ),
     adaptive_support_quantile_hi: float = typer.Option(
         0.99,
@@ -313,8 +319,9 @@ def fit_priors_command(
     torch_dtype = _normalize_torch_dtype(resolve_str(torch_dtype))
     support_max_from = resolve_str(support_max_from)
     support_spacing = resolve_str(support_spacing)
+    support_scale = resolve_float(support_scale)
     use_adaptive_support = resolve_bool(use_adaptive_support)
-    adaptive_support_fraction = resolve_float(adaptive_support_fraction)
+    adaptive_support_scale = resolve_float(adaptive_support_scale)
     adaptive_support_quantile_hi = resolve_float(adaptive_support_quantile_hi)
     likelihood = resolve_str(likelihood)
     nb_overdispersion = resolve_float(nb_overdispersion)
@@ -330,8 +337,9 @@ def fit_priors_command(
         cell_chunk_size=cell_chunk_size,
         support_max_from=support_max_from,
         support_spacing=support_spacing,
+        support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
-        adaptive_support_fraction=adaptive_support_fraction,
+        adaptive_support_scale=adaptive_support_scale,
         adaptive_support_quantile_hi=adaptive_support_quantile_hi,
         likelihood=likelihood,
         nb_overdispersion=nb_overdispersion,
@@ -419,8 +427,9 @@ def fit_priors_command(
         cell_chunk_size=cell_chunk_size,
         support_max_from=support_max_from,
         support_spacing=support_spacing,
+        support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
-        adaptive_support_fraction=adaptive_support_fraction,
+        adaptive_support_scale=adaptive_support_scale,
         adaptive_support_quantile_hi=adaptive_support_quantile_hi,
         likelihood=fit_config.likelihood,
         nb_overdispersion=nb_overdispersion,

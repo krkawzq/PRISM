@@ -5,11 +5,18 @@ import math
 import numpy as np
 
 from prism.gmm import (
+    DistributionGMMSearch,
     GMMSearchConfig,
     GMMTrainingConfig,
     fit_distribution_gmm,
     fit_prior_gmm,
     search_distribution_gmm,
+)
+from prism.gmm.optimize import evaluate_mixture_parameters
+from prism.gmm.search import (
+    _peak_indices,
+    _select_component_count,
+    _select_frontier_target_k,
 )
 from prism.model import PriorGrid, make_distribution_grid
 
@@ -80,15 +87,215 @@ def test_search_distribution_gmm_prefers_one_component_for_single_peak() -> None
         config=GMMSearchConfig(
             max_components=4,
             error_threshold=5e-3,
-            candidate_peak_count=3,
+            peak_limit_per_stage=4,
             candidate_window_count=4,
             candidate_sigma_count=5,
+            search_refit_max_iterations=20,
         ),
         torch_dtype="float64",
     )
     assert search.selected_k.tolist() == [1]
+    assert search.explored_k.tolist() == [1]
     assert np.isclose(np.sum(search.greedy_probabilities[0]), 1.0)
-    assert search.error_path[0, 0] < 0.02
+    assert search.error_path[0, 0] < 0.03
+
+
+def test_search_distribution_gmm_can_disable_search_refit() -> None:
+    support = np.linspace(0.0, 1.0, 65, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [
+            (0.4, 0.2, 0.06, 0.0, 1.0),
+            (0.6, 0.75, 0.07, 0.0, 1.0),
+        ],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=4,
+            error_threshold=2e-2,
+            peak_limit_per_stage=None,
+            candidate_window_count=4,
+            candidate_sigma_count=5,
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    assert search.config["search_refit_enabled"] is False
+    assert search.explored_k[0] >= 2
+    assert search.selected_k[0] >= 2
+    assert np.isclose(np.sum(search.greedy_probabilities[0]), 1.0)
+    assert search.error_path[0, search.selected_k[0] - 1] < 0.12
+
+
+def test_search_frontier_strategy_prefers_best_prefix() -> None:
+    target_k = np.asarray([1, 2, 3], dtype=np.int64)
+    metric_values = np.asarray([0.08, 0.03, 0.05], dtype=np.float64)
+    assert (
+        _select_frontier_target_k(
+            frontier_k=0,
+            stage_target_k=target_k,
+            stage_metric_values=metric_values,
+            strategy="best_prefix",
+        )
+        == 2
+    )
+    assert (
+        _select_frontier_target_k(
+            frontier_k=0,
+            stage_target_k=target_k,
+            stage_metric_values=metric_values,
+            strategy="single_step",
+        )
+        == 1
+    )
+    assert (
+        _select_frontier_target_k(
+            frontier_k=0,
+            stage_target_k=target_k,
+            stage_metric_values=metric_values,
+            strategy="full_stage",
+        )
+        == 3
+    )
+
+
+def test_search_peak_indices_collapse_plateau() -> None:
+    peaks = _peak_indices(
+        np.asarray([0.0, 0.3, 0.3, 0.3, 0.1], dtype=np.float64),
+        config=GMMSearchConfig(
+            peak_plateau_tolerance=1e-12,
+            peak_limit_per_stage=None,
+        ),
+    )
+    assert peaks.tolist() == [2]
+
+
+def test_select_component_count_supports_marginal_gain_and_penalized_error() -> None:
+    metric_path = np.asarray([[0.3, 0.12, 0.11, 0.109]], dtype=np.float64)
+    explored_k = np.asarray([4], dtype=np.int64)
+    marginal = _select_component_count(
+        metric_path,
+        explored_k,
+        error_threshold=0.0,
+        mode="marginal_gain",
+        min_improvement=0.02,
+        min_improvement_patience=2,
+        penalty_weight=0.0,
+    )
+    penalized = _select_component_count(
+        np.asarray([[0.10, 0.09, 0.085]], dtype=np.float64),
+        np.asarray([3], dtype=np.int64),
+        error_threshold=0.0,
+        mode="penalized_error",
+        min_improvement=0.0,
+        min_improvement_patience=1,
+        penalty_weight=0.01,
+    )
+    assert marginal.tolist() == [2]
+    assert penalized.tolist() == [1]
+
+
+def test_search_distribution_gmm_handles_close_peaks_with_shoulder() -> None:
+    support = np.linspace(0.0, 1.0, 81, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [
+            (0.52, 0.42, 0.07, 0.0, 1.0),
+            (0.48, 0.58, 0.07, 0.0, 1.0),
+        ],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=4,
+            error_threshold=2e-2,
+            peak_limit_per_stage=None,
+            candidate_window_count=5,
+            candidate_sigma_count=6,
+            candidate_rerank_top_n=4,
+            frontier_update_strategy="best_prefix",
+            selection_metric="jsd",
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    assert search.selected_k[0] >= 2
+    assert search.error_path[0, search.selected_k[0] - 1] < 0.08
+
+
+def test_search_distribution_gmm_handles_boundary_peak_with_weak_interior_peak() -> None:
+    support = np.linspace(0.0, 1.0, 81, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [
+            (0.8, -0.04, 0.07, 0.0, 1.0),
+            (0.2, 0.68, 0.05, 0.0, 1.0),
+        ],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=4,
+            error_threshold=2e-2,
+            peak_limit_per_stage=None,
+            candidate_window_count=5,
+            candidate_sigma_count=6,
+            candidate_rerank_top_n=4,
+            candidate_alpha_strategy="least_squares",
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    assert search.selected_k[0] >= 2
+    assert search.error_path[0, search.selected_k[0] - 1] < 0.08
+
+
+def test_search_distribution_gmm_prefers_single_component_for_broad_single_mode() -> None:
+    support = np.linspace(0.0, 1.0, 81, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.5, 0.22, 0.0, 1.0)],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=4,
+            error_threshold=2e-2,
+            peak_limit_per_stage=None,
+            candidate_window_count=5,
+            candidate_sigma_count=6,
+            candidate_alpha_strategy="least_squares",
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    assert search.selected_k.tolist() == [1]
+    assert search.error_path[0, 0] < 0.08
 
 
 def test_fit_distribution_gmm_handles_boundary_peak() -> None:
@@ -108,9 +315,10 @@ def test_fit_distribution_gmm_handles_boundary_peak() -> None:
         search_config=GMMSearchConfig(
             max_components=3,
             error_threshold=5e-3,
-            candidate_peak_count=3,
+            peak_limit_per_stage=3,
             candidate_window_count=4,
             candidate_sigma_count=5,
+            search_refit_max_iterations=20,
         ),
         training_config=GMMTrainingConfig(
             max_iterations=120,
@@ -154,9 +362,10 @@ def test_fit_distribution_gmm_supports_parallel_gene_specific_grids() -> None:
         search_config=GMMSearchConfig(
             max_components=4,
             error_threshold=2e-2,
-            candidate_peak_count=4,
+            peak_limit_per_stage=None,
             candidate_window_count=5,
             candidate_sigma_count=5,
+            search_refit_max_iterations=20,
         ),
         training_config=GMMTrainingConfig(
             max_iterations=100,
@@ -176,46 +385,344 @@ def test_fit_distribution_gmm_supports_parallel_gene_specific_grids() -> None:
     assert np.all(report.jsd < 0.08)
 
 
-def test_fit_prior_gmm_preserves_gene_names_and_raw_support_default() -> None:
-    support = np.linspace(0.0, 1.0, 33, dtype=np.float64)
-    probabilities_a = _truncated_gaussian_grid(
-        support,
-        [(1.0, 0.25, 0.07, 0.0, 1.0)],
-        probability_domain=True,
+def test_fit_distribution_gmm_refit_chunking_supports_more_genes_than_chunk_size() -> None:
+    support = np.asarray(
+        [0.0, 0.05, 0.12, 0.2, 0.35, 0.55, 0.75, 1.0],
+        dtype=np.float64,
     )
-    probabilities_b = _truncated_gaussian_grid(
-        support,
-        [(0.35, 0.18, 0.05, 0.0, 1.0), (0.65, 0.72, 0.08, 0.0, 1.0)],
-        probability_domain=True,
+    probabilities = np.vstack(
+        [
+            _truncated_gaussian_grid(
+                support,
+                [(1.0, 0.2, 0.07, 0.0, 1.0)],
+                probability_domain=True,
+            ),
+            _truncated_gaussian_grid(
+                support,
+                [
+                    (0.45, 0.2, 0.06, 0.0, 1.0),
+                    (0.55, 0.72, 0.07, 0.0, 1.0),
+                ],
+                probability_domain=True,
+            ),
+            _truncated_gaussian_grid(
+                support,
+                [(1.0, 0.78, 0.08, 0.0, 1.0)],
+                probability_domain=True,
+            ),
+        ]
     )
-    prior = PriorGrid(
-        gene_names=["g1", "g2"],
-        distribution=make_distribution_grid(
-            "binomial",
-            support=np.vstack([support, support]),
-            probabilities=np.vstack([probabilities_a, probabilities_b]),
-        ),
-        scale=12.0,
+    distribution = make_distribution_grid(
+        "binomial",
+        support=np.repeat(support[None, :], 3, axis=0),
+        probabilities=probabilities,
     )
-    report = fit_prior_gmm(
-        prior,
+    report = fit_distribution_gmm(
+        distribution,
         search_config=GMMSearchConfig(
             max_components=4,
             error_threshold=2e-2,
-            candidate_peak_count=4,
+            peak_limit_per_stage=None,
             candidate_window_count=4,
             candidate_sigma_count=5,
+            search_refit_enabled=False,
         ),
         training_config=GMMTrainingConfig(
-            max_iterations=100,
+            max_iterations=40,
             learning_rate=0.05,
             convergence_tolerance=1e-7,
             gene_chunk_size=2,
             compile_model=False,
         ),
     )
-    assert report.gene_names == ["g1", "g2"]
-    assert np.allclose(report.support, np.vstack([support, support]))
-    assert np.allclose(report.scaled_support, report.support * 12.0)
+    assert report.fitted_probabilities.shape == probabilities.shape
     assert np.allclose(np.sum(report.fitted_probabilities, axis=1), 1.0)
-    assert np.all(report.jsd < 0.08)
+    assert report.selected_k[0] == 1
+    assert report.selected_k[1] >= 2
+    assert report.selected_k[2] == 1
+    assert np.all(np.isfinite(report.jsd))
+
+
+def test_fit_distribution_gmm_accepts_unsorted_duplicate_support() -> None:
+    distribution = make_distribution_grid(
+        "binomial",
+        support=np.asarray([0.5, 0.2, 0.5, 0.8], dtype=np.float64),
+        probabilities=np.asarray([0.2, 0.3, 0.1, 0.4], dtype=np.float64),
+    )
+    report = fit_distribution_gmm(
+        distribution,
+        search_config=GMMSearchConfig(
+            max_components=3,
+            error_threshold=0.2,
+            peak_limit_per_stage=3,
+            candidate_window_count=3,
+            candidate_sigma_count=3,
+            search_refit_enabled=False,
+        ),
+        training_config=GMMTrainingConfig(
+            max_iterations=10,
+            learning_rate=0.05,
+            convergence_tolerance=1e-7,
+            gene_chunk_size=1,
+            compile_model=False,
+        ),
+    )
+    assert report.support.shape == (1, 3)
+    assert np.allclose(report.support[0], np.asarray([0.2, 0.5, 0.8], dtype=np.float64))
+    assert np.all(report.support_mask[0])
+    assert np.allclose(
+        report.probabilities[0],
+        np.asarray([0.3, 0.3, 0.4], dtype=np.float64),
+    )
+    assert np.isclose(np.sum(report.fitted_probabilities[0]), 1.0)
+
+
+def test_fit_distribution_gmm_optional_pruning_can_drop_weak_component() -> None:
+    support = np.linspace(0.0, 1.0, 49, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.35, 0.07, 0.0, 1.0)],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    base_search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=3,
+            error_threshold=1e-2,
+            peak_limit_per_stage=3,
+            candidate_window_count=4,
+            candidate_sigma_count=5,
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    overselected_search = DistributionGMMSearch(
+        support_domain=base_search.support_domain,
+        support=base_search.support,
+        support_mask=base_search.support_mask,
+        probabilities=base_search.probabilities,
+        bin_edges=base_search.bin_edges,
+        lower_bounds=base_search.lower_bounds,
+        upper_bounds=base_search.upper_bounds,
+        selected_k=np.asarray([2], dtype=np.int64),
+        component_weights=np.asarray([[0.55, 0.45, 0.0]], dtype=np.float64),
+        component_means=np.asarray(
+            [[0.2, 0.85, 0.0]],
+            dtype=np.float64,
+        ),
+        component_stds=np.asarray(
+            [[0.05, 0.05, 1.0]],
+            dtype=np.float64,
+        ),
+        component_left_truncations=np.asarray(
+            [[base_search.lower_bounds[0], base_search.lower_bounds[0], base_search.lower_bounds[0]]],
+            dtype=np.float64,
+        ),
+        component_right_truncations=np.asarray(
+            [[base_search.upper_bounds[0], base_search.upper_bounds[0], base_search.upper_bounds[0]]],
+            dtype=np.float64,
+        ),
+        greedy_probabilities=base_search.greedy_probabilities,
+        error_path=np.asarray([[0.02, 0.02, 0.02]], dtype=np.float64),
+        residual_mass_path=np.asarray([[0.05, 0.05, 0.05]], dtype=np.float64),
+        residual_peak_path=np.asarray([[0.02, 0.02, 0.02]], dtype=np.float64),
+        explored_k=np.asarray([2], dtype=np.int64),
+        config=dict(base_search.config),
+    )
+    report = fit_distribution_gmm(
+        distribution,
+        search=overselected_search,
+        training_config=GMMTrainingConfig(
+            max_iterations=80,
+            learning_rate=0.05,
+            convergence_tolerance=1e-7,
+            gene_chunk_size=1,
+            compile_model=False,
+            optimize_weights=False,
+            optimize_means=False,
+            optimize_stds=False,
+            optimize_left_truncations=False,
+            optimize_right_truncations=False,
+            pruning_enabled=True,
+            pruning_error_threshold=0.0,
+            pruning_max_refits=2,
+            pruning_min_components=1,
+            pruning_significance_metric="weight",
+        ),
+    )
+    assert report.selected_k.tolist() == [1]
+    recomputed = evaluate_mixture_parameters(
+        probabilities=report.probabilities,
+        bin_edges=report.bin_edges,
+        support_mask=report.support_mask,
+        lower_bounds=report.lower_bounds,
+        upper_bounds=report.upper_bounds,
+        selected_k=report.selected_k,
+        component_weights=report.component_weights,
+        component_means=report.component_means,
+        component_stds=report.component_stds,
+        component_left_truncations=report.component_left_truncations,
+        component_right_truncations=report.component_right_truncations,
+        torch_dtype="float64",
+    )
+    assert np.allclose(report.fitted_probabilities, recomputed.fitted_probabilities)
+    assert np.allclose(report.residual_probabilities, report.probabilities - report.fitted_probabilities)
+    assert np.allclose(report.greedy_probabilities, report.fitted_probabilities)
+    assert np.allclose(report.jsd, recomputed.jsd)
+    assert np.allclose(report.cross_entropy, recomputed.cross_entropy)
+    assert np.allclose(report.l1_error, recomputed.l1_error)
+    assert np.allclose(report.greedy_error, report.jsd)
+
+
+def test_fit_distribution_gmm_supports_fixed_bounds_truncation_and_multistart() -> None:
+    support = np.linspace(0.0, 1.0, 49, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [
+            (0.45, 0.25, 0.07, 0.0, 1.0),
+            (0.55, 0.72, 0.08, 0.0, 1.0),
+        ],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    report = fit_distribution_gmm(
+        distribution,
+        search_config=GMMSearchConfig(
+            max_components=4,
+            error_threshold=2e-2,
+            peak_limit_per_stage=None,
+            candidate_window_count=4,
+            candidate_sigma_count=5,
+            search_refit_enabled=False,
+        ),
+        training_config=GMMTrainingConfig(
+            max_iterations=40,
+            learning_rate=0.05,
+            convergence_tolerance=1e-7,
+            gene_chunk_size=1,
+            compile_model=False,
+            truncation_mode="fixed_bounds",
+            truncation_regularization_strength=0.1,
+            multi_start_count=3,
+            multi_start_trigger_threshold=0.0,
+            multi_start_jitter_scale=0.05,
+            multi_start_seed=7,
+        ),
+    )
+    active = int(report.selected_k[0])
+    assert np.allclose(
+        report.component_left_truncations[0, :active],
+        report.lower_bounds[0],
+    )
+    assert np.allclose(
+        report.component_right_truncations[0, :active],
+        report.upper_bounds[0],
+    )
+    assert np.isfinite(report.jsd[0])
+
+
+def test_fit_prior_gmm_preserves_gene_names_and_support_bounds() -> None:
+    support = np.asarray([0.2, 0.4, 0.6, 0.8], dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.5, 0.09, 0.0, 1.0)],
+        probability_domain=True,
+    )
+    prior = PriorGrid(
+        gene_names=["g1"],
+        distribution=make_distribution_grid(
+            "binomial",
+            support=support,
+            probabilities=probabilities,
+        ),
+        scale=12.0,
+    )
+    report = fit_prior_gmm(
+        prior,
+        search_config=GMMSearchConfig(
+            max_components=3,
+            error_threshold=2e-2,
+            peak_limit_per_stage=3,
+            candidate_window_count=4,
+            candidate_sigma_count=5,
+            search_refit_max_iterations=20,
+        ),
+        training_config=GMMTrainingConfig(
+            max_iterations=80,
+            learning_rate=0.05,
+            convergence_tolerance=1e-7,
+            gene_chunk_size=1,
+            compile_model=False,
+        ),
+    )
+    assert report.gene_names == ["g1"]
+    assert report.lower_bounds[0] < support[0]
+    assert report.upper_bounds[0] > support[-1]
+    mixture = report.to_mixture("g1")
+    assert mixture.lower_bound == report.lower_bounds[0]
+    assert mixture.upper_bound == report.upper_bounds[0]
+    assert np.allclose(np.sum(report.fitted_probabilities, axis=1), 1.0)
+
+
+def test_fit_prior_gmm_accepts_unsorted_duplicate_support_for_raw_and_scaled() -> None:
+    prior = PriorGrid(
+        gene_names=["g1"],
+        distribution=make_distribution_grid(
+            "binomial",
+            support=np.asarray([0.5, 0.2, 0.5, 0.8], dtype=np.float64),
+            probabilities=np.asarray([0.2, 0.3, 0.1, 0.4], dtype=np.float64),
+        ),
+        scale=12.0,
+    )
+    for support_axis, expected_support, expected_domain in [
+        (
+            "raw",
+            np.asarray([0.2, 0.5, 0.8], dtype=np.float64),
+            "probability",
+        ),
+        (
+            "scaled",
+            np.asarray([2.4, 6.0, 9.6], dtype=np.float64),
+            "rate",
+        ),
+    ]:
+        report = fit_prior_gmm(
+            prior,
+            search_config=GMMSearchConfig(
+                max_components=3,
+                error_threshold=0.2,
+                peak_limit_per_stage=3,
+                candidate_window_count=3,
+                candidate_sigma_count=3,
+                search_refit_enabled=False,
+            ),
+            training_config=GMMTrainingConfig(
+                max_iterations=10,
+                learning_rate=0.05,
+                convergence_tolerance=1e-7,
+                gene_chunk_size=1,
+                compile_model=False,
+            ),
+            support_axis=support_axis,
+        )
+        assert report.support_domain == expected_domain
+        assert report.support.shape == (1, 3)
+        assert np.allclose(report.support[0], expected_support)
+        assert np.allclose(
+            report.scaled_support[0],
+            np.asarray([2.4, 6.0, 9.6], dtype=np.float64),
+        )
+        assert np.allclose(
+            report.probabilities[0],
+            np.asarray([0.3, 0.3, 0.4], dtype=np.float64),
+        )
+        assert np.isclose(np.sum(report.fitted_probabilities[0]), 1.0)

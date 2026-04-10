@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Legacy minimal router kept for compatibility tests.
+
+The active runtime path is the FastAPI application in `prism.server.api`.
+"""
+
 import json
 from dataclasses import dataclass, field
 from http import HTTPStatus

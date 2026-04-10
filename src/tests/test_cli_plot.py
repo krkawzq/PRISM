@@ -9,8 +9,13 @@ import pandas as pd
 from prism.cli.plot.batch_grid import plot_batch_grid_command
 from prism.cli.plot.distributions import plot_distributions_command
 from prism.cli.plot.label_summary import plot_label_summary_command
-from prism.cli.plot.priors import plot_priors_command
-from prism.model import ModelCheckpoint, PriorGrid, make_distribution_grid, save_checkpoint
+from prism.cli.plot.priors import _resolve_checkpoint_name_values, plot_priors_command
+from prism.model import (
+    ModelCheckpoint,
+    PriorGrid,
+    make_distribution_grid,
+    save_checkpoint,
+)
 
 
 def _prior(
@@ -69,7 +74,9 @@ def _write_checkpoint(
     checkpoint: ModelCheckpoint | None = None,
 ) -> Path:
     checkpoint_path = tmp_path / name
-    save_checkpoint(_checkpoint() if checkpoint is None else checkpoint, checkpoint_path)
+    save_checkpoint(
+        _checkpoint() if checkpoint is None else checkpoint, checkpoint_path
+    )
     return checkpoint_path
 
 
@@ -192,6 +199,11 @@ def test_plot_priors_command_drop_missing_policy_skips_missing_label(
     exported = pd.read_csv(curve_csv)
     assert figure_path.exists()
     assert set(exported["checkpoint_name"]) == {"dataset-a"}
+
+
+def test_resolve_checkpoint_name_values_supports_comma_separated_input() -> None:
+    assert _resolve_checkpoint_name_values(["a,b,c"]) == ["a", "b", "c"]
+    assert _resolve_checkpoint_name_values(["a,b", "c"]) == ["a", "b", "c"]
 
 
 def test_plot_batch_grid_command_writes_gene_figures_and_csvs(tmp_path: Path) -> None:

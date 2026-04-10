@@ -14,19 +14,23 @@ from .types import ObservationBatch, PriorFitConfig, PriorFitResult, PriorGrid
 class PriorEngineSetting:
     support_max_from: Literal["observed_max", "quantile"] = "observed_max"
     support_spacing: Literal["linear", "sqrt"] = "linear"
+    support_scale: float = 1.5
     use_adaptive_support: bool = False
-    adaptive_support_fraction: float = 1.0
+    adaptive_support_scale: float = 1.5
     adaptive_support_quantile_hi: float = 0.99
     likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
     nb_overdispersion: float = 0.01
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "use_adaptive_support", bool(self.use_adaptive_support))
+        object.__setattr__(
+            self, "use_adaptive_support", bool(self.use_adaptive_support)
+        )
         PriorFitConfig(
             support_max_from=self.support_max_from,
             support_spacing=self.support_spacing,
+            support_scale=self.support_scale,
             use_adaptive_support=self.use_adaptive_support,
-            adaptive_support_fraction=self.adaptive_support_fraction,
+            adaptive_support_scale=self.adaptive_support_scale,
             adaptive_support_quantile_hi=self.adaptive_support_quantile_hi,
             likelihood=self.likelihood,
             nb_overdispersion=self.nb_overdispersion,
@@ -85,8 +89,9 @@ def _merge_config(
         cell_chunk_size=training_cfg.cell_chunk_size,
         support_max_from=setting.support_max_from,
         support_spacing=setting.support_spacing,
+        support_scale=setting.support_scale,
         use_adaptive_support=setting.use_adaptive_support,
-        adaptive_support_fraction=setting.adaptive_support_fraction,
+        adaptive_support_scale=setting.adaptive_support_scale,
         adaptive_support_quantile_hi=setting.adaptive_support_quantile_hi,
         likelihood=setting.likelihood,
         nb_overdispersion=setting.nb_overdispersion,
@@ -179,6 +184,7 @@ class PriorEngine:
         return self._prior is not None and set(self._prior.gene_names) == set(
             self.gene_names
         )
+
 
 __all__ = [
     "FitSummary",
