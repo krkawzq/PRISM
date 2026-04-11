@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .constants import DTYPE_NP, DistributionName, SupportDomain
+from .constants import DistributionName, SupportDomain
 
 
 def _require_unique_names(names: list[str], *, field_name: str) -> list[str]:
@@ -18,8 +18,21 @@ def _require_unique_names(names: list[str], *, field_name: str) -> list[str]:
     return resolved
 
 
+def _as_floating_array(
+    values: np.ndarray | list[float] | list[list[float]],
+    *,
+    name: str,
+) -> np.ndarray:
+    array = np.asarray(values)
+    if not np.issubdtype(array.dtype, np.number):
+        raise ValueError(f"{name} must be numeric")
+    if not np.issubdtype(array.dtype, np.floating):
+        array = array.astype(np.float64, copy=False)
+    return array
+
+
 def _as_vector(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
-    array = np.asarray(values, dtype=DTYPE_NP).reshape(-1)
+    array = _as_floating_array(values, name=name).reshape(-1)
     if array.size == 0:
         raise ValueError(f"{name} cannot be empty")
     if not np.all(np.isfinite(array)):
@@ -28,7 +41,7 @@ def _as_vector(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
 
 
 def _as_matrix(values: np.ndarray, *, name: str) -> np.ndarray:
-    array = np.asarray(values, dtype=DTYPE_NP)
+    array = _as_floating_array(values, name=name)
     if array.ndim != 2:
         raise ValueError(f"{name} must be 2D, got shape={array.shape}")
     if array.shape[0] == 0 or array.shape[1] == 0:
@@ -41,7 +54,7 @@ def _as_matrix(values: np.ndarray, *, name: str) -> np.ndarray:
 def _as_support(
     values: np.ndarray | list[float] | list[list[float]], *, name: str
 ) -> np.ndarray:
-    array = np.asarray(values, dtype=DTYPE_NP)
+    array = _as_floating_array(values, name=name)
     if array.ndim not in (1, 2):
         raise ValueError(f"{name} must be 1D or 2D, got shape={array.shape}")
     if array.shape[-1] == 0:
@@ -56,7 +69,7 @@ def _as_support(
 def _as_probabilities(
     values: np.ndarray | list[float] | list[list[float]], *, name: str
 ) -> np.ndarray:
-    array = np.asarray(values, dtype=DTYPE_NP)
+    array = _as_floating_array(values, name=name)
     if array.ndim not in (1, 2):
         raise ValueError(f"{name} must be 1D or 2D, got shape={array.shape}")
     if array.shape[-1] == 0:
@@ -84,6 +97,29 @@ def _validate_support_domain(support: np.ndarray, *, domain: SupportDomain) -> N
     raise ValueError(f"unsupported support domain: {domain}")
 
 
+def _normalize_observation_payload(
+    gene_names: list[str],
+    counts: np.ndarray,
+    reference_counts: np.ndarray,
+) -> tuple[list[str], np.ndarray, np.ndarray]:
+    names = _require_unique_names(gene_names, field_name="gene_names")
+    counts_array = _as_matrix(counts, name="counts")
+    reference_array = _as_vector(
+        reference_counts,
+        name="reference_counts",
+    )
+    if counts_array.shape != (reference_array.shape[0], len(names)):
+        raise ValueError(
+            "counts shape must equal (n_cells, n_genes), "
+            f"got {counts_array.shape} vs {(reference_array.shape[0], len(names))}"
+        )
+    if np.any(counts_array < 0):
+        raise ValueError("counts must be non-negative")
+    if np.any(reference_array <= 0):
+        raise ValueError("reference_counts must be positive")
+    return names, counts_array, reference_array
+
+
 @dataclass(frozen=True, slots=True)
 class ObservationBatch:
     gene_names: list[str]
@@ -91,38 +127,28 @@ class ObservationBatch:
     reference_counts: np.ndarray
 
     def __post_init__(self) -> None:
-        names = _require_unique_names(self.gene_names, field_name="gene_names")
-        counts = _as_matrix(self.counts, name="counts")
-        reference_counts = _as_vector(
+        names, counts, reference_counts = _normalize_observation_payload(
+            list(self.gene_names),
+            self.counts,
             self.reference_counts,
-            name="reference_counts",
         )
-        if counts.shape != (reference_counts.shape[0], len(names)):
-            raise ValueError(
-                "counts shape must equal (n_cells, n_genes), "
-                f"got {counts.shape} vs {(reference_counts.shape[0], len(names))}"
-            )
-        if np.any(counts < 0):
-            raise ValueError("counts must be non-negative")
-        if np.any(reference_counts <= 0):
-            raise ValueError("reference_counts must be positive")
         object.__setattr__(self, "gene_names", names)
         object.__setattr__(self, "counts", counts)
         object.__setattr__(self, "reference_counts", reference_counts)
 
     @property
     def n_cells(self) -> int:
-        return int(np.asarray(self.reference_counts).reshape(-1).shape[0])
+        return int(self.reference_counts.shape[0])
 
     @property
     def n_genes(self) -> int:
         return int(len(self.gene_names))
 
     def check_shape(self) -> None:
-        ObservationBatch(
-            gene_names=list(self.gene_names),
-            counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        _normalize_observation_payload(
+            list(self.gene_names),
+            self.counts,
+            self.reference_counts,
         )
 
 
@@ -133,42 +159,48 @@ class GeneBatch:
     reference_counts: np.ndarray
 
     def __post_init__(self) -> None:
-        normalized = ObservationBatch(
-            gene_names=list(self.gene_names),
-            counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        names, counts, reference_counts = _normalize_observation_payload(
+            list(self.gene_names),
+            self.counts,
+            self.reference_counts,
         )
-        object.__setattr__(self, "gene_names", list(normalized.gene_names))
-        object.__setattr__(
-            self, "counts", np.asarray(normalized.counts, dtype=DTYPE_NP)
-        )
-        object.__setattr__(
-            self,
-            "reference_counts",
-            np.asarray(normalized.reference_counts, dtype=DTYPE_NP),
-        )
+        object.__setattr__(self, "gene_names", names)
+        object.__setattr__(self, "counts", counts)
+        object.__setattr__(self, "reference_counts", reference_counts)
 
     @property
     def n_cells(self) -> int:
-        return int(np.asarray(self.reference_counts).reshape(-1).shape[0])
+        return int(self.reference_counts.shape[0])
 
     @property
     def n_genes(self) -> int:
         return int(len(self.gene_names))
 
     def check_shape(self) -> None:
-        ObservationBatch(
-            gene_names=list(self.gene_names),
-            counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        _normalize_observation_payload(
+            list(self.gene_names),
+            self.counts,
+            self.reference_counts,
         )
 
     def to_observation_batch(self) -> ObservationBatch:
-        return ObservationBatch(
-            gene_names=list(self.gene_names),
-            counts=np.asarray(self.counts, dtype=DTYPE_NP),
-            reference_counts=np.asarray(self.reference_counts, dtype=DTYPE_NP),
+        return _make_observation_batch(
+            list(self.gene_names),
+            self.counts,
+            self.reference_counts,
         )
+
+
+def _make_observation_batch(
+    gene_names: list[str],
+    counts: np.ndarray,
+    reference_counts: np.ndarray,
+) -> ObservationBatch:
+    batch = object.__new__(ObservationBatch)
+    object.__setattr__(batch, "gene_names", gene_names)
+    object.__setattr__(batch, "counts", counts)
+    object.__setattr__(batch, "reference_counts", reference_counts)
+    return batch
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -224,17 +256,15 @@ class DistributionGrid(ABC):
         if self.is_gene_specific:
             return self
         return self.__class__(
-            support=np.asarray(self.support, dtype=DTYPE_NP)[None, :],
-            probabilities=np.asarray(self.probabilities, dtype=DTYPE_NP)[None, :],
+            support=np.asarray(self.support)[None, :],
+            probabilities=np.asarray(self.probabilities)[None, :],
         )
 
     def select_genes(self, indices: list[int] | np.ndarray) -> DistributionGrid:
         gene_specific = self.as_gene_specific()
         resolved = np.asarray(indices, dtype=np.int64).reshape(-1)
-        support = np.asarray(gene_specific.support, dtype=DTYPE_NP)[resolved]
-        probabilities = np.asarray(gene_specific.probabilities, dtype=DTYPE_NP)[
-            resolved
-        ]
+        support = np.asarray(gene_specific.support)[resolved]
+        probabilities = np.asarray(gene_specific.probabilities)[resolved]
         if resolved.size == 1:
             return self.__class__(
                 support=support[0],
@@ -305,6 +335,7 @@ class PriorGrid:
     gene_names: list[str]
     distribution: DistributionGrid
     scale: float
+    _gene_name_to_index: dict[str, int]
 
     def __init__(
         self,
@@ -313,22 +344,28 @@ class PriorGrid:
         distribution: DistributionGrid,
         scale: float,
     ) -> None:
+        resolved_gene_names = _require_unique_names(gene_names, field_name="gene_names")
         object.__setattr__(
             self,
             "gene_names",
-            _require_unique_names(gene_names, field_name="gene_names"),
+            resolved_gene_names,
         )
         object.__setattr__(self, "distribution", distribution)
         object.__setattr__(self, "scale", float(scale))
+        object.__setattr__(
+            self,
+            "_gene_name_to_index",
+            {name: idx for idx, name in enumerate(resolved_gene_names)},
+        )
         self.check_shape()
 
     @property
     def support(self) -> np.ndarray:
-        return np.asarray(self.distribution.support, dtype=DTYPE_NP)
+        return np.asarray(self.distribution.support)
 
     @property
     def prior_probabilities(self) -> np.ndarray:
-        return np.asarray(self.distribution.probabilities, dtype=DTYPE_NP)
+        return np.asarray(self.distribution.probabilities)
 
     @property
     def support_domain(self) -> SupportDomain:
@@ -353,8 +390,10 @@ class PriorGrid:
     @property
     def scaled_support(self) -> np.ndarray:
         if self.support_domain == "rate":
-            return np.asarray(self.support, dtype=DTYPE_NP)
-        return np.asarray(self.support, dtype=DTYPE_NP) * float(self.scale)
+            return np.asarray(self.support)
+        support = np.asarray(self.support)
+        scale = np.asarray(self.scale, dtype=support.dtype)
+        return support * scale
 
     def check_shape(self) -> None:
         if not np.isfinite(self.scale) or self.scale <= 0:
@@ -379,8 +418,9 @@ class PriorGrid:
     def select_genes(self, gene_names: str | list[str]) -> PriorGrid:
         gene_specific = self.as_gene_specific()
         names = [gene_names] if isinstance(gene_names, str) else list(gene_names)
-        lookup = {name: idx for idx, name in enumerate(gene_specific.gene_names)}
-        indices = [lookup[name] for name in names]
+        if names == list(gene_specific.gene_names):
+            return gene_specific
+        indices = [gene_specific._gene_name_to_index[name] for name in names]
         return PriorGrid(
             gene_names=names,
             distribution=gene_specific.distribution.select_genes(indices),
@@ -405,7 +445,7 @@ class PriorFitConfig:
     n_support_points: int = 512
     max_em_iterations: int | None = 200
     convergence_tolerance: float = 1e-6
-    cell_chunk_size: int = 512
+    cell_chunk_size: int = 4096
     support_max_from: Literal["observed_max", "quantile"] = "observed_max"
     support_spacing: Literal["linear", "sqrt"] = "linear"
     support_scale: float = 1.5
@@ -458,7 +498,7 @@ class PriorFitResult:
         objective_history = [float(value) for value in self.objective_history]
         if not objective_history:
             raise ValueError("objective_history cannot be empty")
-        if not np.all(np.isfinite(np.asarray(objective_history, dtype=DTYPE_NP))):
+        if not np.all(np.isfinite(np.asarray(objective_history, dtype=np.float64))):
             raise ValueError("objective_history must contain only finite values")
         final_objective = float(self.final_objective)
         if not np.isfinite(final_objective):
@@ -529,9 +569,9 @@ class InferenceResult:
                 f"got {map_support.shape[1]} != {len(names)}"
             )
         if self.posterior_probabilities is not None:
-            posterior_probabilities = np.asarray(
+            posterior_probabilities = _as_floating_array(
                 self.posterior_probabilities,
-                dtype=DTYPE_NP,
+                name="posterior_probabilities",
             )
             if posterior_probabilities.ndim != 3:
                 raise ValueError(

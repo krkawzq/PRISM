@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 import math
 
 import numpy as np
@@ -9,7 +10,12 @@ import torch
 from prism.model.constants import DTYPE_NP, EPS, SupportDomain
 from prism.model.types import DistributionGrid, PriorGrid
 
-from .numeric import build_bin_edges, resolve_torch_dtype, truncated_gaussian_bin_masses
+from .numeric import (
+    build_bin_edges,
+    resolve_torch_dtype,
+    truncated_gaussian_bin_masses,
+    truncated_gaussian_bin_masses_dense_1d,
+)
 from .optimize import MixtureOptimizationResult, evaluate_mixture_parameters, optimize_mixture_parameters
 from .schema import DistributionGMMSearch, GMMSearchConfig, SupportAxis
 
@@ -198,6 +204,7 @@ def _prepare_prior_grid(
     )
 
 
+@lru_cache(maxsize=128)
 def _window_radii(n_points: int, *, count: int) -> np.ndarray:
     if n_points <= 1:
         return np.asarray([0], dtype=np.int64)
@@ -352,6 +359,152 @@ def _build_peak_candidates(
     )
 
 
+def _masked_quantile_columns(
+    values: np.ndarray,
+    mask: np.ndarray,
+    *,
+    quantile: float,
+) -> np.ndarray:
+    values_np = np.asarray(values, dtype=DTYPE_NP)
+    mask_np = np.asarray(mask, dtype=bool)
+    if values_np.shape != mask_np.shape:
+        raise ValueError("values and mask must match")
+    if values_np.ndim != 2:
+        raise ValueError(f"values must be 2D, got shape={tuple(values_np.shape)}")
+    if values_np.shape[1] == 0:
+        return np.zeros(0, dtype=DTYPE_NP)
+
+    result = np.full(values_np.shape[1], np.nan, dtype=DTYPE_NP)
+    counts = np.sum(mask_np, axis=0).astype(np.int64, copy=False)
+    valid_columns = counts > 0
+    if not np.any(valid_columns):
+        return result
+
+    filtered = np.where(mask_np[:, valid_columns], values_np[:, valid_columns], np.inf)
+    sorted_values = np.sort(filtered, axis=0)
+    valid_counts = counts[valid_columns]
+    fractional_index = float(quantile) * np.maximum(valid_counts - 1, 0)
+    lower_index = np.floor(fractional_index).astype(np.int64, copy=False)
+    upper_index = np.ceil(fractional_index).astype(np.int64, copy=False)
+    interpolation = (fractional_index - lower_index).astype(DTYPE_NP, copy=False)
+    column_index = np.arange(valid_counts.shape[0], dtype=np.int64)
+    lower_values = sorted_values[lower_index, column_index]
+    upper_values = sorted_values[upper_index, column_index]
+    result[valid_columns] = lower_values + (upper_values - lower_values) * interpolation
+    return result
+
+
+def _score_candidate_masses(
+    residual: np.ndarray,
+    candidate_masses: np.ndarray,
+    *,
+    config: GMMSearchConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    residual_np = np.asarray(residual, dtype=DTYPE_NP).reshape(-1)
+    masses_np = np.asarray(candidate_masses, dtype=DTYPE_NP)
+    if masses_np.ndim != 2:
+        raise ValueError(
+            f"candidate_masses must be 2D, got shape={tuple(masses_np.shape)}"
+        )
+    if masses_np.shape[0] != residual_np.shape[0]:
+        raise ValueError("candidate_masses must align with residual")
+    if masses_np.shape[1] == 0:
+        return (
+            np.zeros(0, dtype=DTYPE_NP),
+            np.full(0, -np.inf, dtype=DTYPE_NP),
+        )
+
+    total_residual = float(np.sum(residual_np))
+    baseline = float(np.dot(residual_np, residual_np))
+    max_mass = np.maximum(np.max(masses_np, axis=0), EPS)
+    significant = masses_np > (config.mass_floor * max_mass[None, :])
+    alpha_cap = np.full(masses_np.shape[1], total_residual, dtype=DTYPE_NP)
+    valid_columns = np.any(significant, axis=0)
+    if np.any(valid_columns):
+        ratios = np.where(
+            significant[:, valid_columns],
+            residual_np[:, None] / np.clip(masses_np[:, valid_columns], EPS, None),
+            0.0,
+        )
+        alpha_cap[valid_columns] = _masked_quantile_columns(
+            ratios,
+            significant[:, valid_columns],
+            quantile=config.candidate_alpha_cap_quantile,
+        )
+    alpha_cap = np.minimum(
+        alpha_cap * config.candidate_weight_slack,
+        total_residual,
+    )
+    if config.candidate_alpha_strategy == "least_squares":
+        mass_energy = np.maximum(np.sum(masses_np * masses_np, axis=0), EPS)
+        alpha_base = np.sum(residual_np[:, None] * masses_np, axis=0) / mass_energy
+        alpha = np.minimum(np.maximum(alpha_base, 0.0), alpha_cap)
+    else:
+        alpha = np.maximum(alpha_cap, 0.0)
+    residual_after = np.clip(
+        residual_np[:, None] - alpha[None, :] * masses_np,
+        0.0,
+        None,
+    )
+    improvement = baseline - np.sum(residual_after * residual_after, axis=0)
+    return (
+        np.asarray(alpha, dtype=DTYPE_NP),
+        np.asarray(improvement, dtype=DTYPE_NP),
+    )
+
+
+def _score_candidate_parameters(
+    residual: np.ndarray,
+    support_mask: np.ndarray,
+    bin_edges: np.ndarray,
+    means: np.ndarray,
+    stds: np.ndarray,
+    lefts: np.ndarray,
+    rights: np.ndarray,
+    *,
+    config: GMMSearchConfig,
+    device: str | torch.device,
+    torch_dtype: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    dtype_obj = resolve_torch_dtype(torch_dtype)
+    device_obj = torch.device(device)
+    dense_support = bool(np.all(support_mask))
+    with torch.no_grad():
+        if dense_support:
+            candidate_masses = truncated_gaussian_bin_masses_dense_1d(
+                torch.as_tensor(bin_edges, dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(means, dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(stds, dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(lefts, dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(rights, dtype=dtype_obj, device=device_obj),
+            )
+        else:
+            candidate_masses = truncated_gaussian_bin_masses(
+                torch.as_tensor(
+                    bin_edges[None, :],
+                    dtype=dtype_obj,
+                    device=device_obj,
+                ),
+                torch.as_tensor(means[None, :], dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(stds[None, :], dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(lefts[None, :], dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(rights[None, :], dtype=dtype_obj, device=device_obj),
+                torch.as_tensor(
+                    support_mask[None, :],
+                    dtype=torch.bool,
+                    device=device_obj,
+                ),
+            )[0]
+        candidate_masses_np = (
+            candidate_masses.detach().cpu().numpy().astype(DTYPE_NP, copy=False)
+        )
+    return _score_candidate_masses(
+        residual,
+        candidate_masses_np,
+        config=config,
+    )
+
+
 def _score_peak_candidates(
     residual: np.ndarray,
     support_mask: np.ndarray,
@@ -365,93 +518,34 @@ def _score_peak_candidates(
     device: str | torch.device,
     torch_dtype: str,
 ) -> tuple[float, float, float, float, float, float]:
-    dtype_obj = resolve_torch_dtype(torch_dtype)
-    device_obj = torch.device(device)
-    with torch.no_grad():
-        residual_t = torch.as_tensor(
-            residual[None, :],
-            dtype=dtype_obj,
-            device=device_obj,
+    alpha, improvement = _score_candidate_parameters(
+        residual,
+        support_mask,
+        bin_edges,
+        means,
+        stds,
+        lefts,
+        rights,
+        config=config,
+        device=device,
+        torch_dtype=torch_dtype,
+    )
+    valid = (alpha >= config.min_component_mass) & np.isfinite(improvement)
+    if not np.any(valid):
+        best_idx = int(np.argmax(alpha))
+        return (
+            float(alpha[best_idx]),
+            float(improvement[best_idx]),
+            float(means[best_idx]),
+            float(stds[best_idx]),
+            float(lefts[best_idx]),
+            float(rights[best_idx]),
         )
-        bin_edges_t = torch.as_tensor(
-            bin_edges[None, :],
-            dtype=dtype_obj,
-            device=device_obj,
-        )
-        support_mask_t = torch.as_tensor(
-            support_mask[None, :],
-            dtype=torch.bool,
-            device=device_obj,
-        )
-        means_t = torch.as_tensor(means[None, :], dtype=dtype_obj, device=device_obj)
-        stds_t = torch.as_tensor(stds[None, :], dtype=dtype_obj, device=device_obj)
-        lefts_t = torch.as_tensor(lefts[None, :], dtype=dtype_obj, device=device_obj)
-        rights_t = torch.as_tensor(rights[None, :], dtype=dtype_obj, device=device_obj)
-        candidate_masses = truncated_gaussian_bin_masses(
-            bin_edges_t,
-            means_t,
-            stds_t,
-            lefts_t,
-            rights_t,
-            support_mask_t,
-        )[0]
-        candidate_masses_np = (
-            candidate_masses.detach().cpu().numpy().astype(DTYPE_NP, copy=False)
-        )
-        residual_np = np.asarray(residual, dtype=DTYPE_NP)
-        baseline = float(np.sum(residual_np * residual_np))
-        alpha = np.zeros(candidate_masses_np.shape[1], dtype=DTYPE_NP)
-        improvement = np.full(candidate_masses_np.shape[1], -np.inf, dtype=DTYPE_NP)
-        for candidate_idx in range(candidate_masses_np.shape[1]):
-            masses = candidate_masses_np[:, candidate_idx]
-            max_mass = max(float(np.max(masses)), EPS)
-            significant = masses > config.mass_floor * max_mass
-            if np.any(significant):
-                ratios = residual_np[significant] / np.clip(masses[significant], EPS, None)
-                alpha_cap = float(
-                    np.quantile(ratios, config.candidate_alpha_cap_quantile)
-                )
-            else:
-                alpha_cap = float(np.sum(residual_np))
-            alpha_cap = min(
-                alpha_cap * config.candidate_weight_slack,
-                float(np.sum(residual_np)),
-            )
-            if config.candidate_alpha_strategy == "least_squares":
-                alpha_base = float(
-                    np.dot(residual_np, masses)
-                    / max(float(np.dot(masses, masses)), EPS)
-                )
-                alpha_value = min(max(alpha_base, 0.0), alpha_cap)
-            else:
-                alpha_value = max(alpha_cap, 0.0)
-            residual_after = np.clip(residual_np - alpha_value * masses, 0.0, None)
-            alpha[candidate_idx] = float(alpha_value)
-            improvement[candidate_idx] = float(
-                baseline - np.sum(residual_after * residual_after)
-            )
-        alpha_t = torch.as_tensor(alpha, dtype=dtype_obj, device=device_obj)
-        improvement_t = torch.as_tensor(improvement, dtype=dtype_obj, device=device_obj)
-        valid = (alpha_t >= config.min_component_mass) & torch.isfinite(improvement_t)
-        if not torch.any(valid):
-            best_idx = int(torch.argmax(alpha_t).detach().cpu().item())
-            return (
-                float(alpha_t[best_idx].detach().cpu().item()),
-                float(improvement_t[best_idx].detach().cpu().item()),
-                float(means[best_idx]),
-                float(stds[best_idx]),
-                float(lefts[best_idx]),
-                float(rights[best_idx]),
-            )
-        masked_improvement = torch.where(
-            valid,
-            improvement_t,
-            torch.full_like(improvement_t, -float("inf")),
-        )
-        best_idx = int(torch.argmax(masked_improvement).detach().cpu().item())
+    masked_improvement = np.where(valid, improvement, -np.inf)
+    best_idx = int(np.argmax(masked_improvement))
     return (
-        float(alpha_t[best_idx].detach().cpu().item()),
-        float(improvement_t[best_idx].detach().cpu().item()),
+        float(alpha[best_idx]),
+        float(improvement[best_idx]),
         float(means[best_idx]),
         float(stds[best_idx]),
         float(lefts[best_idx]),
@@ -597,6 +691,12 @@ def _extract_stage_components_for_gene(
     min_sigma = max(min_diff * config.min_sigma_factor, EPS)
     peaks = _peak_indices(row_residual, config=config)
     candidate_rows: list[tuple[float, float, float, float, float, float]] = []
+    peak_offsets: list[tuple[int, int]] = []
+    candidate_means: list[np.ndarray] = []
+    candidate_stds: list[np.ndarray] = []
+    candidate_lefts: list[np.ndarray] = []
+    candidate_rights: list[np.ndarray] = []
+    total_candidates = 0
     for peak_idx in peaks.tolist():
         means, stds, lefts, rights = _build_peak_candidates(
             row_support,
@@ -609,21 +709,54 @@ def _extract_stage_components_for_gene(
             min_sigma=min_sigma,
             config=config,
         )
-        alpha, improvement, mean, std, left, right = _score_peak_candidates(
+        candidate_means.append(means)
+        candidate_stds.append(stds)
+        candidate_lefts.append(lefts)
+        candidate_rights.append(rights)
+        peak_offsets.append((total_candidates, total_candidates + means.shape[0]))
+        total_candidates += int(means.shape[0])
+
+    if total_candidates > 0:
+        all_means = np.concatenate(candidate_means).astype(DTYPE_NP, copy=False)
+        all_stds = np.concatenate(candidate_stds).astype(DTYPE_NP, copy=False)
+        all_lefts = np.concatenate(candidate_lefts).astype(DTYPE_NP, copy=False)
+        all_rights = np.concatenate(candidate_rights).astype(DTYPE_NP, copy=False)
+        alpha_values, improvement_values = _score_candidate_parameters(
             row_residual,
             np.ones(row_support.shape[0], dtype=bool),
             row_bin_edges,
-            means,
-            stds,
-            lefts,
-            rights,
+            all_means,
+            all_stds,
+            all_lefts,
+            all_rights,
             config=config,
             device=device,
             torch_dtype=torch_dtype,
         )
-        if alpha < config.min_component_mass:
-            continue
-        candidate_rows.append((improvement, alpha, mean, std, left, right))
+        for start, stop in peak_offsets:
+            peak_alpha = alpha_values[start:stop]
+            peak_improvement = improvement_values[start:stop]
+            peak_valid = (peak_alpha >= config.min_component_mass) & np.isfinite(
+                peak_improvement
+            )
+            if np.any(peak_valid):
+                best_idx = start + int(
+                    np.argmax(np.where(peak_valid, peak_improvement, -np.inf))
+                )
+            else:
+                best_idx = start + int(np.argmax(peak_alpha))
+            if alpha_values[best_idx] < config.min_component_mass:
+                continue
+            candidate_rows.append(
+                (
+                    float(improvement_values[best_idx]),
+                    float(alpha_values[best_idx]),
+                    float(all_means[best_idx]),
+                    float(all_stds[best_idx]),
+                    float(all_lefts[best_idx]),
+                    float(all_rights[best_idx]),
+                )
+            )
 
     if not candidate_rows:
         if frontier_k > 0:
@@ -800,7 +933,7 @@ def _evaluate_prefix_batch(
             mean_margin_fraction=config.search_refit_mean_margin_fraction,
             torch_dtype=torch_dtype,
             device=device,
-            compile_model=config.search_refit_compile_model,
+            compile_policy=config.search_refit_compile_policy,
             optimize_weights=config.search_refit_optimize_weights,
             optimize_means=config.search_refit_optimize_means,
             optimize_stds=config.search_refit_optimize_stds,

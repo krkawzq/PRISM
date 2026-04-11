@@ -132,7 +132,7 @@ def build_api_router() -> APIRouter:
         n_support_points: int = 512,
         max_em_iterations: int | None = 200,
         convergence_tolerance: float = 1e-6,
-        cell_chunk_size: int = 512,
+        cell_chunk_size: int = 4096,
         support_max_from: Literal["observed_max", "quantile"] = "observed_max",
         support_spacing: Literal["linear", "sqrt"] = "linear",
         support_scale: float = 1.5,

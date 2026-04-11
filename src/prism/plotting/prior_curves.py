@@ -143,7 +143,9 @@ def _curve_from_prior(
         scope_name=scope_name,
         checkpoint_name=checkpoint_name,
         checkpoint_path=str(checkpoint_path),
-        label_name=None if scope_name == "global" else scope_name.removeprefix("label:"),
+        label_name=None
+        if scope_name == "global"
+        else scope_name.removeprefix("label:"),
         support_domain=prior.support_domain,
         support=np.asarray(prior.support, dtype=np.float64).reshape(-1),
         scaled_support=np.asarray(prior.scaled_support, dtype=np.float64).reshape(-1),
@@ -152,6 +154,16 @@ def _curve_from_prior(
         ).reshape(-1),
         scale=float(prior.scale),
     )
+
+
+def _missing_gene_hint(checkpoint: ModelCheckpoint) -> str:
+    preview = [str(gene) for gene in checkpoint.gene_names[:32]]
+    if preview and all(gene.startswith("ENSG") for gene in preview):
+        return (
+            " The checkpoint gene namespace looks like Ensembl ids; gene symbols may need "
+            "mapping through an h5ad var annotation column."
+        )
+    return ""
 
 
 def resolve_prior_curve_sets(
@@ -181,9 +193,7 @@ def resolve_prior_curve_sets(
     if not resolved_checkpoint_name:
         raise ValueError("checkpoint_name cannot be blank")
     selected_labels = (
-        sorted(checkpoint.label_priors)
-        if labels is None
-        else dedupe_names(labels)
+        sorted(checkpoint.label_priors) if labels is None else dedupe_names(labels)
     )
     curve_sets: dict[str, list[PriorCurve]] = {}
     for gene_name in requested:
@@ -209,6 +219,7 @@ def resolve_prior_curve_sets(
                 raise ValueError(
                     f"gene {gene_name!r} is missing from the global prior in checkpoint "
                     f"{resolved_checkpoint_name!r}"
+                    f"{_missing_gene_hint(checkpoint)}"
                 )
         for label in selected_labels:
             if label not in checkpoint.label_priors:
@@ -234,10 +245,12 @@ def resolve_prior_curve_sets(
                 raise ValueError(
                     f"gene {gene_name!r} is missing from label prior {label!r} in "
                     f"checkpoint {resolved_checkpoint_name!r}"
+                    f"{_missing_gene_hint(checkpoint)}"
                 )
         if not curves and not allow_empty_genes:
             raise ValueError(
                 f"gene {gene_name!r} is not present in the selected prior sources"
+                f"{_missing_gene_hint(checkpoint)}"
             )
         curve_sets[gene_name] = curves
     return curve_sets
@@ -402,9 +415,7 @@ def __getattr__(name: str) -> object:
     try:
         return resolve_plot_export(name, package=__package__)
     except AttributeError as exc:
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r}"
-        ) from exc
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
 
 
 __all__ = [

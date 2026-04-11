@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Any, Literal, cast
+from typing import Literal, cast
 
 import numpy as np
 import torch
 
-from .constants import DTYPE_NP
 from .exposure import effective_exposure, validate_binomial_observations
 from .numeric import (
     entropy,
@@ -17,6 +16,8 @@ from .numeric import (
 from .types import GeneBatch, InferenceResult, ObservationBatch, PriorGrid
 
 PosteriorDistribution = Literal["auto", "binomial", "negative_binomial", "poisson"]
+ResolvedPosteriorDistribution = Literal["binomial", "negative_binomial", "poisson"]
+_CPU_INFERENCE_TARGET_BYTES = 2 * 1024**3
 
 
 def _resolve_torch_dtype(name: str) -> torch.dtype:
@@ -25,6 +26,14 @@ def _resolve_torch_dtype(name: str) -> torch.dtype:
     if name == "float64":
         return torch.float64
     raise ValueError(f"unsupported torch_dtype: {name}")
+
+
+def _resolve_numpy_dtype(name: str) -> np.dtype:
+    if name == "float32":
+        return np.dtype(np.float32)
+    if name == "float64":
+        return np.dtype(np.float64)
+    raise ValueError(f"unsupported result_dtype: {name}")
 
 
 def _resolve_distribution(
@@ -57,22 +66,16 @@ class _BasePosteriorInferencer(torch.nn.Module):
         posterior_probabilities: torch.Tensor,
         support: torch.Tensor,
         prior_probabilities: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         map_index = torch.argmax(posterior_probabilities, dim=-1)
-        map_support = torch.gather(
-            support[:, None, :].expand(-1, posterior_probabilities.shape[1], -1),
-            2,
-            map_index.unsqueeze(-1),
-        ).squeeze(-1)
+        map_support = torch.gather(support, 1, map_index)
         posterior_entropy = cast(torch.Tensor, entropy(posterior_probabilities))
-        prior_entropy = cast(torch.Tensor, entropy(prior_probabilities))[
-            :, None
-        ].expand(
-            -1,
-            posterior_probabilities.shape[1],
+        prior_entropy = cast(torch.Tensor, entropy(prior_probabilities))
+        mutual_information = torch.clamp(
+            prior_entropy[:, None] - posterior_entropy,
+            min=0.0,
         )
-        mutual_information = torch.clamp(prior_entropy - posterior_entropy, min=0.0)
-        return map_support, posterior_entropy, prior_entropy, mutual_information
+        return map_support, posterior_entropy, mutual_information
 
 
 class _BinomialPosteriorInferencer(_BasePosteriorInferencer):
@@ -82,7 +85,7 @@ class _BinomialPosteriorInferencer(_BasePosteriorInferencer):
         support: torch.Tensor,
         prior_probabilities: torch.Tensor,
         effective_exposure_values: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         log_likelihood = log_binomial_likelihood_support(
             counts,
             effective_exposure_values,
@@ -93,7 +96,7 @@ class _BinomialPosteriorInferencer(_BasePosteriorInferencer):
             prior_probabilities,
         )
         posterior_probabilities = cast(torch.Tensor, posterior_probabilities)
-        map_support, posterior_entropy, prior_entropy, mutual_information = (
+        map_support, posterior_entropy, mutual_information = (
             self._summarize(
                 posterior_probabilities,
                 support,
@@ -104,7 +107,6 @@ class _BinomialPosteriorInferencer(_BasePosteriorInferencer):
             posterior_probabilities,
             map_support,
             posterior_entropy,
-            prior_entropy,
             mutual_information,
         )
 
@@ -120,7 +122,7 @@ class _NegativeBinomialPosteriorInferencer(_BasePosteriorInferencer):
         support: torch.Tensor,
         prior_probabilities: torch.Tensor,
         effective_exposure_values: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         log_likelihood = log_negative_binomial_likelihood_support(
             counts,
             effective_exposure_values,
@@ -132,7 +134,7 @@ class _NegativeBinomialPosteriorInferencer(_BasePosteriorInferencer):
             prior_probabilities,
         )
         posterior_probabilities = cast(torch.Tensor, posterior_probabilities)
-        map_support, posterior_entropy, prior_entropy, mutual_information = (
+        map_support, posterior_entropy, mutual_information = (
             self._summarize(
                 posterior_probabilities,
                 support,
@@ -143,7 +145,6 @@ class _NegativeBinomialPosteriorInferencer(_BasePosteriorInferencer):
             posterior_probabilities,
             map_support,
             posterior_entropy,
-            prior_entropy,
             mutual_information,
         )
 
@@ -154,14 +155,14 @@ class _PoissonPosteriorInferencer(_BasePosteriorInferencer):
         counts: torch.Tensor,
         support: torch.Tensor,
         prior_probabilities: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         log_likelihood = log_poisson_likelihood_support(counts, support)
         posterior_probabilities = posterior_from_log_likelihood(
             log_likelihood,
             prior_probabilities,
         )
         posterior_probabilities = cast(torch.Tensor, posterior_probabilities)
-        map_support, posterior_entropy, prior_entropy, mutual_information = (
+        map_support, posterior_entropy, mutual_information = (
             self._summarize(
                 posterior_probabilities,
                 support,
@@ -172,7 +173,6 @@ class _PoissonPosteriorInferencer(_BasePosteriorInferencer):
             posterior_probabilities,
             map_support,
             posterior_entropy,
-            prior_entropy,
             mutual_information,
         )
 
@@ -195,7 +195,7 @@ def _maybe_compile(module: torch.nn.Module) -> torch.nn.Module:
 
 
 def _get_inferencer(
-    distribution: Literal["binomial", "negative_binomial", "poisson"],
+    distribution: ResolvedPosteriorDistribution,
     *,
     device: torch.device,
     dtype: torch.dtype,
@@ -230,6 +230,197 @@ def _get_inferencer(
     return compiled
 
 
+def _estimate_inference_working_set_bytes(
+    *,
+    n_genes: int,
+    n_observations: int,
+    n_support_points: int,
+    dtype: torch.dtype,
+) -> int:
+    element_size = torch.tensor([], dtype=dtype).element_size()
+    return int(n_genes * n_observations * n_support_points * element_size * 4)
+
+
+def _resolve_observation_chunk_size(
+    *,
+    n_observations: int,
+    n_genes: int,
+    n_support_points: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    observation_chunk_size: int | None,
+) -> int:
+    if n_observations < 1:
+        raise ValueError("n_observations must be >= 1")
+    if observation_chunk_size is not None:
+        if observation_chunk_size < 1:
+            raise ValueError("observation_chunk_size must be >= 1")
+        return min(int(observation_chunk_size), n_observations)
+
+    estimated_bytes = _estimate_inference_working_set_bytes(
+        n_genes=n_genes,
+        n_observations=n_observations,
+        n_support_points=n_support_points,
+        dtype=dtype,
+    )
+    if device.type == "cuda":
+        total_memory = int(torch.cuda.get_device_properties(device).total_memory)
+        target_bytes = max(1, int(total_memory * 0.35))
+    else:
+        target_bytes = _CPU_INFERENCE_TARGET_BYTES
+    if estimated_bytes <= target_bytes:
+        return n_observations
+    bytes_per_observation = max(1, estimated_bytes // n_observations)
+    return max(1, min(n_observations, target_bytes // bytes_per_observation))
+
+
+def _iter_observation_slices(n_observations: int, chunk_size: int) -> list[slice]:
+    return [
+        slice(start, min(start + chunk_size, n_observations))
+        for start in range(0, n_observations, chunk_size)
+    ]
+
+
+def _to_numpy_chunk(
+    values: torch.Tensor,
+    *,
+    result_dtype: np.dtype,
+) -> np.ndarray:
+    return values.detach().cpu().numpy().astype(result_dtype, copy=False)
+
+
+def _infer_from_arrays(
+    *,
+    gene_names: list[str],
+    counts: np.ndarray,
+    effective_exposure_values: np.ndarray | None,
+    prior: PriorGrid,
+    resolved_distribution: ResolvedPosteriorDistribution,
+    device: torch.device,
+    include_posterior: bool,
+    dtype: torch.dtype,
+    result_dtype: np.dtype,
+    nb_overdispersion: float,
+    compile_model: bool,
+    observation_chunk_size: int | None,
+) -> InferenceResult:
+    n_observations, n_genes = counts.shape
+    support_np = np.asarray(prior.support)
+    prior_probabilities_np = np.asarray(prior.prior_probabilities)
+    chunk_size = _resolve_observation_chunk_size(
+        n_observations=n_observations,
+        n_genes=n_genes,
+        n_support_points=int(support_np.shape[1]),
+        dtype=dtype,
+        device=device,
+        observation_chunk_size=observation_chunk_size,
+    )
+    inferencer = _get_inferencer(
+        resolved_distribution,
+        device=device,
+        dtype=dtype,
+        nb_overdispersion=nb_overdispersion,
+        compile_model=compile_model,
+    )
+
+    counts_t = torch.as_tensor(counts, dtype=dtype, device=device).transpose(0, 1)
+    support_t = torch.as_tensor(support_np, dtype=dtype, device=device)
+    prior_probabilities_t = torch.as_tensor(
+        prior_probabilities_np,
+        dtype=dtype,
+        device=device,
+    )
+    prior_entropy_vector_np = _to_numpy_chunk(
+        cast(torch.Tensor, entropy(prior_probabilities_t)),
+        result_dtype=result_dtype,
+    )
+    if resolved_distribution == "poisson":
+        exposure_t = None
+    else:
+        exposure_t = (
+            torch.as_tensor(
+                effective_exposure_values,
+                dtype=dtype,
+                device=device,
+            )
+            .unsqueeze(0)
+            .expand(n_genes, -1)
+        )
+
+    map_support_np = np.empty((n_observations, n_genes), dtype=result_dtype)
+    posterior_entropy_np = np.empty((n_observations, n_genes), dtype=result_dtype)
+    prior_entropy_np = np.empty((n_observations, n_genes), dtype=result_dtype)
+    prior_entropy_np[:] = prior_entropy_vector_np
+    mutual_information_np = np.empty((n_observations, n_genes), dtype=result_dtype)
+    posterior_probabilities_np = (
+        np.empty((n_observations, n_genes, support_np.shape[1]), dtype=result_dtype)
+        if include_posterior
+        else None
+    )
+
+    with torch.inference_mode():
+        for observation_slice in _iter_observation_slices(n_observations, chunk_size):
+            chunk_start = int(observation_slice.start or 0)
+            chunk_stop = int(observation_slice.stop or n_observations)
+            counts_chunk = counts_t[:, observation_slice]
+            if resolved_distribution == "poisson":
+                (
+                    posterior_probabilities_t,
+                    map_support_t,
+                    posterior_entropy_t,
+                    mutual_information_t,
+                ) = cast(_PoissonPosteriorInferencer, inferencer)(
+                    counts_chunk,
+                    support_t,
+                    prior_probabilities_t,
+                )
+            else:
+                (
+                    posterior_probabilities_t,
+                    map_support_t,
+                    posterior_entropy_t,
+                    mutual_information_t,
+                ) = cast(
+                    _BinomialPosteriorInferencer | _NegativeBinomialPosteriorInferencer,
+                    inferencer,
+                )(
+                    counts_chunk,
+                    support_t,
+                    prior_probabilities_t,
+                    cast(torch.Tensor, exposure_t)[:, observation_slice],
+                )
+
+            map_support_np[chunk_start:chunk_stop] = _to_numpy_chunk(
+                map_support_t.transpose(0, 1),
+                result_dtype=result_dtype,
+            )
+            posterior_entropy_np[chunk_start:chunk_stop] = _to_numpy_chunk(
+                posterior_entropy_t.transpose(0, 1),
+                result_dtype=result_dtype,
+            )
+            mutual_information_np[chunk_start:chunk_stop] = _to_numpy_chunk(
+                mutual_information_t.transpose(0, 1),
+                result_dtype=result_dtype,
+            )
+            if posterior_probabilities_np is not None:
+                posterior_probabilities_np[chunk_start:chunk_stop] = _to_numpy_chunk(
+                    posterior_probabilities_t.permute(1, 0, 2),
+                    result_dtype=result_dtype,
+                )
+
+    return InferenceResult(
+        gene_names=list(gene_names),
+        support_domain=prior.support_domain,
+        support=np.asarray(support_np, dtype=result_dtype),
+        prior_probabilities=np.asarray(prior_probabilities_np, dtype=result_dtype),
+        map_support=map_support_np,
+        posterior_entropy=posterior_entropy_np,
+        prior_entropy=prior_entropy_np,
+        mutual_information=mutual_information_np,
+        posterior_probabilities=posterior_probabilities_np,
+    )
+
+
 def infer_posteriors(
     batch: ObservationBatch | GeneBatch,
     prior: PriorGrid,
@@ -237,9 +428,11 @@ def infer_posteriors(
     device: str | torch.device = "cpu",
     include_posterior: bool = False,
     torch_dtype: str = "float64",
+    result_dtype: str | None = None,
     posterior_distribution: PosteriorDistribution = "auto",
     nb_overdispersion: float = 0.01,
     compile_model: bool = True,
+    observation_chunk_size: int | None = None,
 ) -> InferenceResult:
     if isinstance(batch, GeneBatch):
         batch = batch.to_observation_batch()
@@ -249,90 +442,27 @@ def infer_posteriors(
 
     device_obj = torch.device(device)
     dtype_obj = _resolve_torch_dtype(torch_dtype)
-    inferencer = _get_inferencer(
-        resolved_distribution,
-        device=device_obj,
-        dtype=dtype_obj,
-        nb_overdispersion=nb_overdispersion,
-        compile_model=compile_model,
-    )
-
-    counts_t = torch.as_tensor(batch.counts.T, dtype=dtype_obj, device=device_obj)
-    support_t = torch.as_tensor(prior.support, dtype=dtype_obj, device=device_obj)
-    prior_probabilities_t = torch.as_tensor(
-        prior.prior_probabilities,
-        dtype=dtype_obj,
-        device=device_obj,
-    )
-
-    if resolved_distribution == "poisson":
-        (
-            posterior_probabilities_t,
-            map_support_t,
-            posterior_entropy_t,
-            prior_entropy_t,
-            mutual_information_t,
-        ) = cast(_PoissonPosteriorInferencer, inferencer)(
-            counts_t,
-            support_t,
-            prior_probabilities_t,
-        )
-    else:
+    result_dtype_name = torch_dtype if result_dtype is None else result_dtype
+    result_dtype_obj = _resolve_numpy_dtype(result_dtype_name)
+    exposure_values = None
+    if resolved_distribution != "poisson":
         exposure_values = effective_exposure(batch.reference_counts, prior.scale)
         if resolved_distribution == "binomial":
             validate_binomial_observations(batch.counts, exposure_values)
-        exposure_t = (
-            torch.as_tensor(
-                exposure_values,
-                dtype=dtype_obj,
-                device=device_obj,
-            )
-            .unsqueeze(0)
-            .expand(batch.n_genes, -1)
-        )
-        (
-            posterior_probabilities_t,
-            map_support_t,
-            posterior_entropy_t,
-            prior_entropy_t,
-            mutual_information_t,
-        ) = cast(
-            _BinomialPosteriorInferencer | _NegativeBinomialPosteriorInferencer,
-            inferencer,
-        )(
-            counts_t,
-            support_t,
-            prior_probabilities_t,
-            exposure_t,
-        )
 
-    return InferenceResult(
+    return _infer_from_arrays(
         gene_names=list(batch.gene_names),
-        support_domain=prior.support_domain,
-        support=np.asarray(prior.support, dtype=DTYPE_NP),
-        prior_probabilities=np.asarray(prior.prior_probabilities, dtype=DTYPE_NP),
-        map_support=map_support_t.detach().cpu().numpy().T.astype(DTYPE_NP, copy=False),
-        posterior_entropy=posterior_entropy_t.detach()
-        .cpu()
-        .numpy()
-        .T.astype(DTYPE_NP, copy=False),
-        prior_entropy=prior_entropy_t.detach()
-        .cpu()
-        .numpy()
-        .T.astype(DTYPE_NP, copy=False),
-        mutual_information=mutual_information_t.detach()
-        .cpu()
-        .numpy()
-        .T.astype(DTYPE_NP, copy=False),
-        posterior_probabilities=(
-            posterior_probabilities_t.detach()
-            .cpu()
-            .numpy()
-            .transpose(1, 0, 2)
-            .astype(DTYPE_NP, copy=False)
-            if include_posterior
-            else None
-        ),
+        counts=batch.counts,
+        effective_exposure_values=exposure_values,
+        prior=prior,
+        resolved_distribution=resolved_distribution,
+        device=device_obj,
+        include_posterior=include_posterior,
+        dtype=dtype_obj,
+        result_dtype=result_dtype_obj,
+        nb_overdispersion=nb_overdispersion,
+        compile_model=compile_model,
+        observation_chunk_size=observation_chunk_size,
     )
 
 

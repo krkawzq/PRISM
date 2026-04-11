@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
-import math
+from typing import Literal
 
 import numpy as np
 import torch
@@ -17,6 +18,8 @@ from .numeric import (
     normalize_active_weights,
     resolve_torch_dtype,
     truncated_gaussian_bin_masses,
+    truncated_gaussian_bin_masses_dense_1d,
+    truncated_gaussian_bin_masses_from_edges,
 )
 
 
@@ -34,6 +37,29 @@ class MixtureOptimizationResult:
     l1_error: np.ndarray
 
 
+CompilePolicy = Literal["never", "auto", "always"]
+
+
+@dataclass(slots=True)
+class _TensorWorkspace:
+    target: torch.Tensor
+    bin_edges: torch.Tensor
+    support_mask: torch.Tensor
+    lower_bounds: torch.Tensor
+    upper_bounds: torch.Tensor
+    sigma_floor: torch.Tensor
+    active_mask: torch.Tensor
+    component_weights: torch.Tensor
+    component_means: torch.Tensor
+    component_stds: torch.Tensor
+    component_lefts: torch.Tensor
+    component_rights: torch.Tensor
+
+
+_WORKSPACE_CACHE_MAXSIZE = 8
+_WORKSPACE_CACHE: OrderedDict[tuple[object, ...], _TensorWorkspace] = OrderedDict()
+
+
 def _logit(values: np.ndarray, *, clip: float) -> np.ndarray:
     clipped = np.clip(values, clip, 1.0 - clip)
     return np.log(clipped / (1.0 - clipped))
@@ -49,6 +75,125 @@ def maybe_compile(module: torch.nn.Module) -> torch.nn.Module:
         return module if not hasattr(torch, "compile") else torch.compile(module)
     except Exception:
         return module
+
+
+def _resolve_compile_policy(
+    *,
+    compile_policy: CompilePolicy,
+    compile_model: bool | None,
+) -> CompilePolicy:
+    if compile_policy not in {"never", "auto", "always"}:
+        raise ValueError(f"unsupported compile_policy: {compile_policy!r}")
+    if compile_model is None:
+        return compile_policy
+    if not isinstance(compile_model, bool):
+        raise ValueError("compile_model must be a boolean when provided")
+    legacy_policy: CompilePolicy = "always" if compile_model else "never"
+    if compile_policy != "never" and compile_policy != legacy_policy:
+        raise ValueError("compile_model conflicts with compile_policy")
+    return legacy_policy
+
+
+def _should_compile_module(
+    *,
+    compile_policy: CompilePolicy,
+    device: torch.device,
+    batch_size: int,
+    n_bins: int,
+    n_components: int,
+    max_iterations: int,
+) -> bool:
+    if compile_policy == "never":
+        return False
+    if compile_policy == "always":
+        return True
+    if device.type != "cuda":
+        return False
+    work_units = batch_size * n_bins * max(n_components, 1) * max(max_iterations, 1)
+    return max_iterations >= 32 and work_units >= 131072
+
+
+def _workspace_key(
+    *,
+    batch_size: int,
+    n_bins: int,
+    n_components: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[object, ...]:
+    return (
+        batch_size,
+        n_bins,
+        n_components,
+        str(dtype),
+        device.type,
+        device.index,
+    )
+
+
+def _new_workspace(
+    *,
+    batch_size: int,
+    n_bins: int,
+    n_components: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> _TensorWorkspace:
+    return _TensorWorkspace(
+        target=torch.empty((batch_size, n_bins), dtype=dtype, device=device),
+        bin_edges=torch.empty((batch_size, n_bins + 1), dtype=dtype, device=device),
+        support_mask=torch.empty((batch_size, n_bins), dtype=torch.bool, device=device),
+        lower_bounds=torch.empty(batch_size, dtype=dtype, device=device),
+        upper_bounds=torch.empty(batch_size, dtype=dtype, device=device),
+        sigma_floor=torch.empty(batch_size, dtype=dtype, device=device),
+        active_mask=torch.empty((batch_size, n_components), dtype=torch.bool, device=device),
+        component_weights=torch.empty((batch_size, n_components), dtype=dtype, device=device),
+        component_means=torch.empty((batch_size, n_components), dtype=dtype, device=device),
+        component_stds=torch.empty((batch_size, n_components), dtype=dtype, device=device),
+        component_lefts=torch.empty((batch_size, n_components), dtype=dtype, device=device),
+        component_rights=torch.empty((batch_size, n_components), dtype=dtype, device=device),
+    )
+
+
+def _get_tensor_workspace(
+    *,
+    batch_size: int,
+    n_bins: int,
+    n_components: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> _TensorWorkspace:
+    key = _workspace_key(
+        batch_size=batch_size,
+        n_bins=n_bins,
+        n_components=n_components,
+        dtype=dtype,
+        device=device,
+    )
+    workspace = _WORKSPACE_CACHE.get(key)
+    if workspace is None:
+        workspace = _new_workspace(
+            batch_size=batch_size,
+            n_bins=n_bins,
+            n_components=n_components,
+            dtype=dtype,
+            device=device,
+        )
+        _WORKSPACE_CACHE[key] = workspace
+        if len(_WORKSPACE_CACHE) > _WORKSPACE_CACHE_MAXSIZE:
+            _WORKSPACE_CACHE.popitem(last=False)
+        return workspace
+    _WORKSPACE_CACHE.move_to_end(key)
+    return workspace
+
+
+def _copy_numpy_to_tensor(array: np.ndarray, target: torch.Tensor) -> torch.Tensor:
+    source = torch.as_tensor(
+        np.ascontiguousarray(array),
+        dtype=target.dtype,
+    )
+    target.copy_(source)
+    return target
 
 
 def sigma_floor(
@@ -220,37 +365,73 @@ def evaluate_mixture_parameters(
     dtype_obj = resolve_torch_dtype(torch_dtype)
     device_obj = torch.device(device)
     with torch.no_grad():
-        target_t = torch.as_tensor(probabilities_np, dtype=dtype_obj, device=device_obj)
-        bin_edges_t = torch.as_tensor(bin_edges_np, dtype=dtype_obj, device=device_obj)
-        support_mask_t = torch.as_tensor(
-            support_mask_np,
-            dtype=torch.bool,
-            device=device_obj,
-        )
-        component_weights_t = torch.as_tensor(
-            component_weights_np,
-            dtype=dtype_obj,
-            device=device_obj,
-        )
-        active_mask_t = torch.as_tensor(
-            active_mask_np,
-            dtype=torch.bool,
-            device=device_obj,
-        )
+        if device_obj.type == "cpu":
+            target_t = torch.as_tensor(probabilities_np, dtype=dtype_obj, device=device_obj)
+            bin_edges_t = torch.as_tensor(bin_edges_np, dtype=dtype_obj, device=device_obj)
+            support_mask_t = torch.as_tensor(
+                support_mask_np,
+                dtype=torch.bool,
+                device=device_obj,
+            )
+            component_weights_t = torch.as_tensor(
+                component_weights_np,
+                dtype=dtype_obj,
+                device=device_obj,
+            )
+            active_mask_t = torch.as_tensor(
+                active_mask_np,
+                dtype=torch.bool,
+                device=device_obj,
+            )
+            means_t = torch.as_tensor(component_means_np, dtype=dtype_obj, device=device_obj)
+            stds_t = torch.as_tensor(component_stds_np, dtype=dtype_obj, device=device_obj)
+            lefts_t = torch.as_tensor(clipped_left_np, dtype=dtype_obj, device=device_obj)
+            rights_t = torch.as_tensor(clipped_right_np, dtype=dtype_obj, device=device_obj)
+        else:
+            workspace = _get_tensor_workspace(
+                batch_size=probabilities_np.shape[0],
+                n_bins=probabilities_np.shape[1],
+                n_components=component_weights_np.shape[1],
+                dtype=dtype_obj,
+                device=device_obj,
+            )
+            target_t = _copy_numpy_to_tensor(probabilities_np, workspace.target)
+            bin_edges_t = _copy_numpy_to_tensor(bin_edges_np, workspace.bin_edges)
+            support_mask_t = _copy_numpy_to_tensor(
+                support_mask_np,
+                workspace.support_mask,
+            )
+            component_weights_t = _copy_numpy_to_tensor(
+                component_weights_np,
+                workspace.component_weights,
+            )
+            active_mask_t = _copy_numpy_to_tensor(
+                active_mask_np,
+                workspace.active_mask,
+            )
+            means_t = _copy_numpy_to_tensor(component_means_np, workspace.component_means)
+            stds_t = _copy_numpy_to_tensor(component_stds_np, workspace.component_stds)
+            lefts_t = _copy_numpy_to_tensor(clipped_left_np, workspace.component_lefts)
+            rights_t = _copy_numpy_to_tensor(clipped_right_np, workspace.component_rights)
         weights_t = normalize_active_weights(component_weights_t, active_mask_t)
-        means_t = torch.as_tensor(component_means_np, dtype=dtype_obj, device=device_obj)
-        stds_t = torch.as_tensor(component_stds_np, dtype=dtype_obj, device=device_obj)
         stds_t = stds_t.clamp_min(EPS)
-        lefts_t = torch.as_tensor(clipped_left_np, dtype=dtype_obj, device=device_obj)
-        rights_t = torch.as_tensor(clipped_right_np, dtype=dtype_obj, device=device_obj)
-        component_masses_t = truncated_gaussian_bin_masses(
-            bin_edges_t,
-            means_t,
-            stds_t,
-            lefts_t,
-            rights_t,
-            support_mask_t,
-        )
+        if probabilities_np.shape[0] == 1 and bool(np.all(support_mask_np[0])):
+            component_masses_t = truncated_gaussian_bin_masses_dense_1d(
+                bin_edges_t[0],
+                means_t[0],
+                stds_t[0],
+                lefts_t[0],
+                rights_t[0],
+            ).unsqueeze(0)
+        else:
+            component_masses_t = truncated_gaussian_bin_masses(
+                bin_edges_t,
+                means_t,
+                stds_t,
+                lefts_t,
+                rights_t,
+                support_mask_t,
+            )
         fitted_t = mixture_bin_masses(component_masses_t, weights_t)
     return _to_numpy_result(
         fitted_t=fitted_t,
@@ -294,85 +475,50 @@ def initialize_raw_parameters(
     mean_low = lower - mean_margin_fraction * span
     mean_high = upper + mean_margin_fraction * span
 
-    weight_logits = np.full(
-        (n_genes, n_components),
-        float(initial_weight_logit_floor),
-        dtype=DTYPE_NP,
+    active_mask = (
+        np.arange(n_components, dtype=np.int64)[None, :] < selected_k.reshape(-1, 1)
     )
-    mean_raw = np.zeros_like(weight_logits)
-    std_raw = np.zeros_like(weight_logits)
-    left_raw = np.zeros_like(weight_logits)
-    window_raw = np.zeros_like(weight_logits)
+    fallback_mean = initial_means[:, :1]
+    fallback_std = np.maximum(initial_stds[:, :1], sigma_floor_values)
 
-    for row_idx in range(n_genes):
-        k = int(selected_k[row_idx])
-        fallback_mean = float(initial_means[row_idx, 0])
-        fallback_std = max(
-            float(initial_stds[row_idx, 0]),
-            float(sigma_floor_values[row_idx, 0]),
-        )
-        for component_idx in range(n_components):
-            active = component_idx < k
-            weight = (
-                float(initial_weights[row_idx, component_idx])
-                if active
-                else float(inactive_weight_floor)
-            )
-            mean = (
-                float(initial_means[row_idx, component_idx])
-                if active
-                else fallback_mean
-            )
-            std = (
-                float(initial_stds[row_idx, component_idx])
-                if active
-                else fallback_std
-            )
-            left = (
-                float(initial_left_truncations[row_idx, component_idx])
-                if active
-                else float(lower[row_idx, 0])
-            )
-            right = (
-                float(initial_right_truncations[row_idx, component_idx])
-                if active
-                else float(upper[row_idx, 0])
-            )
-            right = max(right, left + EPS)
-            weight_logits[row_idx, component_idx] = math.log(
-                max(weight, float(inactive_weight_floor))
-            )
-            mean_norm = (mean - mean_low[row_idx, 0]) / max(
-                mean_high[row_idx, 0] - mean_low[row_idx, 0],
-                EPS,
-            )
-            mean_raw[row_idx, component_idx] = _logit(
-                np.asarray([mean_norm]),
-                clip=logit_clip,
-            )[0]
-            std_raw[row_idx, component_idx] = _inverse_softplus(
-                np.asarray([max(std - sigma_floor_values[row_idx, 0], EPS)]),
-                clip=inverse_softplus_clip,
-            )[0]
-            left_norm = (left - lower[row_idx, 0]) / max(span[row_idx, 0], EPS)
-            left_raw[row_idx, component_idx] = _logit(
-                np.asarray([left_norm]),
-                clip=logit_clip,
-            )[0]
-            min_window = max(
-                float(sigma_floor_values[row_idx, 0]),
-                float(span[row_idx, 0] * min_window_fraction),
-                EPS,
-            )
-            max_window = max(float(upper[row_idx, 0] - left), min_window + EPS)
-            window_norm = (right - left - min_window) / max(
-                max_window - min_window,
-                EPS,
-            )
-            window_raw[row_idx, component_idx] = _logit(
-                np.asarray([window_norm]),
-                clip=logit_clip,
-            )[0]
+    resolved_weights = np.where(
+        active_mask,
+        initial_weights,
+        float(inactive_weight_floor),
+    )
+    resolved_means = np.where(active_mask, initial_means, fallback_mean)
+    resolved_stds = np.where(active_mask, initial_stds, fallback_std)
+    resolved_lefts = np.where(active_mask, initial_left_truncations, lower)
+    resolved_rights = np.where(active_mask, initial_right_truncations, upper)
+    resolved_rights = np.maximum(resolved_rights, resolved_lefts + EPS)
+
+    weight_logits = np.log(
+        np.maximum(resolved_weights, float(inactive_weight_floor))
+    ).astype(DTYPE_NP, copy=False)
+
+    mean_denom = np.maximum(mean_high - mean_low, EPS)
+    mean_norm = (resolved_means - mean_low) / mean_denom
+    mean_raw = _logit(mean_norm, clip=logit_clip).astype(DTYPE_NP, copy=False)
+
+    std_delta = np.maximum(resolved_stds - sigma_floor_values, EPS)
+    std_raw = _inverse_softplus(
+        std_delta,
+        clip=inverse_softplus_clip,
+    ).astype(DTYPE_NP, copy=False)
+
+    left_norm = (resolved_lefts - lower) / span
+    left_raw = _logit(left_norm, clip=logit_clip).astype(DTYPE_NP, copy=False)
+
+    min_window = np.maximum(
+        np.maximum(sigma_floor_values, span * min_window_fraction),
+        EPS,
+    )
+    max_window = np.maximum(upper - resolved_lefts, min_window + EPS)
+    window_norm = (resolved_rights - resolved_lefts - min_window) / np.maximum(
+        max_window - min_window,
+        EPS,
+    )
+    window_raw = _logit(window_norm, clip=logit_clip).astype(DTYPE_NP, copy=False)
     return weight_logits, mean_raw, std_raw, left_raw, window_raw
 
 
@@ -405,31 +551,43 @@ class RefitModule(torch.nn.Module):
         optimize_right_truncations: bool,
     ) -> None:
         super().__init__()
+        target_dtype = target.dtype
+        target_device = target.device
+        span = (upper_bounds - lower_bounds).clamp_min(EPS).unsqueeze(-1)
+        lower_bounds_expanded = lower_bounds.unsqueeze(-1)
+        upper_bounds_expanded = upper_bounds.unsqueeze(-1)
+        sigma_floor_expanded = sigma_floor_values.unsqueeze(-1)
+        mean_low = lower_bounds_expanded - float(mean_margin_fraction) * span
+        mean_span = upper_bounds_expanded + float(mean_margin_fraction) * span - mean_low
+        min_window = torch.maximum(
+            sigma_floor_expanded,
+            span * float(min_window_fraction),
+        )
         self.weight_logits = torch.nn.Parameter(
             torch.as_tensor(
                 initial_weight_logits,
-                dtype=target.dtype,
-                device=target.device,
+                dtype=target_dtype,
+                device=target_device,
             ),
             requires_grad=optimize_weights,
         )
         self.mean_raw = torch.nn.Parameter(
-            torch.as_tensor(initial_mean_raw, dtype=target.dtype, device=target.device),
+            torch.as_tensor(initial_mean_raw, dtype=target_dtype, device=target_device),
             requires_grad=optimize_means,
         )
         self.std_raw = torch.nn.Parameter(
-            torch.as_tensor(initial_std_raw, dtype=target.dtype, device=target.device),
+            torch.as_tensor(initial_std_raw, dtype=target_dtype, device=target_device),
             requires_grad=optimize_stds,
         )
         self.left_raw = torch.nn.Parameter(
-            torch.as_tensor(initial_left_raw, dtype=target.dtype, device=target.device),
+            torch.as_tensor(initial_left_raw, dtype=target_dtype, device=target_device),
             requires_grad=optimize_left_truncations,
         )
         self.window_raw = torch.nn.Parameter(
             torch.as_tensor(
                 initial_window_raw,
-                dtype=target.dtype,
-                device=target.device,
+                dtype=target_dtype,
+                device=target_device,
             ),
             requires_grad=optimize_right_truncations,
         )
@@ -440,6 +598,20 @@ class RefitModule(torch.nn.Module):
         self.register_buffer("upper_bounds", upper_bounds)
         self.register_buffer("sigma_floor", sigma_floor_values)
         self.register_buffer("active_mask", active_mask)
+        self.register_buffer("span", span)
+        self.register_buffer("lower_bounds_expanded", lower_bounds_expanded)
+        self.register_buffer("upper_bounds_expanded", upper_bounds_expanded)
+        self.register_buffer("sigma_floor_expanded", sigma_floor_expanded)
+        self.register_buffer("mean_low", mean_low)
+        self.register_buffer("mean_span", mean_span)
+        self.register_buffer("min_window", min_window)
+        self.register_buffer("bin_edges_left", bin_edges[:, :-1].unsqueeze(-1))
+        self.register_buffer("bin_edges_right", bin_edges[:, 1:].unsqueeze(-1))
+        self.register_buffer("bin_mask_expanded", bin_mask.unsqueeze(-1))
+        self.register_buffer(
+            "active_component_count",
+            active_mask.sum(dim=-1).clamp_min(1).to(dtype=target_dtype),
+        )
         self.mean_margin_fraction = float(mean_margin_fraction)
         self.overshoot_penalty = float(overshoot_penalty)
         self.min_window_fraction = float(min_window_fraction)
@@ -461,40 +633,34 @@ class RefitModule(torch.nn.Module):
         torch.Tensor,
         torch.Tensor,
     ]:
-        span = (self.upper_bounds - self.lower_bounds).clamp_min(EPS).unsqueeze(-1)
-        mean_low = self.lower_bounds.unsqueeze(-1) - self.mean_margin_fraction * span
-        mean_high = self.upper_bounds.unsqueeze(-1) + self.mean_margin_fraction * span
-        means = mean_low + torch.sigmoid(self.mean_raw) * (mean_high - mean_low)
-        stds = self.sigma_floor.unsqueeze(-1) + F.softplus(self.std_raw)
+        means = self.mean_low + torch.sigmoid(self.mean_raw) * self.mean_span
+        stds = self.sigma_floor_expanded + F.softplus(self.std_raw)
         if self.truncation_mode == "fixed_bounds":
-            lefts = self.lower_bounds.unsqueeze(-1).expand_as(means)
-            rights = self.upper_bounds.unsqueeze(-1).expand_as(means)
+            lefts = self.lower_bounds_expanded.expand_as(means)
+            rights = self.upper_bounds_expanded.expand_as(means)
         else:
-            lefts = self.lower_bounds.unsqueeze(-1) + torch.sigmoid(self.left_raw) * span
-            min_window = torch.maximum(
-                self.sigma_floor.unsqueeze(-1),
-                span * self.min_window_fraction,
+            lefts = self.lower_bounds_expanded + torch.sigmoid(self.left_raw) * self.span
+            available_window = (self.upper_bounds_expanded - lefts).clamp_min(
+                self.min_window + EPS
             )
-            available_window = (self.upper_bounds.unsqueeze(-1) - lefts).clamp_min(
-                min_window + EPS
+            windows = self.min_window + torch.sigmoid(self.window_raw) * (
+                available_window - self.min_window
             )
-            windows = min_window + torch.sigmoid(self.window_raw) * (
-                available_window - min_window
-            )
-            rights = torch.minimum(lefts + windows, self.upper_bounds.unsqueeze(-1))
+            rights = torch.minimum(lefts + windows, self.upper_bounds_expanded)
         masked_logits = torch.where(
             self.active_mask,
             self.weight_logits,
             torch.full_like(self.weight_logits, self.masked_logit_value),
         )
         weights = torch.softmax(masked_logits, dim=-1)
-        component_masses = truncated_gaussian_bin_masses(
-            self.bin_edges,
+        component_masses = truncated_gaussian_bin_masses_from_edges(
+            self.bin_edges_left,
+            self.bin_edges_right,
             means,
             stds,
             lefts,
             rights,
-            self.bin_mask,
+            self.bin_mask_expanded,
         )
         fitted = mixture_bin_masses(component_masses, weights)
         loss = cross_entropy_loss(self.target, fitted)
@@ -504,12 +670,12 @@ class RefitModule(torch.nn.Module):
                 dim=-1,
             )
         if self.truncation_regularization_strength > 0:
-            window_fraction = ((rights - lefts) / span).clamp(0.0, 1.0)
+            window_fraction = ((rights - lefts) / self.span).clamp(0.0, 1.0)
             active_components = self.active_mask.to(dtype=self.target.dtype)
             truncation_penalty = torch.sum(
                 ((1.0 - window_fraction) ** 2) * active_components,
                 dim=-1,
-            ) / active_components.sum(dim=-1).clamp_min(1.0)
+            ) / self.active_component_count
             loss = loss + self.truncation_regularization_strength * truncation_penalty
         return fitted, component_masses, weights, means, stds, lefts, rights, loss
 
@@ -534,7 +700,8 @@ def optimize_mixture_parameters(
     mean_margin_fraction: float,
     torch_dtype: str,
     device: str | torch.device = "cpu",
-    compile_model: bool = False,
+    compile_model: bool | None = None,
+    compile_policy: CompilePolicy = "never",
     optimize_weights: bool = True,
     optimize_means: bool = True,
     optimize_stds: bool = True,
@@ -599,6 +766,10 @@ def optimize_mixture_parameters(
         raise ValueError("logit_clip must be in (0, 0.5)")
     if inverse_softplus_clip <= 0:
         raise ValueError("inverse_softplus_clip must be > 0")
+    compile_policy = _resolve_compile_policy(
+        compile_policy=compile_policy,
+        compile_model=compile_model,
+    )
 
     active_mask_np = (
         np.arange(initial_weights_np.shape[1], dtype=np.int64)[None, :]
@@ -613,6 +784,30 @@ def optimize_mixture_parameters(
         )
         optimize_left_truncations = False
         optimize_right_truncations = False
+    if max_iterations == 0 or not any(
+        [
+            optimize_weights,
+            optimize_means,
+            optimize_stds,
+            optimize_left_truncations,
+            optimize_right_truncations,
+        ]
+    ):
+        return evaluate_mixture_parameters(
+            probabilities=probabilities_np,
+            bin_edges=bin_edges_np,
+            support_mask=support_mask_np,
+            lower_bounds=lower_bounds_np,
+            upper_bounds=upper_bounds_np,
+            selected_k=selected_k_np,
+            component_weights=initial_weights_np,
+            component_means=initial_means_np,
+            component_stds=initial_stds_np,
+            component_left_truncations=initial_left_np,
+            component_right_truncations=initial_right_np,
+            torch_dtype=torch_dtype,
+            device=device,
+        )
     (
         initial_weight_logits,
         initial_mean_raw,
@@ -644,30 +839,57 @@ def optimize_mixture_parameters(
         bin_edges_np,
         floor_fraction=sigma_floor_fraction,
     )
-    module = RefitModule(
-        target=torch.as_tensor(probabilities_np, dtype=dtype_obj, device=device_obj),
-        bin_edges=torch.as_tensor(bin_edges_np, dtype=dtype_obj, device=device_obj),
-        bin_mask=torch.as_tensor(support_mask_np, dtype=torch.bool, device=device_obj),
-        lower_bounds=torch.as_tensor(
+    if device_obj.type == "cpu":
+        target_t = torch.as_tensor(probabilities_np, dtype=dtype_obj, device=device_obj)
+        bin_edges_t = torch.as_tensor(bin_edges_np, dtype=dtype_obj, device=device_obj)
+        bin_mask_t = torch.as_tensor(
+            support_mask_np,
+            dtype=torch.bool,
+            device=device_obj,
+        )
+        lower_bounds_t = torch.as_tensor(
             lower_bounds_np,
             dtype=dtype_obj,
             device=device_obj,
-        ),
-        upper_bounds=torch.as_tensor(
+        )
+        upper_bounds_t = torch.as_tensor(
             upper_bounds_np,
             dtype=dtype_obj,
             device=device_obj,
-        ),
-        sigma_floor_values=torch.as_tensor(
+        )
+        sigma_floor_t = torch.as_tensor(
             sigma_floor_np,
             dtype=dtype_obj,
             device=device_obj,
-        ),
-        active_mask=torch.as_tensor(
+        )
+        active_mask_t = torch.as_tensor(
             active_mask_np,
             dtype=torch.bool,
             device=device_obj,
-        ),
+        )
+    else:
+        workspace = _get_tensor_workspace(
+            batch_size=probabilities_np.shape[0],
+            n_bins=probabilities_np.shape[1],
+            n_components=initial_weights_np.shape[1],
+            dtype=dtype_obj,
+            device=device_obj,
+        )
+        target_t = _copy_numpy_to_tensor(probabilities_np, workspace.target)
+        bin_edges_t = _copy_numpy_to_tensor(bin_edges_np, workspace.bin_edges)
+        bin_mask_t = _copy_numpy_to_tensor(support_mask_np, workspace.support_mask)
+        lower_bounds_t = _copy_numpy_to_tensor(lower_bounds_np, workspace.lower_bounds)
+        upper_bounds_t = _copy_numpy_to_tensor(upper_bounds_np, workspace.upper_bounds)
+        sigma_floor_t = _copy_numpy_to_tensor(sigma_floor_np, workspace.sigma_floor)
+        active_mask_t = _copy_numpy_to_tensor(active_mask_np, workspace.active_mask)
+    module = RefitModule(
+        target=target_t,
+        bin_edges=bin_edges_t,
+        bin_mask=bin_mask_t,
+        lower_bounds=lower_bounds_t,
+        upper_bounds=upper_bounds_t,
+        sigma_floor_values=sigma_floor_t,
+        active_mask=active_mask_t,
         initial_weight_logits=initial_weight_logits,
         initial_mean_raw=initial_mean_raw,
         initial_std_raw=initial_std_raw,
@@ -685,7 +907,18 @@ def optimize_mixture_parameters(
         optimize_left_truncations=optimize_left_truncations,
         optimize_right_truncations=optimize_right_truncations,
     )
-    compiled = maybe_compile(module) if compile_model else module
+    compiled = (
+        maybe_compile(module)
+        if _should_compile_module(
+            compile_policy=compile_policy,
+            device=device_obj,
+            batch_size=probabilities_np.shape[0],
+            n_bins=probabilities_np.shape[1],
+            n_components=initial_weights_np.shape[1],
+            max_iterations=max_iterations,
+        )
+        else module
+    )
     best_state: dict[str, torch.Tensor] | None = None
     trainable_parameters = [
         parameter for parameter in module.parameters() if parameter.requires_grad

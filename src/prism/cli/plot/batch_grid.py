@@ -175,6 +175,10 @@ def plot_batch_grid_command(
         labels_path=labels_path,
         label_grid_csv_path=label_grid_csv_path,
     )
+    if label_grid_csv_path is None:
+        console.print(
+            "[yellow]Inferring batch and perturbation names from label strings; use --label-grid-csv to override the grid layout[/yellow]"
+        )
     curve_sets, batches, perturbations = resolve_batch_grid_curve_sets(
         checkpoint,
         gene_names=resolved_genes,

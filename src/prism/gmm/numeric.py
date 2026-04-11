@@ -101,6 +101,86 @@ def truncated_gaussian_bin_masses(
 
     edges_left = bin_edges[:, :-1].unsqueeze(-1)
     edges_right = bin_edges[:, 1:].unsqueeze(-1)
+    return truncated_gaussian_bin_masses_from_edges(
+        edges_left,
+        edges_right,
+        means,
+        stds,
+        left_truncations,
+        right_truncations,
+        bin_mask.unsqueeze(-1),
+    )
+
+
+def truncated_gaussian_bin_masses_dense_1d(
+    bin_edges: torch.Tensor,
+    means: torch.Tensor,
+    stds: torch.Tensor,
+    left_truncations: torch.Tensor,
+    right_truncations: torch.Tensor,
+) -> torch.Tensor:
+    if bin_edges.ndim != 1:
+        raise ValueError(f"bin_edges must be 1D, got shape={tuple(bin_edges.shape)}")
+    if means.ndim != 1:
+        raise ValueError(f"means must be 1D, got shape={tuple(means.shape)}")
+    if stds.shape != means.shape:
+        raise ValueError("stds must match means")
+    if left_truncations.shape != means.shape:
+        raise ValueError("left_truncations must match means")
+    if right_truncations.shape != means.shape:
+        raise ValueError("right_truncations must match means")
+    if bin_edges.shape[0] < 2:
+        raise ValueError("bin_edges must contain at least one bin")
+
+    edges_left = bin_edges[:-1].unsqueeze(-1)
+    edges_right = bin_edges[1:].unsqueeze(-1)
+    stds_safe = stds.clamp_min(EPS)
+    means_view = means.unsqueeze(0)
+    stds_view = stds_safe.unsqueeze(0)
+    left_view = left_truncations.unsqueeze(0)
+    right_view = right_truncations.unsqueeze(0)
+    clipped_left = torch.maximum(edges_left, left_view)
+    clipped_right = torch.minimum(edges_right, right_view)
+    active_bins = clipped_right > clipped_left
+
+    z_left = (clipped_left - means_view) / stds_view
+    z_right = (clipped_right - means_view) / stds_view
+    numerator = _normal_cdf(z_right) - _normal_cdf(z_left)
+    numerator = torch.where(active_bins, numerator, torch.zeros_like(numerator))
+    trunc_left = (left_truncations - means) / stds_safe
+    trunc_right = (right_truncations - means) / stds_safe
+    denominator = (_normal_cdf(trunc_right) - _normal_cdf(trunc_left)).clamp_min(EPS)
+    masses = (numerator / denominator.unsqueeze(0)).clamp_min(0.0)
+    normalizer = masses.sum(dim=0, keepdim=True).clamp_min(EPS)
+    return masses / normalizer
+
+
+def truncated_gaussian_bin_masses_from_edges(
+    edges_left: torch.Tensor,
+    edges_right: torch.Tensor,
+    means: torch.Tensor,
+    stds: torch.Tensor,
+    left_truncations: torch.Tensor,
+    right_truncations: torch.Tensor,
+    bin_mask: torch.Tensor,
+) -> torch.Tensor:
+    if edges_left.ndim != 3 or edges_right.ndim != 3:
+        raise ValueError("edges_left and edges_right must be 3D")
+    if edges_left.shape != edges_right.shape:
+        raise ValueError("edges_left and edges_right must match")
+    if means.ndim != 2:
+        raise ValueError(f"means must be 2D, got shape={tuple(means.shape)}")
+    if stds.shape != means.shape:
+        raise ValueError("stds must match means")
+    if left_truncations.shape != means.shape:
+        raise ValueError("left_truncations must match means")
+    if right_truncations.shape != means.shape:
+        raise ValueError("right_truncations must match means")
+    if bin_mask.shape != edges_left.shape:
+        raise ValueError("bin_mask must match edge tensors")
+    if means.shape[0] != edges_left.shape[0]:
+        raise ValueError("means must match the batch size")
+
     means_view = means.unsqueeze(1)
     stds_view = stds.clamp_min(EPS).unsqueeze(1)
     left_view = left_truncations.unsqueeze(1)
@@ -117,7 +197,7 @@ def truncated_gaussian_bin_masses(
     trunc_right = (right_truncations - means) / stds.clamp_min(EPS)
     denominator = (_normal_cdf(trunc_right) - _normal_cdf(trunc_left)).clamp_min(EPS)
     masses = numerator / denominator.unsqueeze(1)
-    masses = masses * bin_mask.unsqueeze(-1)
+    masses = masses * bin_mask
     masses = masses.clamp_min(0.0)
     normalizer = masses.sum(dim=1, keepdim=True).clamp_min(EPS)
     return masses / normalizer
@@ -193,4 +273,6 @@ __all__ = [
     "normalize_active_weights",
     "resolve_torch_dtype",
     "truncated_gaussian_bin_masses",
+    "truncated_gaussian_bin_masses_dense_1d",
+    "truncated_gaussian_bin_masses_from_edges",
 ]

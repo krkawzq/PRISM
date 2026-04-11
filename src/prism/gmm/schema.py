@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from types import MappingProxyType
+from typing import Literal, Mapping
 
 import numpy as np
 
-from prism.model.constants import DTYPE_NP, EPS, SupportDomain
+from prism.model.constants import DTYPE_NP, SupportDomain
 
 SupportAxis = Literal["raw", "scaled"]
 RefitPruningMetric = Literal["weight", "peak_mass"]
@@ -14,6 +15,7 @@ FrontierUpdateStrategy = Literal["full_stage", "best_prefix", "single_step"]
 CandidateAlphaStrategy = Literal["min_ratio", "least_squares"]
 KSelectionMode = Literal["threshold_first", "marginal_gain", "penalized_error"]
 TruncationMode = Literal["free", "fixed_bounds"]
+CompilePolicy = Literal["never", "auto", "always"]
 
 
 def _as_vector(values: np.ndarray | list[float], *, name: str) -> np.ndarray:
@@ -59,6 +61,116 @@ def _normalize_gene_names(gene_names: list[str]) -> list[str]:
     if len(resolved) != len(set(resolved)):
         raise ValueError("gene_names must be unique")
     return resolved
+
+
+def _freeze_config_mapping(values: Mapping[str, object]) -> Mapping[str, object]:
+    return MappingProxyType(dict(values))
+
+
+def _resolve_compile_policy_compat(
+    *,
+    compile_policy: str,
+    compile_model: object,
+    compile_policy_name: str,
+    compile_model_name: str,
+) -> tuple[CompilePolicy, bool | None]:
+    if compile_policy not in {"never", "auto", "always"}:
+        raise ValueError(f"unsupported {compile_policy_name}: {compile_policy!r}")
+    resolved_model = compile_model
+    if resolved_model is not None:
+        if not isinstance(resolved_model, bool):
+            raise ValueError(f"{compile_model_name} must be a boolean when provided")
+        legacy_policy: CompilePolicy = "always" if resolved_model else "never"
+        if compile_policy != "never" and compile_policy != legacy_policy:
+            raise ValueError(
+                f"{compile_model_name} conflicts with {compile_policy_name}"
+            )
+        return legacy_policy, resolved_model
+    return compile_policy, None
+
+
+def _validate_prefix_mask(
+    mask: np.ndarray,
+    *,
+    name: str,
+) -> np.ndarray:
+    if mask.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape={mask.shape}")
+    if mask.shape[1] > 1 and np.any(mask[:, 1:] & ~mask[:, :-1]):
+        raise ValueError(f"{name} must be prefix-contiguous along the support axis")
+    active_counts = mask.sum(axis=1).astype(np.int64, copy=False)
+    if np.any(active_counts < 1):
+        raise ValueError(f"{name} must activate at least one support point per row")
+    return active_counts
+
+
+def _validate_support_grid(
+    *,
+    support: np.ndarray,
+    support_mask: np.ndarray,
+    probabilities: np.ndarray,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
+    bin_edges: np.ndarray | None = None,
+    support_domain: SupportDomain | None = None,
+    masked_probability_name: str = "probabilities",
+) -> np.ndarray:
+    active_counts = _validate_prefix_mask(support_mask, name="support_mask")
+    masked_probabilities = np.where(support_mask, 0.0, probabilities)
+    if np.any(np.abs(masked_probabilities) > 1e-9):
+        raise ValueError(f"masked-out {masked_probability_name} must be zero")
+    if np.any(lower_bounds >= upper_bounds):
+        raise ValueError("lower_bounds must be strictly smaller than upper_bounds")
+
+    for row_idx, active_count in enumerate(active_counts.tolist()):
+        row_support = support[row_idx, :active_count]
+        if active_count > 1 and np.any(np.diff(row_support) <= 0):
+            raise ValueError("active support points must be strictly increasing")
+        if support_domain == "probability":
+            if np.any(row_support < -1e-9) or np.any(row_support > 1.0 + 1e-9):
+                raise ValueError("probability support must lie within [0, 1]")
+        elif support_domain == "rate" and np.any(row_support < -1e-9):
+            raise ValueError("rate support must be non-negative")
+        if bin_edges is None:
+            continue
+        row_edges = bin_edges[row_idx, : active_count + 1]
+        if np.any(np.diff(row_edges) <= 0):
+            raise ValueError("active bin_edges must be strictly increasing")
+        if abs(float(row_edges[0]) - float(lower_bounds[row_idx])) > 1e-9:
+            raise ValueError("lower_bounds must match the first active bin edge")
+        if abs(float(row_edges[-1]) - float(upper_bounds[row_idx])) > 1e-9:
+            raise ValueError("upper_bounds must match the last active bin edge")
+    return active_counts
+
+
+def _build_mixture_from_row(
+    *,
+    support_domain: SupportDomain,
+    lower_bound: float,
+    upper_bound: float,
+    selected_k: int,
+    component_weights: np.ndarray,
+    component_means: np.ndarray,
+    component_stds: np.ndarray,
+    component_left: np.ndarray,
+    component_right: np.ndarray,
+) -> GaussianMixtureDistribution:
+    components = tuple(
+        GaussianComponent(
+            weight=float(component_weights[component_idx]),
+            mean=float(component_means[component_idx]),
+            std=float(component_stds[component_idx]),
+            left_truncation=float(component_left[component_idx]),
+            right_truncation=float(component_right[component_idx]),
+        )
+        for component_idx in range(int(selected_k))
+    )
+    return GaussianMixtureDistribution(
+        support_domain=support_domain,
+        lower_bound=float(lower_bound),
+        upper_bound=float(upper_bound),
+        components=components,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,7 +264,8 @@ class GMMSearchConfig:
     search_refit_convergence_tolerance: float = 1e-6
     search_refit_overshoot_penalty: float = 1.0
     search_refit_mean_margin_fraction: float = 0.5
-    search_refit_compile_model: bool = False
+    search_refit_compile_policy: CompilePolicy = "never"
+    search_refit_compile_model: bool | None = None
     search_refit_optimize_weights: bool = True
     search_refit_optimize_means: bool = True
     search_refit_optimize_stds: bool = True
@@ -270,6 +383,22 @@ class GMMSearchConfig:
             raise ValueError("search_refit_logit_clip must be in (0, 0.5)")
         if self.search_refit_inverse_softplus_clip <= 0:
             raise ValueError("search_refit_inverse_softplus_clip must be > 0")
+        resolved_compile_policy, resolved_compile_model = _resolve_compile_policy_compat(
+            compile_policy=self.search_refit_compile_policy,
+            compile_model=self.search_refit_compile_model,
+            compile_policy_name="search_refit_compile_policy",
+            compile_model_name="search_refit_compile_model",
+        )
+        object.__setattr__(
+            self,
+            "search_refit_compile_policy",
+            resolved_compile_policy,
+        )
+        object.__setattr__(
+            self,
+            "search_refit_compile_model",
+            resolved_compile_model,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,7 +410,8 @@ class GMMTrainingConfig:
     mean_margin_fraction: float = 0.5
     gene_chunk_size: int = 256
     torch_dtype: Literal["float64", "float32"] = "float64"
-    compile_model: bool = True
+    compile_policy: CompilePolicy = "never"
+    compile_model: bool | None = None
     optimize_weights: bool = True
     optimize_means: bool = True
     optimize_stds: bool = True
@@ -347,12 +477,29 @@ class GMMTrainingConfig:
             raise ValueError(f"unsupported multi_start_metric: {self.multi_start_metric}")
         if self.multi_start_seed < 0:
             raise ValueError("multi_start_seed must be >= 0")
+        if self.pruning_error_metric not in {"jsd", "l1", "cross_entropy"}:
+            raise ValueError(
+                f"unsupported pruning_error_metric: {self.pruning_error_metric}"
+            )
         if self.pruning_error_threshold < 0:
             raise ValueError("pruning_error_threshold must be >= 0")
         if self.pruning_max_refits < 0:
             raise ValueError("pruning_max_refits must be >= 0")
         if self.pruning_min_components < 1:
             raise ValueError("pruning_min_components must be >= 1")
+        if self.pruning_significance_metric not in {"weight", "peak_mass"}:
+            raise ValueError(
+                "unsupported pruning_significance_metric: "
+                f"{self.pruning_significance_metric}"
+            )
+        resolved_compile_policy, resolved_compile_model = _resolve_compile_policy_compat(
+            compile_policy=self.compile_policy,
+            compile_model=self.compile_model,
+            compile_policy_name="compile_policy",
+            compile_model_name="compile_model",
+        )
+        object.__setattr__(self, "compile_policy", resolved_compile_policy)
+        object.__setattr__(self, "compile_model", resolved_compile_model)
 
 
 def _validate_component_state(
@@ -434,7 +581,7 @@ class DistributionGMMSearch:
     residual_mass_path: np.ndarray
     residual_peak_path: np.ndarray
     explored_k: np.ndarray
-    config: dict[str, object]
+    config: Mapping[str, object]
 
     def __post_init__(self) -> None:
         support = _as_matrix(self.support, name="support")
@@ -488,8 +635,19 @@ class DistributionGMMSearch:
             raise ValueError("explored_k must match the batch size")
         if np.any(explored_k < 1) or np.any(explored_k > component_weights.shape[1]):
             raise ValueError("explored_k must lie within the component axis")
+        _validate_support_grid(
+            support=support,
+            support_mask=support_mask,
+            probabilities=probabilities,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            bin_edges=bin_edges,
+            support_domain=self.support_domain,
+        )
         if np.any(np.abs(greedy_probabilities.sum(axis=1) - 1.0) > 1e-6):
             raise ValueError("greedy_probabilities must sum to 1 across support points")
+        if np.any(np.abs(np.where(support_mask, 0.0, greedy_probabilities)) > 1e-9):
+            raise ValueError("masked-out greedy_probabilities must be zero")
         _validate_component_state(
             support=support,
             probabilities=probabilities,
@@ -520,30 +678,22 @@ class DistributionGMMSearch:
         object.__setattr__(self, "residual_mass_path", residual_mass_path)
         object.__setattr__(self, "residual_peak_path", residual_peak_path)
         object.__setattr__(self, "explored_k", explored_k)
-        object.__setattr__(self, "config", dict(self.config))
+        object.__setattr__(self, "config", _freeze_config_mapping(self.config))
 
     def to_mixture(self, index: int = 0) -> GaussianMixtureDistribution:
         row_idx = int(index)
-        k = int(self.selected_k[row_idx])
-        components = tuple(
-            GaussianComponent(
-                weight=float(self.component_weights[row_idx, component_idx]),
-                mean=float(self.component_means[row_idx, component_idx]),
-                std=float(self.component_stds[row_idx, component_idx]),
-                left_truncation=float(
-                    self.component_left_truncations[row_idx, component_idx]
-                ),
-                right_truncation=float(
-                    self.component_right_truncations[row_idx, component_idx]
-                ),
-            )
-            for component_idx in range(k)
-        )
-        return GaussianMixtureDistribution(
+        if row_idx < 0 or row_idx >= self.support.shape[0]:
+            raise IndexError(f"index out of range: {index!r}")
+        return _build_mixture_from_row(
             support_domain=self.support_domain,
             lower_bound=float(self.lower_bounds[row_idx]),
             upper_bound=float(self.upper_bounds[row_idx]),
-            components=components,
+            selected_k=int(self.selected_k[row_idx]),
+            component_weights=self.component_weights[row_idx],
+            component_means=self.component_means[row_idx],
+            component_stds=self.component_stds[row_idx],
+            component_left=self.component_left_truncations[row_idx],
+            component_right=self.component_right_truncations[row_idx],
         )
 
 
@@ -570,42 +720,35 @@ class DistributionGMMReport:
     l1_error: np.ndarray
     greedy_error: np.ndarray
     explored_k: np.ndarray
-    config: dict[str, object]
+    config: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        search = DistributionGMMSearch(
-            support_domain=self.support_domain,
-            support=self.support,
-            support_mask=self.support_mask,
-            probabilities=self.probabilities,
-            bin_edges=self.bin_edges,
-            lower_bounds=self.lower_bounds,
-            upper_bounds=self.upper_bounds,
-            selected_k=self.selected_k,
-            component_weights=self.component_weights,
-            component_means=self.component_means,
-            component_stds=self.component_stds,
-            component_left_truncations=self.component_left_truncations,
-            component_right_truncations=self.component_right_truncations,
-            greedy_probabilities=self.greedy_probabilities,
-            error_path=np.repeat(
-                np.asarray(self.greedy_error, dtype=DTYPE_NP).reshape(-1, 1),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            residual_mass_path=np.repeat(
-                np.zeros((np.asarray(self.selected_k).shape[0], 1), dtype=DTYPE_NP),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            residual_peak_path=np.repeat(
-                np.zeros((np.asarray(self.selected_k).shape[0], 1), dtype=DTYPE_NP),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            explored_k=self.explored_k,
-            config=self.config,
+        support = _as_matrix(self.support, name="support")
+        support_mask = _as_bool_matrix(self.support_mask, name="support_mask")
+        probabilities = _as_matrix(self.probabilities, name="probabilities")
+        bin_edges = _as_matrix(self.bin_edges, name="bin_edges")
+        lower_bounds = _as_vector(self.lower_bounds, name="lower_bounds")
+        upper_bounds = _as_vector(self.upper_bounds, name="upper_bounds")
+        selected_k = _as_index_vector(self.selected_k, name="selected_k")
+        component_weights = _as_matrix(
+            self.component_weights,
+            name="component_weights",
         )
+        component_means = _as_matrix(self.component_means, name="component_means")
+        component_stds = _as_matrix(self.component_stds, name="component_stds")
+        component_left = _as_matrix(
+            self.component_left_truncations,
+            name="component_left_truncations",
+        )
+        component_right = _as_matrix(
+            self.component_right_truncations,
+            name="component_right_truncations",
+        )
+        greedy_probabilities = _as_matrix(
+            self.greedy_probabilities,
+            name="greedy_probabilities",
+        )
+        explored_k = _as_index_vector(self.explored_k, name="explored_k")
         fitted = _as_matrix(self.fitted_probabilities, name="fitted_probabilities")
         residual = _as_matrix(
             self.residual_probabilities,
@@ -615,63 +758,99 @@ class DistributionGMMReport:
         cross_entropy = _as_vector(self.cross_entropy, name="cross_entropy")
         l1_error = _as_vector(self.l1_error, name="l1_error")
         greedy_error = _as_vector(self.greedy_error, name="greedy_error")
-        if fitted.shape != search.support.shape:
+        if self.support_domain not in {"probability", "rate"}:
+            raise ValueError(f"unsupported support_domain: {self.support_domain!r}")
+        if bin_edges.shape != (support.shape[0], support.shape[1] + 1):
+            raise ValueError("bin_edges must have one more column than support")
+        _validate_support_grid(
+            support=support,
+            support_mask=support_mask,
+            probabilities=probabilities,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            bin_edges=bin_edges,
+            support_domain=self.support_domain,
+        )
+        _validate_component_state(
+            support=support,
+            probabilities=probabilities,
+            support_mask=support_mask,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            selected_k=selected_k,
+            component_weights=component_weights,
+            component_means=component_means,
+            component_stds=component_stds,
+            component_left=component_left,
+            component_right=component_right,
+        )
+        if greedy_probabilities.shape != support.shape:
+            raise ValueError("greedy_probabilities must match support")
+        if explored_k.shape[0] != support.shape[0]:
+            raise ValueError("explored_k must match the batch size")
+        if fitted.shape != support.shape:
             raise ValueError("fitted_probabilities must match support")
-        if residual.shape != search.support.shape:
+        if residual.shape != support.shape:
             raise ValueError("residual_probabilities must match support")
-        if jsd.shape[0] != search.support.shape[0]:
+        if jsd.shape[0] != support.shape[0]:
             raise ValueError("jsd must match the batch size")
-        if cross_entropy.shape[0] != search.support.shape[0]:
+        if cross_entropy.shape[0] != support.shape[0]:
             raise ValueError("cross_entropy must match the batch size")
-        if l1_error.shape[0] != search.support.shape[0]:
+        if l1_error.shape[0] != support.shape[0]:
             raise ValueError("l1_error must match the batch size")
-        if greedy_error.shape[0] != search.support.shape[0]:
+        if greedy_error.shape[0] != support.shape[0]:
             raise ValueError("greedy_error must match the batch size")
         if np.any(np.abs(fitted.sum(axis=1) - 1.0) > 1e-6):
             raise ValueError("fitted_probabilities must sum to 1 across support points")
+        if np.any(np.abs(greedy_probabilities.sum(axis=1) - 1.0) > 1e-6):
+            raise ValueError("greedy_probabilities must sum to 1 across support points")
+        if np.any(np.abs(np.where(support_mask, 0.0, fitted)) > 1e-9):
+            raise ValueError("masked-out fitted_probabilities must be zero")
+        if np.any(np.abs(np.where(support_mask, 0.0, residual)) > 1e-9):
+            raise ValueError("masked-out residual_probabilities must be zero")
+        if np.any(np.abs(np.where(support_mask, 0.0, greedy_probabilities)) > 1e-9):
+            raise ValueError("masked-out greedy_probabilities must be zero")
+        if np.any(np.abs((fitted + residual) - probabilities) > 1e-6):
+            raise ValueError(
+                "fitted_probabilities plus residual_probabilities must match probabilities"
+            )
+        object.__setattr__(self, "support", support)
+        object.__setattr__(self, "support_mask", support_mask)
+        object.__setattr__(self, "probabilities", probabilities)
+        object.__setattr__(self, "bin_edges", bin_edges)
+        object.__setattr__(self, "lower_bounds", lower_bounds)
+        object.__setattr__(self, "upper_bounds", upper_bounds)
+        object.__setattr__(self, "selected_k", selected_k)
+        object.__setattr__(self, "component_weights", component_weights)
+        object.__setattr__(self, "component_means", component_means)
+        object.__setattr__(self, "component_stds", component_stds)
+        object.__setattr__(self, "component_left_truncations", component_left)
+        object.__setattr__(self, "component_right_truncations", component_right)
+        object.__setattr__(self, "greedy_probabilities", greedy_probabilities)
+        object.__setattr__(self, "explored_k", explored_k)
         object.__setattr__(self, "fitted_probabilities", fitted)
         object.__setattr__(self, "residual_probabilities", residual)
         object.__setattr__(self, "jsd", jsd)
         object.__setattr__(self, "cross_entropy", cross_entropy)
         object.__setattr__(self, "l1_error", l1_error)
         object.__setattr__(self, "greedy_error", greedy_error)
-        object.__setattr__(self, "config", dict(self.config))
+        object.__setattr__(self, "config", _freeze_config_mapping(self.config))
 
     def to_mixture(self, index: int = 0) -> GaussianMixtureDistribution:
-        search = DistributionGMMSearch(
+        row_idx = int(index)
+        if row_idx < 0 or row_idx >= self.support.shape[0]:
+            raise IndexError(f"index out of range: {index!r}")
+        return _build_mixture_from_row(
             support_domain=self.support_domain,
-            support=self.support,
-            support_mask=self.support_mask,
-            probabilities=self.probabilities,
-            bin_edges=self.bin_edges,
-            lower_bounds=self.lower_bounds,
-            upper_bounds=self.upper_bounds,
-            selected_k=self.selected_k,
-            component_weights=self.component_weights,
-            component_means=self.component_means,
-            component_stds=self.component_stds,
-            component_left_truncations=self.component_left_truncations,
-            component_right_truncations=self.component_right_truncations,
-            greedy_probabilities=self.greedy_probabilities,
-            error_path=np.repeat(
-                np.asarray(self.greedy_error, dtype=DTYPE_NP).reshape(-1, 1),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            residual_mass_path=np.repeat(
-                np.zeros((np.asarray(self.selected_k).shape[0], 1), dtype=DTYPE_NP),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            residual_peak_path=np.repeat(
-                np.zeros((np.asarray(self.selected_k).shape[0], 1), dtype=DTYPE_NP),
-                np.asarray(self.component_weights, dtype=DTYPE_NP).shape[1],
-                axis=1,
-            ),
-            explored_k=self.explored_k,
-            config=self.config,
+            lower_bound=float(self.lower_bounds[row_idx]),
+            upper_bound=float(self.upper_bounds[row_idx]),
+            selected_k=int(self.selected_k[row_idx]),
+            component_weights=self.component_weights[row_idx],
+            component_means=self.component_means[row_idx],
+            component_stds=self.component_stds[row_idx],
+            component_left=self.component_left_truncations[row_idx],
+            component_right=self.component_right_truncations[row_idx],
         )
-        return search.to_mixture(index=index)
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,7 +876,7 @@ class PriorGMMReport:
     l1_error: np.ndarray
     explored_k: np.ndarray
     scale: float
-    config: dict[str, object]
+    config: Mapping[str, object]
 
     def __post_init__(self) -> None:
         names = _normalize_gene_names(list(self.gene_names))
@@ -731,6 +910,8 @@ class PriorGMMReport:
         cross_entropy = _as_vector(self.cross_entropy, name="cross_entropy")
         l1_error = _as_vector(self.l1_error, name="l1_error")
         explored_k = _as_index_vector(self.explored_k, name="explored_k")
+        if self.support_domain not in {"probability", "rate"}:
+            raise ValueError(f"unsupported support_domain: {self.support_domain!r}")
         if support.shape != scaled_support.shape:
             raise ValueError("support and scaled_support must match")
         if support.shape != support_mask.shape:
@@ -745,6 +926,14 @@ class PriorGMMReport:
             raise ValueError("gene_names must match the batch size")
         if explored_k.shape[0] != len(names):
             raise ValueError("explored_k must match the batch size")
+        _validate_support_grid(
+            support=support,
+            support_mask=support_mask,
+            probabilities=probabilities,
+            lower_bounds=lower_bounds,
+            upper_bounds=upper_bounds,
+            support_domain=self.support_domain,
+        )
         _validate_component_state(
             support=support,
             probabilities=probabilities,
@@ -766,6 +955,16 @@ class PriorGMMReport:
             raise ValueError("l1_error must match the batch size")
         if not np.isfinite(self.scale) or self.scale <= 0:
             raise ValueError("scale must be finite and positive")
+        if np.any(np.abs(fitted.sum(axis=1) - 1.0) > 1e-6):
+            raise ValueError("fitted_probabilities must sum to 1 across support points")
+        if np.any(np.abs(np.where(support_mask, 0.0, fitted)) > 1e-9):
+            raise ValueError("masked-out fitted_probabilities must be zero")
+        if np.any(np.abs(np.where(support_mask, 0.0, residual)) > 1e-9):
+            raise ValueError("masked-out residual_probabilities must be zero")
+        if np.any(np.abs((fitted + residual) - probabilities) > 1e-6):
+            raise ValueError(
+                "fitted_probabilities plus residual_probabilities must match probabilities"
+            )
         object.__setattr__(self, "gene_names", names)
         object.__setattr__(self, "support", support)
         object.__setattr__(self, "scaled_support", scaled_support)
@@ -785,37 +984,28 @@ class PriorGMMReport:
         object.__setattr__(self, "cross_entropy", cross_entropy)
         object.__setattr__(self, "l1_error", l1_error)
         object.__setattr__(self, "explored_k", explored_k)
-        object.__setattr__(self, "config", dict(self.config))
+        object.__setattr__(self, "config", _freeze_config_mapping(self.config))
 
     def to_mixture(self, gene_name: str) -> GaussianMixtureDistribution:
         try:
             row_idx = self.gene_names.index(str(gene_name))
         except ValueError as exc:
             raise KeyError(f"unknown gene_name: {gene_name!r}") from exc
-        k = int(self.selected_k[row_idx])
-        components = tuple(
-            GaussianComponent(
-                weight=float(self.component_weights[row_idx, component_idx]),
-                mean=float(self.component_means[row_idx, component_idx]),
-                std=float(self.component_stds[row_idx, component_idx]),
-                left_truncation=float(
-                    self.component_left_truncations[row_idx, component_idx]
-                ),
-                right_truncation=float(
-                    self.component_right_truncations[row_idx, component_idx]
-                ),
-            )
-            for component_idx in range(k)
-        )
-        return GaussianMixtureDistribution(
+        return _build_mixture_from_row(
             support_domain=self.support_domain,
             lower_bound=float(self.lower_bounds[row_idx]),
             upper_bound=float(self.upper_bounds[row_idx]),
-            components=components,
+            selected_k=int(self.selected_k[row_idx]),
+            component_weights=self.component_weights[row_idx],
+            component_means=self.component_means[row_idx],
+            component_stds=self.component_stds[row_idx],
+            component_left=self.component_left_truncations[row_idx],
+            component_right=self.component_right_truncations[row_idx],
         )
 
 
 __all__ = [
+    "CompilePolicy",
     "DistributionGMMReport",
     "DistributionGMMSearch",
     "FrontierUpdateStrategy",

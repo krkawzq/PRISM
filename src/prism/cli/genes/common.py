@@ -303,6 +303,55 @@ def maybe_subsample_adata(
     return sampled, metadata
 
 
+def maybe_subset_adata_by_obs(
+    adata: ad.AnnData,
+    *,
+    obs_key: str | None,
+    obs_values: list[str] | None,
+) -> tuple[ad.AnnData, dict[str, Any]]:
+    metadata: dict[str, Any] = {
+        "obs_filter_applied": False,
+        "obs_filter_key": obs_key,
+        "obs_filter_values": []
+        if obs_values is None
+        else [str(value) for value in obs_values],
+        "n_cells_before_obs_filter": int(adata.n_obs),
+        "n_cells_after_obs_filter": int(adata.n_obs),
+    }
+    if obs_values and obs_key is None:
+        raise ValueError("--obs-key is required when --obs-value/--obs-values is set")
+    if obs_key is None or not obs_values:
+        return adata, metadata
+    if obs_key not in adata.obs.columns:
+        raise KeyError(f"obs column {obs_key!r} does not exist")
+    requested_values: list[str] = []
+    seen: set[str] = set()
+    for value in obs_values:
+        resolved = str(value).strip()
+        if not resolved or resolved in seen:
+            continue
+        seen.add(resolved)
+        requested_values.append(resolved)
+    if not requested_values:
+        raise ValueError("obs filter values are empty after trimming blanks")
+    labels = np.asarray(adata.obs[obs_key].astype(str)).reshape(-1)
+    mask = np.isin(labels, np.asarray(requested_values, dtype=object))
+    selected = int(mask.sum())
+    if selected == 0:
+        raise ValueError(
+            f"no cells matched obs filter {obs_key!r} for values {requested_values[:10]}"
+        )
+    subset = adata[mask].copy()
+    metadata.update(
+        {
+            "obs_filter_applied": True,
+            "obs_filter_values": requested_values,
+            "n_cells_after_obs_filter": int(subset.n_obs),
+        }
+    )
+    return subset, metadata
+
+
 def compute_hvg_ranking_from_adata(
     adata: ad.AnnData, *, flavor: str
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -435,6 +484,8 @@ def compute_ranking(
     hvg_flavor: str,
     prior_source: str,
     label: str | None,
+    obs_key: str | None,
+    obs_values: list[str] | None,
     max_cells: int | None,
     random_seed: int,
 ) -> RankingResult:
@@ -456,6 +507,9 @@ def compute_ranking(
             },
         )
     adata = ad.read_h5ad(input_path)
+    adata, obs_filter_metadata = maybe_subset_adata_by_obs(
+        adata, obs_key=obs_key, obs_values=obs_values
+    )
     adata, sampling_metadata = maybe_subsample_adata(
         adata, max_cells=max_cells, random_seed=random_seed
     )
@@ -473,6 +527,7 @@ def compute_ranking(
             adata, method=method_resolved
         )
     metadata = dict(metadata)
+    metadata.update(obs_filter_metadata)
     metadata.update(sampling_metadata)
     return RankingResult(
         gene_names=np.asarray(gene_names),
@@ -749,6 +804,7 @@ __all__ = [
     "load_config_rules",
     "load_var_names",
     "maybe_subsample_adata",
+    "maybe_subset_adata_by_obs",
     "merge_gene_lists",
     "normalize_filter_species",
     "normalize_gene_set_mode",

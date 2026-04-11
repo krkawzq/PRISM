@@ -222,11 +222,13 @@ def resolve_scale(
 
 
 def slice_gene_counts(
-    matrix, positions: list[int], *, cell_indices: np.ndarray | None = None
+    matrix,
+    positions: list[int],
+    *,
+    cell_indices: np.ndarray | None = None,
+    dtype: np.dtype | type = np.float64,
 ) -> np.ndarray:
-    return slice_gene_matrix(
-        matrix, positions, cell_indices=cell_indices, dtype=np.float64
-    )
+    return slice_gene_matrix(matrix, positions, cell_indices=cell_indices, dtype=dtype)
 
 
 def print_fit_plan(**values: Any) -> None:

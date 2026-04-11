@@ -13,7 +13,7 @@ from prism.cli.common import (
     print_key_value_table,
     print_saved_path,
     resolve_numpy_dtype,
-    resolve_prior_source
+    resolve_prior_source,
 )
 from prism.io import (
     compute_reference_counts as compute_reference_counts_shared,
@@ -90,12 +90,22 @@ def select_matrix(adata: ad.AnnData, layer: str | None):
     return select_matrix_shared(adata, layer)
 
 
-def slice_gene_counts(matrix, positions: list[int]) -> np.ndarray:
-    return slice_gene_matrix_shared(matrix, positions, dtype=np.float64)
+def slice_gene_counts(
+    matrix,
+    positions: list[int],
+    *,
+    dtype: np.dtype | type = np.float64,
+) -> np.ndarray:
+    return slice_gene_matrix_shared(matrix, positions, dtype=dtype)
 
 
-def compute_reference_counts(matrix, positions: list[int]) -> np.ndarray:
-    return compute_reference_counts_shared(matrix, positions, dtype=np.float64)
+def compute_reference_counts(
+    matrix,
+    positions: list[int],
+    *,
+    dtype: np.dtype | type = np.float64,
+) -> np.ndarray:
+    return compute_reference_counts_shared(matrix, positions, dtype=dtype)
 
 
 def extract_batch(
@@ -109,6 +119,8 @@ def extract_batch(
     label_groups: dict[str, np.ndarray] | None,
     device: str,
     torch_dtype: str,
+    result_dtype: str,
+    output_dtype: np.dtype,
     selected_channels: list[str],
 ) -> dict[str, np.ndarray]:
     requested_channels = cast(set[SignalChannel], set(selected_channels))
@@ -125,6 +137,7 @@ def extract_batch(
             prior.select_genes(batch_names),
             device=device,
             torch_dtype=torch_dtype,
+            result_dtype=result_dtype,
             posterior_distribution=posterior_distribution,
             nb_overdispersion=nb_overdispersion,
         )
@@ -140,7 +153,7 @@ def extract_batch(
         raise ValueError("label groups are required when --prior-source label")
     layer_values = {
         channel: np.full(
-            (batch_counts.shape[0], len(batch_names)), np.nan, dtype=np.float64
+            (batch_counts.shape[0], len(batch_names)), np.nan, dtype=output_dtype
         )
         for channel in selected_channels
     }
@@ -151,6 +164,7 @@ def extract_batch(
             prior.select_genes(batch_names),
             device=device,
             torch_dtype=torch_dtype,
+            result_dtype=result_dtype,
             posterior_distribution=posterior_distribution,
             nb_overdispersion=nb_overdispersion,
         )
@@ -164,7 +178,8 @@ def extract_batch(
         )
         for channel in selected_channels:
             layer_values[channel][cell_indices] = np.asarray(
-                extracted[channel], dtype=np.float64
+                extracted[channel],
+                dtype=output_dtype,
             )
     return layer_values
 

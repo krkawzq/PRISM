@@ -13,9 +13,11 @@ from prism.cli.common import (
     print_saved_path,
     resolve_float,
     resolve_int,
+    resolve_optional_path,
     resolve_optional_str,
     resolve_str,
 )
+from prism.io import read_gene_list
 from prism.plotting import plt
 
 from .common import normalize_distribution_plot_type, resolve_optional_list
@@ -29,7 +31,9 @@ def _plot_ungrouped(
     plot_type: str,
 ) -> None:
     data = [layer_data[:, pos] for pos in gene_positions]
-    data = [np.asarray(values[np.isfinite(values)], dtype=np.float64) for values in data]
+    data = [
+        np.asarray(values[np.isfinite(values)], dtype=np.float64) for values in data
+    ]
     positions = list(range(len(gene_names)))
     if plot_type == "violin":
         parts = ax.violinplot(data, positions=positions, showmedians=True)
@@ -98,11 +102,14 @@ def _plot_grouped(
                     patch.set_facecolor(color)
                     patch.set_alpha(0.6)
         else:
-            for values in data:
-                ax.hist(values, bins=20, alpha=0.4, color=color, label=label)
-            break
+            ax.hist(data[0], bins=20, alpha=0.4, color=color, label=label)
     ax.set_xticks(range(n_genes))
     ax.set_xticklabels(gene_names, rotation=45, ha="right", fontsize=7)
+    if plot_type == "hist":
+        ax.set_xticks([])
+        ax.set_xlabel(gene_names[0])
+        ax.legend(fontsize=6, loc="upper right")
+        return
     if n_groups <= 10:
         from matplotlib.patches import Patch
 
@@ -113,12 +120,72 @@ def _plot_grouped(
         ax.legend(handles=handles, fontsize=6, loc="upper right")
 
 
+def _resolve_distribution_gene_names(
+    adata: ad.AnnData,
+    *,
+    gene_names: list[str] | None,
+    genes_path: Path | None,
+    max_genes: int,
+    sample_genes: bool,
+    seed: int,
+) -> tuple[list[str], list[int]]:
+    available_gene_names = [str(name) for name in adata.var_names.tolist()]
+    if gene_names is not None and genes_path is not None:
+        raise ValueError("--gene and --genes are mutually exclusive")
+    if gene_names is not None or genes_path is not None:
+        requested = gene_names if gene_names is not None else read_gene_list(genes_path)
+        assert requested is not None
+        selected_names: list[str] = []
+        selected_positions: list[int] = []
+        lookup = {gene_name: idx for idx, gene_name in enumerate(available_gene_names)}
+        missing: list[str] = []
+        for gene_name in requested:
+            resolved = str(gene_name).strip()
+            if not resolved:
+                continue
+            idx = lookup.get(resolved)
+            if idx is None:
+                missing.append(resolved)
+                continue
+            selected_names.append(resolved)
+            selected_positions.append(idx)
+        if missing:
+            raise ValueError(
+                f"{len(missing)} requested genes are missing from the dataset; examples: {missing[:5]}"
+            )
+        if not selected_names:
+            raise ValueError("no genes remain after filtering the requested gene list")
+        limit = min(max_genes, len(selected_names))
+        return selected_names[:limit], selected_positions[:limit]
+    if len(available_gene_names) <= max_genes:
+        return available_gene_names, list(range(len(available_gene_names)))
+    if sample_genes:
+        rng = np.random.default_rng(seed)
+        chosen_idx = np.sort(
+            rng.choice(len(available_gene_names), size=max_genes, replace=False)
+        )
+        return [available_gene_names[idx] for idx in chosen_idx], chosen_idx.tolist()
+    selected_positions = list(range(max_genes))
+    return [available_gene_names[idx] for idx in selected_positions], selected_positions
+
+
 def plot_distributions_command(
     h5ad_path: Path = typer.Argument(
         ..., exists=True, dir_okay=False, help="Extracted h5ad file with signal layers."
     ),
-    output_path: Path = typer.Option(
-        ..., "--output", "-o", help="Output figure path."
+    output_path: Path = typer.Option(..., "--output", "-o", help="Output figure path."),
+    gene_names: list[str] | None = typer.Option(
+        None,
+        "--gene",
+        help="Repeatable gene name to plot. Defaults to the first --max-genes genes.",
+    ),
+    genes_path: Path | None = typer.Option(
+        None,
+        "--genes",
+        "--gene-list",
+        exists=True,
+        dir_okay=False,
+        help="Optional gene-list file used instead of random or leading-gene selection.",
     ),
     layers: list[str] | None = typer.Option(
         None,
@@ -140,6 +207,11 @@ def plot_distributions_command(
     figsize_w: float = typer.Option(12.0, help="Figure width in inches."),
     figsize_h: float = typer.Option(4.0, help="Figure height per layer in inches."),
     seed: int = typer.Option(0, min=0, help="Random seed for gene sampling."),
+    sample_genes: bool = typer.Option(
+        False,
+        "--sample-genes/--no-sample-genes",
+        help="Randomly sample genes when no explicit gene selection is provided.",
+    ),
     palette: str | None = typer.Option(
         None, help="Optional matplotlib colormap name for group coloring."
     ),
@@ -147,11 +219,13 @@ def plot_distributions_command(
     start_time = perf_counter()
     h5ad_path = h5ad_path.expanduser().resolve()
     output_path = output_path.expanduser().resolve()
+    genes_path = resolve_optional_path(genes_path)
     group_key = resolve_optional_str(group_key)
     max_genes = resolve_int(max_genes)
     figsize_w = resolve_float(figsize_w)
     figsize_h = resolve_float(figsize_h)
     seed = resolve_int(seed)
+    sample_genes = bool(sample_genes)
     palette = resolve_optional_str(palette)
     resolved_plot_type = normalize_distribution_plot_type(resolve_str(plot_type))
 
@@ -172,14 +246,14 @@ def plot_distributions_command(
     if missing_layers:
         raise ValueError(f"layers not found in h5ad: {missing_layers}")
 
-    gene_names = [str(name) for name in adata.var_names.tolist()]
-    if len(gene_names) > max_genes:
-        rng = np.random.default_rng(seed)
-        chosen_idx = np.sort(rng.choice(len(gene_names), size=max_genes, replace=False))
-        gene_names = [gene_names[idx] for idx in chosen_idx]
-        gene_positions = chosen_idx.tolist()
-    else:
-        gene_positions = list(range(len(gene_names)))
+    selected_gene_names, gene_positions = _resolve_distribution_gene_names(
+        adata,
+        gene_names=resolve_optional_list(gene_names),
+        genes_path=genes_path,
+        max_genes=max_genes,
+        sample_genes=sample_genes,
+        seed=seed,
+    )
 
     groups = None
     group_labels = None
@@ -191,6 +265,10 @@ def plot_distributions_command(
         groups = {
             label: np.flatnonzero(labels_array == label) for label in group_labels
         }
+        if resolved_plot_type == "hist" and len(selected_gene_names) != 1:
+            raise ValueError(
+                "grouped histogram plots require exactly one gene; use --gene or choose --plot-type violin/box"
+            )
 
     fig, axes = plt.subplots(
         len(selected_layers),
@@ -205,7 +283,7 @@ def plot_distributions_command(
             _plot_ungrouped(
                 ax,
                 layer_data,
-                gene_names,
+                selected_gene_names,
                 gene_positions,
                 resolved_plot_type,
             )
@@ -213,7 +291,7 @@ def plot_distributions_command(
             _plot_grouped(
                 ax,
                 layer_data,
-                gene_names,
+                selected_gene_names,
                 gene_positions,
                 groups,
                 group_labels,

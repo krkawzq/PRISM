@@ -99,7 +99,7 @@ def parse_fit_params(request: Request) -> GeneFitParams:
             min_value=0.0,
         ),
         cell_chunk_size=parse_int(
-            request.first("cell_chunk_size"), default=512, min_value=1
+            request.first("cell_chunk_size"), default=4096, min_value=1
         ),
         support_max_from="quantile"
         if (request.first("support_max_from") or "").strip().lower() == "quantile"

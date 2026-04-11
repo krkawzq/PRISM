@@ -57,7 +57,7 @@ DATASETS: tuple[DatasetSpec, ...] = (
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def default_output_dir() -> Path:
@@ -112,9 +112,10 @@ def download_file(url: str, destination: Path, *, force: bool) -> Path:
     print(f"Downloading {url} -> {destination}")
     try:
         request = urllib.request.Request(url, headers=DOWNLOAD_HEADERS)
-        with urllib.request.urlopen(request) as response, temp_path.open(
-            "wb"
-        ) as handle:
+        with (
+            urllib.request.urlopen(request) as response,
+            temp_path.open("wb") as handle,
+        ):
             shutil.copyfileobj(response, handle)
         temp_path.replace(destination)
     finally:

@@ -299,6 +299,17 @@ uv run prism genes rank input.h5ad \
 ```
 
 ```bash
+uv run prism genes rank input.h5ad \
+  --method lognorm-variance \
+  --obs-key guide_target \
+  --obs-value NegCtrl0_NegCtrl0 \
+  --obs-value NegCtrl10_NegCtrl0 \
+  --top-n 200 \
+  --output-gene-column gene_name \
+  --output outputs/top200_symbols.txt
+```
+
+```bash
 uv run prism genes rank outputs/checkpoint.pkl \
   --method prior-entropy \
   --prior-source global \
@@ -310,6 +321,9 @@ Useful options:
 - `--method`: ranking method
 - `--restrict-genes`: limit output to a supplied gene list
 - `--max-cells`, `--seed`: h5ad-based ranking controls
+- `--obs-key`, `--obs-value`, `--obs-values`: restrict h5ad ranking to selected cells
+- `--top-n`: write only the leading ranked genes
+- `--output-gene-column`: emit a `var` column such as `gene_name` instead of `var_names`
 - `--prior-source`, `--label`: checkpoint-based ranking controls
 
 #### `prism genes merge`
@@ -452,10 +466,38 @@ uv run prism plot priors outputs/checkpoint.pkl \
   --output outputs/priors.svg
 ```
 
+You can also rank genes directly from the source h5ad, then plot the resulting prior curves in one step:
+
+```bash
+uv run prism plot priors outputs/checkpoint.pkl \
+  --rank-method lognorm-variance \
+  --rank-obs-key guide_target \
+  --rank-obs-value NegCtrl0_NegCtrl0 \
+  --rank-obs-value NegCtrl10_NegCtrl0 \
+  --rank-top-n 200 \
+  --label NegCtrl0_NegCtrl0 \
+  --label NegCtrl10_NegCtrl0 \
+  --no-include-global \
+  --layout facet \
+  --output outputs/top200_priors.svg
+```
+
+If your checkpoint stores Ensembl-style gene ids, you can map gene symbols through an h5ad `var` column:
+
+```bash
+uv run prism plot priors outputs/checkpoint.pkl \
+  --gene HBG1 \
+  --gene-id-column gene_name \
+  --label NegCtrl0_NegCtrl0 \
+  --output outputs/hbg1_prior.svg
+```
+
 Useful options:
 
 - `--checkpoint-name`: display names aligned to input checkpoints
-- `--gene`, `--genes`, `--top-n`: gene selection controls
+- `--gene`, `--genes`, `--top-n`: explicit gene selection controls
+- `--rank-h5ad`, `--rank-method`, `--rank-obs-key`, `--rank-obs-value`, `--rank-top-n`: rank-driven gene selection from h5ad
+- `--gene-annotations-h5ad`, `--gene-id-column`: map gene symbols through h5ad annotations and add facet labels
 - `--label`, `--labels`: label prior selection controls
 - `--output-csv`, `--summary-csv`: export plotted data/statistics
 - `--annot-csv`, `--annot-name`: extra facet annotations
@@ -479,7 +521,7 @@ uv run prism plot batch-grid outputs/checkpoint.pkl \
 
 Useful options:
 
-- `--label-grid-csv`: custom CSV describing batch/perturbation grid layout
+- `--label-grid-csv`: custom CSV describing batch/perturbation grid layout; recommended when label names do not follow `batch_perturbation`
 - `--image-format`: `svg`, `pdf`, or `eps`
 - `--output-csv`, `--summary-csv`: export data/statistics
 - `--hide-empty`: hide empty grid cells
@@ -494,12 +536,23 @@ uv run prism plot distributions outputs/signals.h5ad \
   --output outputs/distributions.svg
 ```
 
+```bash
+uv run prism plot distributions outputs/signals.h5ad \
+  --gene CD3D \
+  --gene MS4A1 \
+  --group-key cell_type \
+  --plot-type violin \
+  --output outputs/distributions_markers.svg
+```
+
 Useful options:
 
+- `--gene`, `--genes`: explicit gene selection
 - `--layer`: repeatable layer selection
 - `--group-key`: group by an `obs` column
 - `--plot-type`: `violin`, `box`, or `hist`
-- `--max-genes`: limit plotted genes
+- `--max-genes`: limit plotted genes when explicit genes are not provided
+- `--sample-genes`: opt into random gene sampling instead of deterministic leading-gene selection
 
 #### `prism plot label-summary`
 
@@ -513,6 +566,7 @@ uv run prism plot label-summary outputs/checkpoint.pkl \
 Useful options:
 
 - `--gene`: repeatable gene selection
+- `--label`, `--labels`: restrict the summary matrix to selected label priors
 - `--max-genes`: limit plotted genes
 - `--metric`: `jsd` or `overlap`
 

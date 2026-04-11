@@ -7,7 +7,7 @@ import numpy as np
 
 from .exposure import mean_reference_count
 from .fit import fit_gene_priors
-from .types import ObservationBatch, PriorFitConfig, PriorFitResult, PriorGrid
+from .types import ObservationBatch, PriorFitConfig, PriorGrid
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +42,7 @@ class PriorEngineTrainingConfig:
     n_support_points: int = 512
     max_em_iterations: int | None = 200
     convergence_tolerance: float = 1e-6
-    cell_chunk_size: int = 512
+    cell_chunk_size: int = 4096
     torch_dtype: Literal["float64", "float32"] = "float64"
     compile_model: bool = True
 
@@ -158,14 +158,10 @@ class PriorEngine:
         self._prior = result.prior
         return PriorFitReport(
             gene_names=list(result.gene_names),
-            support=np.asarray(result.prior.support, dtype=np.float64),
-            scaled_support=np.asarray(result.prior.scaled_support, dtype=np.float64),
-            prior_probabilities=np.asarray(
-                result.prior.prior_probabilities, dtype=np.float64
-            ),
-            posterior_mean_probabilities=np.asarray(
-                result.posterior_mean_probabilities, dtype=np.float64
-            ),
+            support=np.asarray(result.prior.support),
+            scaled_support=np.asarray(result.prior.scaled_support),
+            prior_probabilities=np.asarray(result.prior.prior_probabilities),
+            posterior_mean_probabilities=np.asarray(result.posterior_mean_probabilities),
             final_objective=float(result.final_objective),
             config=dict(result.config),
             scale=float(result.prior.scale),

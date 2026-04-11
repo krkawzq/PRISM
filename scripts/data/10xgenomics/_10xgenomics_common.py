@@ -40,7 +40,7 @@ class DatasetSpec:
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    return Path(__file__).resolve().parents[3]
 
 
 def default_output_dir(category: str) -> Path:
@@ -69,9 +69,10 @@ def download_file(url: str, destination: Path, *, force: bool) -> Path:
     try:
         try:
             request = urllib.request.Request(url, headers=DOWNLOAD_HEADERS)
-            with urllib.request.urlopen(request) as response, temp_path.open(
-                "wb"
-            ) as handle:
+            with (
+                urllib.request.urlopen(request) as response,
+                temp_path.open("wb") as handle,
+            ):
                 shutil.copyfileobj(response, handle)
         except (HTTPError, URLError):
             if temp_path.exists():
@@ -146,7 +147,9 @@ def write_h5ad_atomic(adata, output_path: Path) -> None:
             temp_path.unlink()
 
 
-def download_dataset(spec: DatasetSpec, raw_root: Path, *, force_download: bool) -> Path:
+def download_dataset(
+    spec: DatasetSpec, raw_root: Path, *, force_download: bool
+) -> Path:
     return download_file(
         spec.url,
         raw_root / spec.raw_subdir / spec.resolved_raw_filename(),

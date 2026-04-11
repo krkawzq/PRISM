@@ -1,11 +1,47 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 
 from .constants import EPS, NEG_INF
+
+
+@dataclass(frozen=True, slots=True)
+class _ProbabilitySupportTerms:
+    values: torch.Tensor
+    log_values: torch.Tensor
+    log1m_values: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _RateSupportTerms:
+    values: torch.Tensor
+    log_values: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _BinomialObservationTerms:
+    counts: torch.Tensor
+    exposure: torch.Tensor
+    log_coeff: torch.Tensor
+    invalid: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _NegativeBinomialObservationTerms:
+    counts: torch.Tensor
+    exposure: torch.Tensor
+    base_term: torch.Tensor
+    r: float
+    r_tensor: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class _PoissonObservationTerms:
+    counts: torch.Tensor
 
 
 def gaussian_kernel_1d(
@@ -48,28 +84,133 @@ def smooth_probability_weights(
     return smoothed[0] if squeeze else smoothed
 
 
+def _validate_count_exposure_shapes(
+    counts: torch.Tensor,
+    effective_exposure: torch.Tensor,
+) -> None:
+    if counts.shape != effective_exposure.shape:
+        raise ValueError(
+            "counts and effective_exposure must match, got "
+            f"{tuple(counts.shape)} != {tuple(effective_exposure.shape)}"
+        )
+
+
+def _probability_support_terms(support: torch.Tensor) -> _ProbabilitySupportTerms:
+    if support.ndim != 2:
+        raise ValueError(f"support must be 2D, got shape={tuple(support.shape)}")
+    values = support.clamp(EPS, 1.0 - EPS)
+    return _ProbabilitySupportTerms(
+        values=values,
+        log_values=torch.log(values),
+        log1m_values=torch.log1p(-values),
+    )
+
+
+def _rate_support_terms(support: torch.Tensor) -> _RateSupportTerms:
+    if support.ndim != 2:
+        raise ValueError(f"support must be 2D, got shape={tuple(support.shape)}")
+    values = support.clamp_min(EPS)
+    return _RateSupportTerms(
+        values=values,
+        log_values=torch.log(values),
+    )
+
+
+def _binomial_observation_terms(
+    counts: torch.Tensor,
+    effective_exposure: torch.Tensor,
+) -> _BinomialObservationTerms:
+    _validate_count_exposure_shapes(counts, effective_exposure)
+    counts_values = counts.unsqueeze(-1)
+    exposure_values = effective_exposure.unsqueeze(-1)
+    log_coeff = (
+        torch.lgamma(exposure_values + 1.0)
+        - torch.lgamma(counts_values + 1.0)
+        - torch.lgamma((exposure_values - counts_values).clamp_min(0.0) + 1.0)
+    )
+    invalid = counts_values > (exposure_values + 1e-9)
+    return _BinomialObservationTerms(
+        counts=counts_values,
+        exposure=exposure_values,
+        log_coeff=log_coeff,
+        invalid=invalid,
+    )
+
+
+def _negative_binomial_observation_terms(
+    counts: torch.Tensor,
+    effective_exposure: torch.Tensor,
+    overdispersion: float,
+) -> _NegativeBinomialObservationTerms:
+    _validate_count_exposure_shapes(counts, effective_exposure)
+    counts_values = counts.unsqueeze(-1)
+    exposure_values = effective_exposure.unsqueeze(-1)
+    r = float(1.0 / overdispersion)
+    r_tensor = torch.tensor(r, dtype=counts_values.dtype, device=counts_values.device)
+    base_term = (
+        torch.lgamma(counts_values + r)
+        - torch.lgamma(counts_values + 1.0)
+        - torch.lgamma(r_tensor)
+        + r * torch.log(r_tensor)
+    )
+    return _NegativeBinomialObservationTerms(
+        counts=counts_values,
+        exposure=exposure_values,
+        base_term=base_term,
+        r=r,
+        r_tensor=r_tensor,
+    )
+
+
+def _poisson_observation_terms(counts: torch.Tensor) -> _PoissonObservationTerms:
+    return _PoissonObservationTerms(counts=counts.unsqueeze(-1))
+
+
+def _log_binomial_likelihood_from_terms(
+    observation_terms: _BinomialObservationTerms,
+    support_terms: _ProbabilitySupportTerms,
+) -> torch.Tensor:
+    log_likelihood = (
+        observation_terms.log_coeff
+        + observation_terms.counts * support_terms.log_values.unsqueeze(-2)
+        + (observation_terms.exposure - observation_terms.counts)
+        * support_terms.log1m_values.unsqueeze(-2)
+    )
+    return log_likelihood.masked_fill(observation_terms.invalid, NEG_INF)
+
+
+def _log_negative_binomial_likelihood_from_terms(
+    observation_terms: _NegativeBinomialObservationTerms,
+    support_terms: _ProbabilitySupportTerms,
+) -> torch.Tensor:
+    mu = observation_terms.exposure * support_terms.values.unsqueeze(-2)
+    log_r_plus_mu = torch.log(observation_terms.r_tensor + mu)
+    return (
+        observation_terms.base_term
+        + observation_terms.counts * torch.log(mu + EPS)
+        - (observation_terms.counts + observation_terms.r) * log_r_plus_mu
+    )
+
+
+def _log_poisson_likelihood_from_terms(
+    observation_terms: _PoissonObservationTerms,
+    support_terms: _RateSupportTerms,
+) -> torch.Tensor:
+    return (
+        observation_terms.counts * support_terms.log_values.unsqueeze(-2)
+        - support_terms.values.unsqueeze(-2)
+    )
+
+
 def log_binomial_likelihood_support(
     counts: torch.Tensor,
     effective_exposure: torch.Tensor,
     support: torch.Tensor,
 ) -> torch.Tensor:
-    if counts.shape != effective_exposure.shape:
-        raise ValueError(
-            f"counts and effective_exposure must match, got {tuple(counts.shape)} != {tuple(effective_exposure.shape)}"
-        )
-    if support.ndim != 2:
-        raise ValueError(f"support must be 2D, got shape={tuple(support.shape)}")
-    x = counts.unsqueeze(-1)
-    n = effective_exposure.unsqueeze(-1)
-    p = support.unsqueeze(-2).clamp(EPS, 1.0 - EPS)
-    log_coeff = (
-        torch.lgamma(n + 1.0)
-        - torch.lgamma(x + 1.0)
-        - torch.lgamma((n - x).clamp_min(0.0) + 1.0)
+    return _log_binomial_likelihood_from_terms(
+        _binomial_observation_terms(counts, effective_exposure),
+        _probability_support_terms(support),
     )
-    log_likelihood = log_coeff + x * torch.log(p) + (n - x) * torch.log1p(-p)
-    invalid = x > (n + 1e-9)
-    return log_likelihood.masked_fill(invalid, NEG_INF)
 
 
 def log_negative_binomial_likelihood_support(
@@ -78,24 +219,13 @@ def log_negative_binomial_likelihood_support(
     support: torch.Tensor,
     overdispersion: float = 0.01,
 ) -> torch.Tensor:
-    if counts.shape != effective_exposure.shape:
-        raise ValueError(
-            f"counts and effective_exposure must match, got {tuple(counts.shape)} != {tuple(effective_exposure.shape)}"
-        )
-    x = counts.unsqueeze(-1)
-    n = effective_exposure.unsqueeze(-1)
-    p = support.unsqueeze(-2).clamp(EPS, 1.0 - EPS)
-    mu = n * p
-    r = 1.0 / overdispersion
-    r_tensor = torch.tensor(r, dtype=x.dtype, device=x.device)
-    return (
-        torch.lgamma(x + r)
-        - torch.lgamma(x + 1.0)
-        - torch.lgamma(r_tensor)
-        + r * torch.log(r_tensor)
-        - r * torch.log(r_tensor + mu)
-        + x * torch.log(mu + EPS)
-        - x * torch.log(r_tensor + mu)
+    return _log_negative_binomial_likelihood_from_terms(
+        _negative_binomial_observation_terms(
+            counts,
+            effective_exposure,
+            overdispersion,
+        ),
+        _probability_support_terms(support),
     )
 
 
@@ -103,9 +233,10 @@ def log_poisson_likelihood_support(
     counts: torch.Tensor,
     support: torch.Tensor,
 ) -> torch.Tensor:
-    x = counts.unsqueeze(-1)
-    rate = support.unsqueeze(-2).clamp_min(EPS)
-    return x * torch.log(rate) - rate
+    return _log_poisson_likelihood_from_terms(
+        _poisson_observation_terms(counts),
+        _rate_support_terms(support),
+    )
 
 
 def posterior_from_log_likelihood(

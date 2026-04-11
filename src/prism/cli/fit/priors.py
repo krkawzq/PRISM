@@ -11,11 +11,13 @@ import numpy as np
 import typer
 from rich.progress import (
     BarColumn,
+    MofNCompleteColumn,
     Progress,
     SpinnerColumn,
     TaskProgressColumn,
     TextColumn,
     TimeElapsedColumn,
+    TimeRemainingColumn,
 )
 
 from prism.cli.common import (
@@ -23,6 +25,7 @@ from prism.cli.common import (
     resolve_bool,
     resolve_float,
     resolve_int,
+    resolve_numpy_dtype,
     resolve_optional_float,
     resolve_optional_int,
     resolve_optional_path,
@@ -140,6 +143,7 @@ def _select_warm_start_prior(
     label_value: str | None,
     gene_names: list[str],
     expected_distribution: str,
+    dtype: np.dtype,
 ) -> np.ndarray | None:
     if checkpoint is None:
         return None
@@ -154,7 +158,7 @@ def _select_warm_start_prior(
         return None
     return np.asarray(
         warm_prior.select_genes(gene_names).as_gene_specific().prior_probabilities,
-        dtype=np.float64,
+        dtype=dtype,
     )
 
 
@@ -163,11 +167,16 @@ def _merge_priors(
 ) -> PriorGrid:
     if not priors:
         raise ValueError("cannot merge an empty prior list")
+    support_dtype = np.asarray(priors[0].support).dtype
+    probability_dtype = np.asarray(priors[0].prior_probabilities).dtype
     support = np.concatenate(
-        [np.asarray(prior.support, dtype=np.float64) for prior in priors], axis=0
+        [np.asarray(prior.support, dtype=support_dtype) for prior in priors], axis=0
     )
     prior_probabilities = np.concatenate(
-        [np.asarray(prior.prior_probabilities, dtype=np.float64) for prior in priors],
+        [
+            np.asarray(prior.prior_probabilities, dtype=probability_dtype)
+            for prior in priors
+        ],
         axis=0,
     )
     return PriorGrid(
@@ -231,7 +240,7 @@ def fit_priors_command(
     ),
     device: str = typer.Option("cpu", help="Torch device, e.g. cpu or cuda."),
     gene_batch_size: int = typer.Option(
-        64, min=1, help="Number of genes to fit per batch."
+        128, min=1, help="Number of genes to fit per batch."
     ),
     shard: str = typer.Option(
         "0/1", help="Shard specification as rank/world, e.g. 0/4."
@@ -246,7 +255,7 @@ def fit_priors_command(
         1e-6, min=0.0, help="EM convergence tolerance."
     ),
     cell_chunk_size: int = typer.Option(
-        512, min=1, help="Number of cells per likelihood chunk."
+        4096, min=1, help="Number of cells per likelihood chunk."
     ),
     torch_dtype: str = typer.Option("float64", help="Torch dtype: float64 or float32."),
     support_max_from: str = typer.Option(
@@ -317,6 +326,7 @@ def fit_priors_command(
     convergence_tolerance = resolve_float(convergence_tolerance)
     cell_chunk_size = resolve_int(cell_chunk_size)
     torch_dtype = _normalize_torch_dtype(resolve_str(torch_dtype))
+    compute_dtype = resolve_numpy_dtype(torch_dtype, option_name="--torch-dtype")
     support_max_from = resolve_str(support_max_from)
     support_spacing = resolve_str(support_spacing)
     support_scale = resolve_float(support_scale)
@@ -379,7 +389,11 @@ def fit_priors_command(
         raise ValueError(f"shard {rank}/{world_size} has no assigned genes")
 
     reference_positions = [gene_to_idx[name] for name in reference_gene_names]
-    reference_counts = compute_reference_counts(matrix, reference_positions)
+    reference_counts = compute_reference_counts(
+        matrix,
+        reference_positions,
+        dtype=compute_dtype,
+    )
     scale_resolution = resolve_scale(reference_counts, scale=scale)
     resolved_scale = scale_resolution.scale
 
@@ -470,8 +484,10 @@ def fit_priors_command(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(bar_width=None),
+        MofNCompleteColumn(),
         TaskProgressColumn(),
         TimeElapsedColumn(),
+        TimeRemainingColumn(),
         console=console,
     ) as progress:
         task_id = progress.add_task("fitting priors", total=total_batches)
@@ -480,7 +496,10 @@ def fit_priors_command(
                 task.cell_indices, n_samples=n_samples, seed=sample_seed + task_index
             )
             task_reference_counts = compute_reference_counts(
-                matrix, reference_positions, cell_indices=sampled_indices
+                matrix,
+                reference_positions,
+                cell_indices=sampled_indices,
+                dtype=compute_dtype,
             )
             valid_mask = task_reference_counts > 0
             if int(np.count_nonzero(valid_mask)) == 0:
@@ -493,18 +512,36 @@ def fit_priors_command(
             fitted_priors: list[PriorGrid] = []
             batch_summaries: list[dict[str, Any]] = []
             for batch_index, batch in enumerate(gene_batches, start=1):
-                progress.update(
-                    task_id,
-                    description=(
-                        "fitting priors "
-                        f"[{task.scope_name} | group {task_index}/{len(fit_tasks)} | "
-                        f"batch {batch_index}/{len(gene_batches)}]"
-                    ),
+                batch_prefix = (
+                    "fitting priors "
+                    f"[{task.scope_name} | group {task_index}/{len(fit_tasks)} | "
+                    f"batch {batch_index}/{len(gene_batches)}]"
                 )
+                progress.update(task_id, description=batch_prefix)
+
+                def on_fit_progress(
+                    step: int,
+                    max_steps: int,
+                    _objective: float,
+                    _best_objective: float,
+                    phase_index: float,
+                    converged: bool,
+                ) -> None:
+                    phase_label = int(phase_index)
+                    suffix = " converged" if converged else ""
+                    progress.update(
+                        task_id,
+                        description=(
+                            f"{batch_prefix} "
+                            f"phase {phase_label} step {step}/{max_steps}{suffix}"
+                        ),
+                    )
+
                 batch_counts = slice_gene_counts(
                     matrix,
                     batch.gene_positions,
                     cell_indices=sampled_indices,
+                    dtype=compute_dtype,
                 )
                 observation_batch = ObservationBatch(
                     gene_names=list(batch.gene_names),
@@ -516,6 +553,7 @@ def fit_priors_command(
                     label_value=task.label_value,
                     gene_names=list(batch.gene_names),
                     expected_distribution=fit_config.likelihood,
+                    dtype=compute_dtype,
                 )
                 result = fit_gene_priors(
                     observation_batch,
@@ -523,8 +561,10 @@ def fit_priors_command(
                     config=fit_config,
                     device=device,
                     torch_dtype=torch_dtype,
+                    result_dtype=torch_dtype,
                     initial_probabilities=init_probabilities,
                     compile_model=compile_model,
+                    progress_callback=on_fit_progress,
                 )
                 fitted_priors.append(result.prior.as_gene_specific())
                 batch_summaries.append(
@@ -534,6 +574,9 @@ def fit_priors_command(
                         "final_objective": float(result.final_objective),
                         "n_iterations": int(len(result.objective_history)),
                         "warm_start": init_probabilities is not None,
+                        "support_diagnostics": dict(
+                            result.config.get("support_diagnostics", {})
+                        ),
                     }
                 )
                 progress.update(task_id, advance=1)

@@ -106,6 +106,7 @@ def extract_signals_command(
     reference_gene_names = require_reference_genes(checkpoint.metadata)
     selected_channels = resolve_channels(channels)
     output_dtype = resolve_dtype(dtype)
+    input_dtype = resolve_dtype(torch_dtype)
     prior_source_resolved = resolve_prior_source(prior_source)
     label_groups = None
 
@@ -121,7 +122,11 @@ def extract_signals_command(
         raise ValueError(
             "checkpoint reference genes do not overlap with the input dataset"
         )
-    reference_counts = compute_reference_counts(matrix, ref_positions)
+    reference_counts = compute_reference_counts(
+        matrix,
+        ref_positions,
+        dtype=input_dtype,
+    )
     available_gene_names = checkpoint.gene_names
     available_gene_set = set(available_gene_names)
     if prior_source_resolved == "global" and not checkpoint.has_global_prior:
@@ -197,7 +202,9 @@ def extract_signals_command(
         task_id = progress.add_task("extracting", total=len(batches))
         for batch_index, batch_names in enumerate(batches, start=1):
             batch_counts = slice_gene_counts(
-                matrix, [gene_to_idx[name] for name in batch_names]
+                matrix,
+                [gene_to_idx[name] for name in batch_names],
+                dtype=input_dtype,
             )
             extracted = extract_batch(
                 checkpoint=checkpoint,
@@ -209,6 +216,8 @@ def extract_signals_command(
                 label_groups=label_groups,
                 device=device,
                 torch_dtype=torch_dtype,
+                result_dtype=dtype,
+                output_dtype=output_dtype,
                 selected_channels=selected_channels,
             )
             batch_positions = np.asarray(

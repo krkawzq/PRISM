@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import numpy as np
 
-from .constants import DTYPE_NP, DistributionName
+from .constants import DistributionName
 from .types import (
     DistributionGrid,
     PriorFitResult,
@@ -31,8 +31,8 @@ def _require_unique_gene_names(gene_names: list[str]) -> list[str]:
 def _serialize_distribution(distribution: DistributionGrid) -> dict[str, Any]:
     return {
         "distribution": distribution.distribution,
-        "support": np.asarray(distribution.support, dtype=DTYPE_NP),
-        "probabilities": np.asarray(distribution.probabilities, dtype=DTYPE_NP),
+        "support": np.asarray(distribution.support),
+        "probabilities": np.asarray(distribution.probabilities),
     }
 
 
@@ -46,8 +46,8 @@ def _parse_distribution_name(value: object) -> DistributionName:
 def _deserialize_distribution(payload: dict[str, Any]) -> DistributionGrid:
     return make_distribution_grid(
         _parse_distribution_name(payload["distribution"]),
-        support=np.asarray(payload["support"], dtype=DTYPE_NP),
-        probabilities=np.asarray(payload["probabilities"], dtype=DTYPE_NP),
+        support=np.asarray(payload["support"]),
+        probabilities=np.asarray(payload["probabilities"]),
     )
 
 
@@ -161,6 +161,12 @@ def checkpoint_from_fit_result(
     )
     resolved_metadata.setdefault("distribution", result.prior.distribution_name)
     resolved_metadata.setdefault("support_domain", result.prior.support_domain)
+    support_diagnostics = result.config.get("support_diagnostics")
+    if isinstance(support_diagnostics, dict):
+        resolved_metadata.setdefault(
+            "support_diagnostics",
+            dict(support_diagnostics),
+        )
     resolved_scale_metadata = scale_metadata
     if resolved_scale_metadata is None:
         mean_reference_count_value = result.config.get("mean_reference_count")

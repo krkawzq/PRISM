@@ -10,9 +10,21 @@ from .priors import plot_priors_command
 plot_app = create_typer_app(
     help="Render figures from checkpoints and extracted outputs."
 )
-plot_app.command("priors")(plot_priors_command)
-plot_app.command("batch-grid")(plot_batch_grid_command)
-plot_app.command("distributions")(plot_distributions_command)
-plot_app.command("label-summary")(plot_label_summary_command)
+plot_app.command(
+    "priors",
+    help="Compare prior curves across genes, labels, and checkpoints.",
+)(plot_priors_command)
+plot_app.command(
+    "batch-grid",
+    help="Render label priors on a batch x perturbation grid.",
+)(plot_batch_grid_command)
+plot_app.command(
+    "distributions",
+    help="Inspect extracted layer distributions across genes or groups.",
+)(plot_distributions_command)
+plot_app.command(
+    "label-summary",
+    help="Summarize pairwise similarity across label-specific priors.",
+)(plot_label_summary_command)
 
 __all__ = ["plot_app"]

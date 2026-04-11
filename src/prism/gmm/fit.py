@@ -33,7 +33,11 @@ def _validate_search_matches(
     search: DistributionGMMSearch,
     *,
     support: np.ndarray,
+    support_mask: np.ndarray,
     probabilities: np.ndarray,
+    bin_edges: np.ndarray,
+    lower_bounds: np.ndarray,
+    upper_bounds: np.ndarray,
     support_domain: str,
 ) -> None:
     atol = float(search.config.get("support_match_atol", 1e-9))
@@ -49,10 +53,26 @@ def _validate_search_matches(
         raise ValueError(
             "search probability shape does not match the requested fit input"
         )
+    if search.support_mask.shape != support_mask.shape:
+        raise ValueError("search support_mask shape does not match the requested fit input")
+    if search.bin_edges.shape != bin_edges.shape:
+        raise ValueError("search bin_edges shape does not match the requested fit input")
+    if search.lower_bounds.shape != lower_bounds.shape:
+        raise ValueError("search lower_bounds shape does not match the requested fit input")
+    if search.upper_bounds.shape != upper_bounds.shape:
+        raise ValueError("search upper_bounds shape does not match the requested fit input")
     if not np.allclose(search.support, support, atol=atol, rtol=rtol):
         raise ValueError("search support does not match the requested fit input")
+    if not np.array_equal(search.support_mask, support_mask):
+        raise ValueError("search support_mask does not match the requested fit input")
     if not np.allclose(search.probabilities, probabilities, atol=atol, rtol=rtol):
         raise ValueError("search probabilities do not match the requested fit input")
+    if not np.allclose(search.bin_edges, bin_edges, atol=atol, rtol=rtol):
+        raise ValueError("search bin_edges do not match the requested fit input")
+    if not np.allclose(search.lower_bounds, lower_bounds, atol=atol, rtol=rtol):
+        raise ValueError("search lower_bounds do not match the requested fit input")
+    if not np.allclose(search.upper_bounds, upper_bounds, atol=atol, rtol=rtol):
+        raise ValueError("search upper_bounds do not match the requested fit input")
 
 
 def _resolve_search_config(
@@ -143,7 +163,7 @@ def _run_refit(
         mean_margin_fraction=training_config.mean_margin_fraction,
         torch_dtype=training_config.torch_dtype,
         device=device,
-        compile_model=training_config.compile_model,
+        compile_policy=training_config.compile_policy,
         optimize_weights=training_config.optimize_weights,
         optimize_means=training_config.optimize_means,
         optimize_stds=training_config.optimize_stds,
@@ -274,7 +294,7 @@ def _refit_single_row_with_pruning(
             mean_margin_fraction=training_config.mean_margin_fraction,
             torch_dtype=training_config.torch_dtype,
             device=device,
-            compile_model=training_config.compile_model,
+            compile_policy=training_config.compile_policy,
             optimize_weights=training_config.optimize_weights,
             optimize_means=training_config.optimize_means,
             optimize_stds=training_config.optimize_stds,
@@ -436,7 +456,7 @@ def _refit_hard_rows_with_multistart(
                 mean_margin_fraction=training_config.mean_margin_fraction,
                 torch_dtype=training_config.torch_dtype,
                 device=device,
-                compile_model=training_config.compile_model,
+                compile_policy=training_config.compile_policy,
                 optimize_weights=training_config.optimize_weights,
                 optimize_means=training_config.optimize_means,
                 optimize_stds=training_config.optimize_stds,
@@ -706,7 +726,11 @@ def fit_distribution_gmm(
     _validate_search_matches(
         search,
         support=prepared.support,
+        support_mask=prepared.support_mask,
         probabilities=prepared.probabilities,
+        bin_edges=prepared.bin_edges,
+        lower_bounds=prepared.lower_bounds,
+        upper_bounds=prepared.upper_bounds,
         support_domain=prepared.support_domain,
     )
     return _fit_search_result(
@@ -741,7 +765,11 @@ def fit_prior_gmm(
     _validate_search_matches(
         search,
         support=prepared.support,
+        support_mask=prepared.support_mask,
         probabilities=prepared.probabilities,
+        bin_edges=prepared.bin_edges,
+        lower_bounds=prepared.lower_bounds,
+        upper_bounds=prepared.upper_bounds,
         support_domain=prepared.support_domain,
     )
     gene_specific = prior.as_gene_specific()

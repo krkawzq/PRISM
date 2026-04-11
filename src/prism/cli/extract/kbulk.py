@@ -263,6 +263,7 @@ def extract_kbulk_command(
     checkpoint = load_checkpoint(checkpoint_path)
     prior_source_resolved = resolve_prior_source(prior_source)
     output_dtype = resolve_dtype(dtype)
+    input_dtype = resolve_dtype(torch_dtype)
     console.print(f"[bold cyan]Reading[/bold cyan] {h5ad_path}")
     adata = ad.read_h5ad(h5ad_path)
     matrix = select_matrix(adata, layer)
@@ -286,7 +287,11 @@ def extract_kbulk_command(
         raise ValueError(
             "checkpoint reference genes do not overlap with the input dataset"
         )
-    reference_counts = compute_reference_counts(matrix, reference_positions)
+    reference_counts = compute_reference_counts(
+        matrix,
+        reference_positions,
+        dtype=input_dtype,
+    )
     class_groups = resolve_class_groups(adata, class_key)
     if prior_source_resolved == "global" and not checkpoint.has_global_prior:
         raise ValueError("checkpoint does not contain global priors")
@@ -356,9 +361,10 @@ def extract_kbulk_command(
 
     target_positions = [gene_to_idx[name] for name in selected_genes]
     gene_counts = np.ascontiguousarray(
-        slice_gene_counts(matrix, target_positions), dtype=np.float32
+        slice_gene_counts(matrix, target_positions, dtype=input_dtype),
+        dtype=input_dtype,
     )
-    reference_counts = np.ascontiguousarray(reference_counts, dtype=np.float32)
+    reference_counts = np.ascontiguousarray(reference_counts, dtype=input_dtype)
     posterior_distribution = resolve_posterior_distribution(
         checkpoint.metadata, checkpoint.fit_config
     )
@@ -394,8 +400,8 @@ def extract_kbulk_command(
                 combo_matrix.shape[0], combo_matrix.shape[1], n_genes
             )
             chunk_reference = reference_counts[flat_indices].reshape(combo_matrix.shape)
-            aggregated_counts = chunk_counts.sum(axis=1, dtype=np.float32)
-            aggregated_exposure = chunk_reference.sum(axis=1, dtype=np.float32)
+            aggregated_counts = chunk_counts.sum(axis=1, dtype=input_dtype)
+            aggregated_exposure = chunk_reference.sum(axis=1, dtype=input_dtype)
             result = infer_kbulk(
                 KBulkBatch(
                     gene_names=selected_genes,
@@ -406,6 +412,7 @@ def extract_kbulk_command(
                 device=device,
                 include_posterior=False,
                 torch_dtype=torch_dtype,
+                result_dtype=dtype,
                 posterior_distribution=posterior_distribution,
                 nb_overdispersion=nb_overdispersion,
             )
@@ -420,8 +427,9 @@ def extract_kbulk_command(
                     map_support, np.nan, dtype=output_dtype
                 )
             else:
-                map_scaled_support_rows[start:stop] = map_support * np.float32(
-                    prior.scale
+                map_scaled_support_rows[start:stop] = map_support * np.asarray(
+                    prior.scale,
+                    dtype=output_dtype,
                 )
                 map_probability_rows[start:stop] = map_support
             posterior_entropy_rows[start:stop] = np.asarray(

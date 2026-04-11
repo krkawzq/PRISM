@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 
 import numpy as np
+import pytest
+import torch
 
 from prism.gmm import (
     DistributionGMMSearch,
@@ -12,8 +15,13 @@ from prism.gmm import (
     fit_prior_gmm,
     search_distribution_gmm,
 )
-from prism.gmm.optimize import evaluate_mixture_parameters
+from prism.gmm.numeric import (
+    truncated_gaussian_bin_masses,
+    truncated_gaussian_bin_masses_dense_1d,
+)
+from prism.gmm.optimize import evaluate_mixture_parameters, optimize_mixture_parameters
 from prism.gmm.search import (
+    _masked_quantile_columns,
     _peak_indices,
     _select_component_count,
     _select_frontier_target_k,
@@ -68,6 +76,13 @@ def _truncated_gaussian_grid(
         total += float(weight) * bin_mass
     total = np.clip(total, 0.0, None)
     return total / max(float(np.sum(total)), 1e-12)
+
+
+def _dataclass_kwargs(instance: object) -> dict[str, object]:
+    return {
+        field.name: getattr(instance, field.name)
+        for field in dataclasses.fields(instance)
+    }
 
 
 def test_search_distribution_gmm_prefers_one_component_for_single_peak() -> None:
@@ -177,6 +192,60 @@ def test_search_peak_indices_collapse_plateau() -> None:
     assert peaks.tolist() == [2]
 
 
+def test_masked_quantile_columns_matches_columnwise_quantile() -> None:
+    values = np.asarray(
+        [
+            [1.0, 5.0, 2.0],
+            [3.0, 7.0, 4.0],
+            [2.0, 6.0, 8.0],
+            [9.0, 1.0, 6.0],
+        ],
+        dtype=np.float64,
+    )
+    mask = np.asarray(
+        [
+            [True, False, True],
+            [True, True, False],
+            [False, True, True],
+            [True, True, True],
+        ],
+        dtype=bool,
+    )
+    expected = np.asarray(
+        [
+            np.quantile(values[mask[:, col_idx], col_idx], 0.25)
+            for col_idx in range(values.shape[1])
+        ],
+        dtype=np.float64,
+    )
+    resolved = _masked_quantile_columns(values, mask, quantile=0.25)
+    assert np.allclose(resolved, expected)
+
+
+def test_truncated_gaussian_dense_1d_matches_generic_kernel() -> None:
+    bin_edges = np.asarray([0.0, 0.2, 0.5, 1.0], dtype=np.float64)
+    means = np.asarray([0.25, 0.7], dtype=np.float64)
+    stds = np.asarray([0.08, 0.12], dtype=np.float64)
+    lefts = np.asarray([0.0, 0.15], dtype=np.float64)
+    rights = np.asarray([1.0, 1.0], dtype=np.float64)
+    generic = truncated_gaussian_bin_masses(
+        torch.as_tensor(bin_edges[None, :], dtype=torch.float64),
+        torch.as_tensor(means[None, :], dtype=torch.float64),
+        torch.as_tensor(stds[None, :], dtype=torch.float64),
+        torch.as_tensor(lefts[None, :], dtype=torch.float64),
+        torch.as_tensor(rights[None, :], dtype=torch.float64),
+        torch.ones((1, bin_edges.shape[0] - 1), dtype=torch.bool),
+    )[0]
+    dense = truncated_gaussian_bin_masses_dense_1d(
+        torch.as_tensor(bin_edges, dtype=torch.float64),
+        torch.as_tensor(means, dtype=torch.float64),
+        torch.as_tensor(stds, dtype=torch.float64),
+        torch.as_tensor(lefts, dtype=torch.float64),
+        torch.as_tensor(rights, dtype=torch.float64),
+    )
+    assert np.allclose(dense.numpy(), generic.numpy())
+
+
 def test_select_component_count_supports_marginal_gain_and_penalized_error() -> None:
     metric_path = np.asarray([[0.3, 0.12, 0.11, 0.109]], dtype=np.float64)
     explored_k = np.asarray([4], dtype=np.int64)
@@ -200,6 +269,233 @@ def test_select_component_count_supports_marginal_gain_and_penalized_error() -> 
     )
     assert marginal.tolist() == [2]
     assert penalized.tolist() == [1]
+
+
+def test_training_config_validates_pruning_metrics() -> None:
+    with pytest.raises(ValueError, match="pruning_error_metric"):
+        GMMTrainingConfig(pruning_error_metric="bad")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="pruning_significance_metric"):
+        GMMTrainingConfig(pruning_significance_metric="bad")  # type: ignore[arg-type]
+
+
+def test_compile_policy_supports_legacy_bool_and_rejects_conflicts() -> None:
+    config = GMMTrainingConfig(compile_model=True)
+    assert config.compile_policy == "always"
+    assert config.compile_model is True
+
+    search_config = GMMSearchConfig(search_refit_compile_policy="auto")
+    assert search_config.search_refit_compile_policy == "auto"
+    assert search_config.search_refit_compile_model is None
+
+    with pytest.raises(ValueError, match="compile_model conflicts"):
+        GMMTrainingConfig(
+            compile_policy="auto",
+            compile_model=True,
+        )
+    with pytest.raises(ValueError, match="search_refit_compile_model conflicts"):
+        GMMSearchConfig(
+            search_refit_compile_policy="auto",
+            search_refit_compile_model=True,
+        )
+
+
+def test_distribution_gmm_search_rejects_non_prefix_mask_and_masked_probability() -> None:
+    support = np.asarray(
+        [
+            [0.0, 0.25, 0.5, 0.75],
+            [0.0, 0.5, 0.5, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    probabilities = np.asarray(
+        [
+            [0.2, 0.3, 0.3, 0.2],
+            [0.25, 0.25, 0.2, 0.3],
+        ],
+        dtype=np.float64,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=3,
+            peak_limit_per_stage=3,
+            candidate_window_count=3,
+            candidate_sigma_count=3,
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    kwargs = _dataclass_kwargs(search)
+
+    bad_mask = np.asarray(search.support_mask, dtype=bool).copy()
+    bad_mask[0, 1] = False
+    bad_mask[0, 2] = True
+    kwargs["support_mask"] = bad_mask
+    with pytest.raises(ValueError, match="prefix-contiguous"):
+        type(search)(**kwargs)
+
+    kwargs = _dataclass_kwargs(search)
+    bad_probabilities = np.asarray(search.probabilities, dtype=np.float64).copy()
+    masked_idx = int(np.flatnonzero(~search.support_mask[1])[0])
+    bad_probabilities[1, masked_idx] = 1e-3
+    bad_probabilities[1, 0] -= 1e-3
+    kwargs["probabilities"] = bad_probabilities
+    with pytest.raises(ValueError, match="masked-out probabilities"):
+        type(search)(**kwargs)
+
+
+def test_fit_distribution_gmm_rejects_search_with_mismatched_bin_edges() -> None:
+    support = np.linspace(0.0, 1.0, 17, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.45, 0.08, 0.0, 1.0)],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    search = search_distribution_gmm(
+        distribution,
+        config=GMMSearchConfig(
+            max_components=3,
+            peak_limit_per_stage=3,
+            candidate_window_count=3,
+            candidate_sigma_count=3,
+            search_refit_enabled=False,
+        ),
+        torch_dtype="float64",
+    )
+    kwargs = _dataclass_kwargs(search)
+    bad_bin_edges = np.asarray(search.bin_edges, dtype=np.float64).copy()
+    bad_lower_bounds = np.asarray(search.lower_bounds, dtype=np.float64).copy()
+    bad_bin_edges[0, 0] -= 0.05
+    bad_lower_bounds[0] = bad_bin_edges[0, 0]
+    kwargs["bin_edges"] = bad_bin_edges
+    kwargs["lower_bounds"] = bad_lower_bounds
+    mismatched_search = type(search)(**kwargs)
+    with pytest.raises(ValueError, match="bin_edges"):
+        fit_distribution_gmm(distribution, search=mismatched_search)
+
+
+def test_distribution_report_validates_residual_consistency_and_freezes_config() -> None:
+    support = np.linspace(0.0, 1.0, 33, dtype=np.float64)
+    probabilities = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.5, 0.1, 0.0, 1.0)],
+        probability_domain=True,
+    )
+    distribution = make_distribution_grid(
+        "binomial",
+        support=support,
+        probabilities=probabilities,
+    )
+    report = fit_distribution_gmm(
+        distribution,
+        search_config=GMMSearchConfig(
+            max_components=3,
+            peak_limit_per_stage=3,
+            candidate_window_count=3,
+            candidate_sigma_count=3,
+            search_refit_enabled=False,
+        ),
+        training_config=GMMTrainingConfig(
+            max_iterations=5,
+            gene_chunk_size=1,
+            compile_model=False,
+        ),
+    )
+    with pytest.raises(TypeError):
+        report.config["mutated"] = True  # type: ignore[index]
+
+    kwargs = _dataclass_kwargs(report)
+    bad_residual = np.asarray(report.residual_probabilities, dtype=np.float64).copy()
+    bad_residual[0, 0] += 1e-3
+    kwargs["residual_probabilities"] = bad_residual
+    with pytest.raises(ValueError, match="fitted_probabilities plus residual_probabilities"):
+        type(report)(**kwargs)
+
+
+def test_evaluate_and_optimize_do_not_leak_workspace_state_between_calls() -> None:
+    support = np.linspace(0.0, 1.0, 25, dtype=np.float64)
+    bin_edges = _build_edges(support, probability_domain=True)[None, :]
+    support_mask = np.ones((1, support.shape[0]), dtype=bool)
+    lower_bounds = np.asarray([bin_edges[0, 0]], dtype=np.float64)
+    upper_bounds = np.asarray([bin_edges[0, -1]], dtype=np.float64)
+    selected_k = np.asarray([1], dtype=np.int64)
+    component_weights = np.asarray([[1.0]], dtype=np.float64)
+    component_stds = np.asarray([[0.08]], dtype=np.float64)
+    component_lefts = np.asarray([[0.0]], dtype=np.float64)
+    component_rights = np.asarray([[1.0]], dtype=np.float64)
+    probabilities_first = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.25, 0.08, 0.0, 1.0)],
+        probability_domain=True,
+    )[None, :]
+    probabilities_second = _truncated_gaussian_grid(
+        support,
+        [(1.0, 0.75, 0.08, 0.0, 1.0)],
+        probability_domain=True,
+    )[None, :]
+
+    first = evaluate_mixture_parameters(
+        probabilities=probabilities_first,
+        bin_edges=bin_edges,
+        support_mask=support_mask,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        selected_k=selected_k,
+        component_weights=component_weights,
+        component_means=np.asarray([[0.25]], dtype=np.float64),
+        component_stds=component_stds,
+        component_left_truncations=component_lefts,
+        component_right_truncations=component_rights,
+        torch_dtype="float64",
+    )
+    second = evaluate_mixture_parameters(
+        probabilities=probabilities_second,
+        bin_edges=bin_edges,
+        support_mask=support_mask,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        selected_k=selected_k,
+        component_weights=component_weights,
+        component_means=np.asarray([[0.75]], dtype=np.float64),
+        component_stds=component_stds,
+        component_left_truncations=component_lefts,
+        component_right_truncations=component_rights,
+        torch_dtype="float64",
+    )
+    optimized = optimize_mixture_parameters(
+        probabilities=probabilities_second,
+        bin_edges=bin_edges,
+        support_mask=support_mask,
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        selected_k=selected_k,
+        initial_weights=component_weights,
+        initial_means=np.asarray([[0.75]], dtype=np.float64),
+        initial_stds=component_stds,
+        initial_left_truncations=component_lefts,
+        initial_right_truncations=component_rights,
+        max_iterations=0,
+        learning_rate=0.05,
+        convergence_tolerance=1e-7,
+        overshoot_penalty=0.0,
+        mean_margin_fraction=0.5,
+        torch_dtype="float64",
+    )
+
+    assert not np.allclose(first.fitted_probabilities, second.fitted_probabilities)
+    assert np.allclose(second.fitted_probabilities, probabilities_second, atol=1e-6)
+    assert np.allclose(optimized.fitted_probabilities, second.fitted_probabilities)
+    assert np.allclose(optimized.component_means, np.asarray([[0.75]], dtype=np.float64))
 
 
 def test_search_distribution_gmm_handles_close_peaks_with_shoulder() -> None:
