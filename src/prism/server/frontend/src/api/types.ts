@@ -203,7 +203,7 @@ export interface GeneAnalysisRequest {
   supportScale: number
   useAdaptiveSupport: boolean
   adaptiveSupportScale: number
-  adaptiveSupportQuantileHi: number
+  adaptiveSupportQuantile: number
   likelihood: 'binomial' | 'negative_binomial' | 'poisson'
   nbOverdispersion: number
   torchDtype: 'float32' | 'float64'

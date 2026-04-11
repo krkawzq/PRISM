@@ -451,7 +451,7 @@ class PriorFitConfig:
     support_scale: float = 1.5
     use_adaptive_support: bool = False
     adaptive_support_scale: float = 1.5
-    adaptive_support_quantile_hi: float = 0.99
+    adaptive_support_quantile: float = 0.99
     likelihood: DistributionName = "binomial"
     nb_overdispersion: float = 0.01
 
@@ -472,8 +472,8 @@ class PriorFitConfig:
             raise ValueError("support_scale must be >= 1")
         if self.adaptive_support_scale < 1.0:
             raise ValueError("adaptive_support_scale must be >= 1")
-        if not (0.0 < self.adaptive_support_quantile_hi <= 1.0):
-            raise ValueError("adaptive_support_quantile_hi must be in (0, 1]")
+        if not (0.0 < self.adaptive_support_quantile <= 1.0):
+            raise ValueError("adaptive_support_quantile must be in (0, 1]")
         if self.likelihood not in {"binomial", "negative_binomial", "poisson"}:
             raise ValueError(f"unsupported likelihood: {self.likelihood}")
         if self.nb_overdispersion <= 0:

@@ -215,10 +215,10 @@ def parse_args() -> argparse.Namespace:
         help="Expansion factor applied to the adaptive support range.",
     )
     parser.add_argument(
-        "--adaptive-support-quantile-hi",
+        "--adaptive-support-quantile",
         type=float,
         default=0.99,
-        help="Upper posterior quantile used for adaptive refinement.",
+        help="Posterior quantile used for adaptive refinement.",
     )
     parser.add_argument(
         "--nb-overdispersion",
@@ -508,7 +508,7 @@ def fit_distribution(
         support_spacing=args.support_spacing,
         use_adaptive_support=bool(args.adaptive_support),
         adaptive_support_scale=args.adaptive_support_scale,
-        adaptive_support_quantile_hi=args.adaptive_support_quantile_hi,
+        adaptive_support_quantile=args.adaptive_support_quantile,
         likelihood=cast(Any, distribution),
         nb_overdispersion=args.nb_overdispersion,
     )

@@ -174,7 +174,7 @@ def test_api_gene_analysis_and_kbulk_routes_map_query_contracts(
             "support_scale": 2.5,
             "use_adaptive_support": True,
             "adaptive_support_scale": 1.75,
-            "adaptive_support_quantile_hi": 0.95,
+            "adaptive_support_quantile": 0.95,
             "likelihood": "poisson",
             "nb_overdispersion": 0.2,
             "torch_dtype": "float32",

@@ -469,19 +469,19 @@ def test_probability_support_max_uses_effective_exposure() -> None:
 def test_scaled_support_max_keeps_raw_count_floor() -> None:
     batch = ObservationBatch(
         gene_names=["g1", "g2"],
-        counts=np.array([[8.0, 1.0], [2.0, 2.0]], dtype=np.float64),
-        reference_counts=np.array([100.0, 1000.0], dtype=np.float64),
+        counts=np.array([[1.0, 4.0], [2.0, 2.0]], dtype=np.float64),
+        reference_counts=np.array([10.0, 20.0], dtype=np.float64),
     )
 
     scaled_support_max = fit_module._default_scaled_support_max(
         batch,
-        scale=100.0,
+        scale=15.0,
         method="observed_max",
     )
 
     assert np.allclose(
         scaled_support_max,
-        np.array([44.0, 2.0], dtype=np.float64),
+        np.array([2.0, 6.0], dtype=np.float64),
     )
 
 
@@ -545,7 +545,7 @@ def test_adaptive_refine_support_keeps_zero_and_scales_upper_bound() -> None:
         config=PriorFitConfig(
             use_adaptive_support=True,
             adaptive_support_scale=2.0,
-            adaptive_support_quantile_hi=0.75,
+            adaptive_support_quantile=0.75,
         ),
         dtype=torch.float64,
         device=torch.device("cpu"),
@@ -570,7 +570,7 @@ def test_adaptive_refine_support_expands_when_right_edge_is_saturated() -> None:
         config=PriorFitConfig(
             use_adaptive_support=True,
             adaptive_support_scale=1.5,
-            adaptive_support_quantile_hi=0.995,
+            adaptive_support_quantile=0.995,
         ),
         dtype=torch.float64,
         device=torch.device("cpu"),
@@ -622,7 +622,7 @@ def test_fit_gene_priors_adaptive_support_runs_end_to_end() -> None:
             likelihood="binomial",
             use_adaptive_support=True,
             adaptive_support_scale=1.5,
-            adaptive_support_quantile_hi=0.9,
+            adaptive_support_quantile=0.9,
         ),
         compile_model=False,
     )

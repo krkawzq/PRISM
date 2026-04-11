@@ -463,13 +463,13 @@ export default function GenePage() {
             />
           </label>
           <label className="field">
-            <span>Adaptive q_hi</span>
+            <span>Adaptive quantile</span>
             <input
               onChange={(event) =>
-                handleFitChange('adaptiveSupportQuantileHi', event.target.value)
+                handleFitChange('adaptiveSupportQuantile', event.target.value)
               }
               type="text"
-              value={draft.fit.adaptiveSupportQuantileHi}
+              value={draft.fit.adaptiveSupportQuantile}
             />
           </label>
           <label className="field">

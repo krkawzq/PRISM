@@ -101,7 +101,7 @@ class GeneFitParams:
     support_scale: float = 1.5
     use_adaptive_support: bool = False
     adaptive_support_scale: float = 1.5
-    adaptive_support_quantile_hi: float = 0.99
+    adaptive_support_quantile: float = 0.99
     likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
     nb_overdispersion: float = 0.01
     torch_dtype: Literal["float32", "float64"] = "float64"
@@ -119,7 +119,7 @@ class GeneFitParams:
             support_scale=self.support_scale,
             use_adaptive_support=self.use_adaptive_support,
             adaptive_support_scale=self.adaptive_support_scale,
-            adaptive_support_quantile_hi=self.adaptive_support_quantile_hi,
+            adaptive_support_quantile=self.adaptive_support_quantile,
             likelihood=self.likelihood,
             nb_overdispersion=self.nb_overdispersion,
         )

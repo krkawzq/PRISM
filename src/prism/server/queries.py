@@ -120,8 +120,8 @@ def parse_fit_params(request: Request) -> GeneFitParams:
             default=1.5,
             min_value=1.0,
         ),
-        adaptive_support_quantile_hi=parse_float(
-            request.first("adaptive_support_quantile_hi"),
+        adaptive_support_quantile=parse_float(
+            request.first("adaptive_support_quantile"),
             default=0.99,
             min_value=1e-12,
         ),

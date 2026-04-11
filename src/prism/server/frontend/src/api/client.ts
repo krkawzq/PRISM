@@ -71,7 +71,7 @@ export const apiClient = {
       support_scale: payload.supportScale,
       use_adaptive_support: payload.useAdaptiveSupport,
       adaptive_support_scale: payload.adaptiveSupportScale,
-      adaptive_support_quantile_hi: payload.adaptiveSupportQuantileHi,
+      adaptive_support_quantile: payload.adaptiveSupportQuantile,
       likelihood: payload.likelihood,
       nb_overdispersion: payload.nbOverdispersion,
       torch_dtype: payload.torchDtype,

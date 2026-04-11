@@ -159,7 +159,7 @@ def _render_fit_form(analysis: GeneAnalysis, params: GeneFitParams) -> str:
         <label><span>Support scale</span><input type="text" name="support_scale" value="{params.support_scale}"></label>
         <label><span>Adaptive support</span><select name="use_adaptive_support"><option value="0"{" selected" if not params.use_adaptive_support else ""}>off</option><option value="1"{" selected" if params.use_adaptive_support else ""}>on</option></select></label>
         <label><span>Adaptive support scale</span><input type="text" name="adaptive_support_scale" value="{params.adaptive_support_scale}"></label>
-        <label><span>Adaptive q_hi</span><input type="text" name="adaptive_support_quantile_hi" value="{params.adaptive_support_quantile_hi}"></label>
+        <label><span>Adaptive quantile</span><input type="text" name="adaptive_support_quantile" value="{params.adaptive_support_quantile}"></label>
         <label><span>Likelihood</span><select name="likelihood"><option value="binomial"{" selected" if params.likelihood == "binomial" else ""}>binomial</option><option value="negative_binomial"{" selected" if params.likelihood == "negative_binomial" else ""}>negative_binomial</option><option value="poisson"{" selected" if params.likelihood == "poisson" else ""}>poisson</option></select></label>
         <label><span>NB overdispersion</span><input type="text" name="nb_overdispersion" value="{params.nb_overdispersion}"></label>
         <label><span>Torch dtype</span><select name="torch_dtype"><option value="float64"{" selected" if params.torch_dtype == "float64" else ""}>float64</option><option value="float32"{" selected" if params.torch_dtype == "float32" else ""}>float32</option></select></label>

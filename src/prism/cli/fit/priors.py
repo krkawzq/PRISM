@@ -117,7 +117,7 @@ def _build_fit_config(
     support_scale: float,
     use_adaptive_support: bool,
     adaptive_support_scale: float,
-    adaptive_support_quantile_hi: float,
+    adaptive_support_quantile: float,
     likelihood: str,
     nb_overdispersion: float,
 ) -> PriorFitConfig:
@@ -131,7 +131,7 @@ def _build_fit_config(
         support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
         adaptive_support_scale=adaptive_support_scale,
-        adaptive_support_quantile_hi=adaptive_support_quantile_hi,
+        adaptive_support_quantile=adaptive_support_quantile,
         likelihood=cast(Any, _normalize_likelihood(likelihood)),
         nb_overdispersion=nb_overdispersion,
     )
@@ -275,13 +275,13 @@ def fit_priors_command(
     adaptive_support_scale: float = typer.Option(
         1.5,
         min=1.0,
-        help="Expansion factor applied to the adaptive support range [0, q_hi].",
+        help="Expansion factor applied to the adaptive support range [0, q].",
     ),
-    adaptive_support_quantile_hi: float = typer.Option(
+    adaptive_support_quantile: float = typer.Option(
         0.99,
         min=0.000001,
         max=1.0,
-        help="Upper posterior quantile used for adaptive refinement.",
+        help="Posterior quantile used for adaptive refinement.",
     ),
     likelihood: str = typer.Option(
         "binomial", help="Fit distribution: binomial, negative_binomial, or poisson."
@@ -332,7 +332,7 @@ def fit_priors_command(
     support_scale = resolve_float(support_scale)
     use_adaptive_support = resolve_bool(use_adaptive_support)
     adaptive_support_scale = resolve_float(adaptive_support_scale)
-    adaptive_support_quantile_hi = resolve_float(adaptive_support_quantile_hi)
+    adaptive_support_quantile = resolve_float(adaptive_support_quantile)
     likelihood = resolve_str(likelihood)
     nb_overdispersion = resolve_float(nb_overdispersion)
     compile_model = resolve_bool(compile_model)
@@ -350,7 +350,7 @@ def fit_priors_command(
         support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
         adaptive_support_scale=adaptive_support_scale,
-        adaptive_support_quantile_hi=adaptive_support_quantile_hi,
+        adaptive_support_quantile=adaptive_support_quantile,
         likelihood=likelihood,
         nb_overdispersion=nb_overdispersion,
     )
@@ -444,7 +444,7 @@ def fit_priors_command(
         support_scale=support_scale,
         use_adaptive_support=use_adaptive_support,
         adaptive_support_scale=adaptive_support_scale,
-        adaptive_support_quantile_hi=adaptive_support_quantile_hi,
+        adaptive_support_quantile=adaptive_support_quantile,
         likelihood=fit_config.likelihood,
         nb_overdispersion=nb_overdispersion,
         warm_start_checkpoint=warm_start_checkpoint,

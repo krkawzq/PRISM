@@ -17,7 +17,7 @@ export interface FitFormState {
   supportScale: string
   useAdaptiveSupport: boolean
   adaptiveSupportScale: string
-  adaptiveSupportQuantileHi: string
+  adaptiveSupportQuantile: string
   likelihood: 'binomial' | 'negative_binomial' | 'poisson'
   nbOverdispersion: string
   torchDtype: 'float32' | 'float64'
@@ -60,7 +60,7 @@ const DEFAULT_FIT_FORM: FitFormState = {
   supportScale: '1.5',
   useAdaptiveSupport: false,
   adaptiveSupportScale: '1.5',
-  adaptiveSupportQuantileHi: '0.99',
+  adaptiveSupportQuantile: '0.99',
   likelihood: 'binomial',
   nbOverdispersion: '0.01',
   torchDtype: 'float64',
@@ -116,9 +116,9 @@ export function readGeneWorkspaceUrlState(
       ),
       adaptiveSupportScale:
         searchParams.get('adaptive_support_scale') ?? DEFAULT_FIT_FORM.adaptiveSupportScale,
-      adaptiveSupportQuantileHi:
-        searchParams.get('adaptive_support_quantile_hi') ??
-        DEFAULT_FIT_FORM.adaptiveSupportQuantileHi,
+      adaptiveSupportQuantile:
+        searchParams.get('adaptive_support_quantile') ??
+        DEFAULT_FIT_FORM.adaptiveSupportQuantile,
       likelihood: readLikelihood(searchParams.get('likelihood')),
       nbOverdispersion:
         searchParams.get('nb_overdispersion') ?? DEFAULT_FIT_FORM.nbOverdispersion,
@@ -171,7 +171,7 @@ export function toGeneAnalysisRequest(
     supportScale: readNumber(state.fit.supportScale, 1.5),
     useAdaptiveSupport: state.fit.useAdaptiveSupport,
     adaptiveSupportScale: readNumber(state.fit.adaptiveSupportScale, 1.5),
-    adaptiveSupportQuantileHi: readNumber(state.fit.adaptiveSupportQuantileHi, 0.99),
+    adaptiveSupportQuantile: readNumber(state.fit.adaptiveSupportQuantile, 0.99),
     likelihood: state.fit.likelihood,
     nbOverdispersion: readNumber(state.fit.nbOverdispersion, 0.01),
     torchDtype: state.fit.torchDtype,
@@ -218,7 +218,7 @@ export function toGeneSearchParams(state: GeneWorkspaceUrlState): URLSearchParam
   searchParams.set('support_scale', state.fit.supportScale)
   searchParams.set('use_adaptive_support', state.fit.useAdaptiveSupport ? '1' : '0')
   searchParams.set('adaptive_support_scale', state.fit.adaptiveSupportScale)
-  searchParams.set('adaptive_support_quantile_hi', state.fit.adaptiveSupportQuantileHi)
+  searchParams.set('adaptive_support_quantile', state.fit.adaptiveSupportQuantile)
   searchParams.set('likelihood', state.fit.likelihood)
   searchParams.set('nb_overdispersion', state.fit.nbOverdispersion)
   searchParams.set('torch_dtype', state.fit.torchDtype)

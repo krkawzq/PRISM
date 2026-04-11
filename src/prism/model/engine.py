@@ -17,7 +17,7 @@ class PriorEngineSetting:
     support_scale: float = 1.5
     use_adaptive_support: bool = False
     adaptive_support_scale: float = 1.5
-    adaptive_support_quantile_hi: float = 0.99
+    adaptive_support_quantile: float = 0.99
     likelihood: Literal["binomial", "negative_binomial", "poisson"] = "binomial"
     nb_overdispersion: float = 0.01
 
@@ -31,7 +31,7 @@ class PriorEngineSetting:
             support_scale=self.support_scale,
             use_adaptive_support=self.use_adaptive_support,
             adaptive_support_scale=self.adaptive_support_scale,
-            adaptive_support_quantile_hi=self.adaptive_support_quantile_hi,
+            adaptive_support_quantile=self.adaptive_support_quantile,
             likelihood=self.likelihood,
             nb_overdispersion=self.nb_overdispersion,
         )
@@ -92,7 +92,7 @@ def _merge_config(
         support_scale=setting.support_scale,
         use_adaptive_support=setting.use_adaptive_support,
         adaptive_support_scale=setting.adaptive_support_scale,
-        adaptive_support_quantile_hi=setting.adaptive_support_quantile_hi,
+        adaptive_support_quantile=setting.adaptive_support_quantile,
         likelihood=setting.likelihood,
         nb_overdispersion=setting.nb_overdispersion,
     )

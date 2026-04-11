@@ -320,7 +320,7 @@ def _compute_support_diagnostics(
     support: torch.Tensor,
     probabilities: np.ndarray | torch.Tensor,
     *,
-    quantile_hi: float,
+    quantile: float,
     dtype: torch.dtype,
     device: torch.device,
 ) -> dict[str, torch.Tensor | int]:
@@ -330,7 +330,7 @@ def _compute_support_diagnostics(
     probabilities_t = probabilities_t / probabilities_t.sum(dim=-1, keepdim=True)
     cdf = probabilities_t.cumsum(dim=-1)
     cdf = cdf / cdf[:, -1:].clamp_min(EPS)
-    quantile_mask = cdf >= float(quantile_hi)
+    quantile_mask = cdf >= float(quantile)
     quantile_index = quantile_mask.to(torch.int64).argmax(dim=-1)
     quantile_index = torch.where(
         quantile_mask.any(dim=-1),
@@ -412,12 +412,12 @@ def _adaptive_refine_support(
     diagnostics = _compute_support_diagnostics(
         support_t,
         probabilities,
-        quantile_hi=float(config.adaptive_support_quantile_hi),
+        quantile=float(config.adaptive_support_quantile),
         dtype=dtype,
         device=device,
     )
     quantile_index = cast(torch.Tensor, diagnostics["quantile_index"])
-    quantile_hi_value = torch.gather(
+    quantile_value = torch.gather(
         support_t,
         1,
         quantile_index.unsqueeze(-1),
@@ -432,7 +432,7 @@ def _adaptive_refine_support(
     shrink_upper = torch.minimum(
         max_value,
         torch.maximum(
-            quantile_hi_value * float(config.adaptive_support_scale),
+            quantile_value * float(config.adaptive_support_scale),
             minimum_upper,
         ),
     )
@@ -1029,7 +1029,7 @@ def fit_gene_priors(
     phase1_diagnostics = _compute_support_diagnostics(
         support,
         posterior_mean_probabilities_t,
-        quantile_hi=float(config.adaptive_support_quantile_hi),
+        quantile=float(config.adaptive_support_quantile),
         dtype=dtype_obj,
         device=device_obj,
     )
@@ -1084,7 +1084,7 @@ def fit_gene_priors(
             round_diagnostics = _compute_support_diagnostics(
                 support,
                 posterior_mean_probabilities_t,
-                quantile_hi=float(config.adaptive_support_quantile_hi),
+                quantile=float(config.adaptive_support_quantile),
                 dtype=dtype_obj,
                 device=device_obj,
             )
@@ -1099,7 +1099,7 @@ def fit_gene_priors(
     final_diagnostics = _compute_support_diagnostics(
         support,
         posterior_mean_probabilities_t,
-        quantile_hi=float(config.adaptive_support_quantile_hi),
+        quantile=float(config.adaptive_support_quantile),
         dtype=dtype_obj,
         device=device_obj,
     )

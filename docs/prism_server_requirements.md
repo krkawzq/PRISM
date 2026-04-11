@@ -263,7 +263,7 @@ fit 参数至少支持：
 - `support_spacing`
 - `use_adaptive_support`
 - `adaptive_support_fraction`
-- `adaptive_support_quantile_hi`
+- `adaptive_support_quantile`
 - `likelihood`
 - `nb_overdispersion`
 - `torch_dtype`
@@ -419,4 +419,3 @@ server 只接收本地路径，不负责上传。
 7. 可以在 gene 页面查看 checkpoint posterior
 8. 可以触发 on-demand fit
 9. 可以触发 kBulk 分析
-
