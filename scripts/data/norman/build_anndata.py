@@ -169,8 +169,12 @@ def compute_var_stats(matrix: sparse.csr_matrix, genes: pd.DataFrame) -> pd.Data
     cv[mean == 0] = np.nan
     fano[mean == 0] = np.nan
 
-    var_df = genes.set_index("gene_id").copy()
+    var_df = genes.copy()
     var_df["gene_name"] = var_df["gene_name"].astype(str)
+    var_df["ensembl_id"] = var_df["gene_id"].astype(str)
+    var_df.index = ad.utils.make_index_unique(pd.Index(var_df["gene_name"].to_numpy(dtype=str)))
+    var_df.index.name = None
+    var_df = var_df.drop(columns="gene_id")
     var_df["mean"] = mean
     var_df["std"] = std
     var_df["cv"] = cv
@@ -219,7 +223,7 @@ def build_anndata(
     adata.uns["compat_source"] = "Perturbseq_GI CellPopulation.from_file (matrix-only subset)"
     adata.uns["cellpopulation_fields"] = {
         "obs": ["UMI_count", "gem_group"],
-        "var": ["gene_name", "mean", "std", "cv", "fano", "in_matrix"],
+        "var": ["gene_name", "ensembl_id", "mean", "std", "cv", "fano", "in_matrix"],
     }
     adata.uns["build_stats"] = filter_stats
     return adata, filter_stats
